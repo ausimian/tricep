@@ -1,0 +1,5 @@
+%{
+  "elixir_make": {:hex, :elixir_make, "0.9.0", "6484b3cd8c0cee58f09f05ecaf1a140a8c97670671a6a0e7ab4dc326c3109726", [:mix], [], "hexpm", "db23d4fd8b757462ad02f8aa73431a426fe6671c80b200d9710caf3d1dd0ffdb"},
+  "tundra": {:hex, :tundra, "0.3.1", "cedf40e30797a6050d6c6ae7fceeb84b798f9e810f0fe43b9932928ddb150a20", [:make, :mix], [{:elixir_make, "~> 0.9", [hex: :elixir_make, repo: "hexpm", optional: false]}, {:typedstruct, "~> 0.5", [hex: :typedstruct, repo: "hexpm", optional: false]}], "hexpm", "9d036e04e6b52c97fb465b6541e0a1d930a37c87eed535c9fe06330c4ecbe9b5"},
+  "typedstruct": {:hex, :typedstruct, "0.5.4", "d1d33d58460a74f413e9c26d55e66fd633abd8ac0fb12639add9a11a60a0462a", [:make, :mix], [], "hexpm", "ffaef36d5dbaebdbf4ed07f7fb2ebd1037b2c1f757db6fb8e7bcbbfabbe608d8"},
+}
