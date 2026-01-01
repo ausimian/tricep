@@ -5,7 +5,7 @@ defmodule Tricep.MixProject do
     [
       app: :tricep,
       version: "0.1.0",
-      elixir: "~> 1.18",
+      elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       compilers: [:elixir_make] ++ Mix.compilers(),
       make_targets: ["all"],
@@ -27,7 +27,7 @@ defmodule Tricep.MixProject do
     [
       {:typedstruct, "~> 0.5", runtime: false},
       {:tundra, "~> 0.3.0"},
-      {:elixir_make, "~> 0.8", runtime: false}
+      {:elixir_make, "~> 0.9", runtime: false}
     ]
   end
 end

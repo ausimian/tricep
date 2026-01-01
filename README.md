@@ -15,7 +15,7 @@ Tricep connects to TUN devices (or other transports) via a Link abstraction and 
 
 ## Requirements
 
-- Elixir 1.18+
+- Elixir 1.15+
 - Linux (macOS support planned)
 - Root or `CAP_NET_ADMIN` for TUN device creation
 
