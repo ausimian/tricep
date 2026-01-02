@@ -21,6 +21,11 @@ defmodule Tricep.Socket do
     :gen_statem.call(pid, {:recv, length, timeout})
   end
 
+  @spec close(pid()) :: :ok | {:error, atom()}
+  def close(pid) when is_pid(pid) do
+    :gen_statem.call(pid, :close)
+  end
+
   def handle_packet(src_addr, dst_addr, <<src_port::16, dst_port::16, _::binary>> = segment) do
     pair = {{dst_addr, dst_port}, {src_addr, src_port}}
 
@@ -71,9 +76,14 @@ defmodule Tricep.Socket do
     # Buffers for data transfer
     field :send_buffer, binary(), default: <<>>
     field :recv_buffer, binary(), default: <<>>
-    # Callers waiting on recv (list of {from, length})
+    # Callers waiting on recv (list of {from, length, timer_ref})
     field :recv_waiters, list(), default: []
+    # Track if peer has sent FIN (EOF)
+    field :fin_received, boolean(), default: false
   end
+
+  # TIME_WAIT duration (2*MSL - using short value for TUN-based stack)
+  @time_wait_ms 2_000
 
   @impl true
   def callback_mode, do: :handle_event_function
@@ -277,6 +287,7 @@ defmodule Tricep.Socket do
       %{flags: flags, seq: seq, ack: ack, payload: payload, window: window} ->
         rst? = :rst in flags
         ack? = :ack in flags
+        fin? = :fin in flags
 
         cond do
           rst? ->
@@ -291,6 +302,32 @@ defmodule Tricep.Socket do
               end)
 
             {:next_state, :closed, nil, actions}
+
+          fin? and seq == state.rcv_nxt ->
+            # FIN from peer - handle any data with it, then transition to CLOSE_WAIT
+            data_len = byte_size(payload)
+            new_rcv_nxt = wrap_seq(state.rcv_nxt + data_len + 1)
+            new_recv_buffer = state.recv_buffer <> payload
+            new_snd_una = if ack > state.snd_una, do: ack, else: state.snd_una
+
+            # Send ACK for FIN (and any data)
+            send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
+
+            # Notify waiters: deliver buffered data or EOF
+            {new_recv_buffer, new_waiters, replies} =
+              process_waiters_eof(new_recv_buffer, state.recv_waiters)
+
+            new_state = %{
+              state
+              | rcv_nxt: new_rcv_nxt,
+                recv_buffer: new_recv_buffer,
+                recv_waiters: new_waiters,
+                snd_una: new_snd_una,
+                snd_wnd: window,
+                fin_received: true
+            }
+
+            {:next_state, :close_wait, new_state, replies}
 
           ack? and seq == state.rcv_nxt and byte_size(payload) > 0 ->
             # Data segment with expected sequence number
@@ -332,12 +369,261 @@ defmodule Tricep.Socket do
     end
   end
 
+  # --- Active close from established ---
+
+  def handle_event({:call, from}, :close, :established, %__MODULE__{} = state) do
+    send_fin(state)
+    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1)}
+    {:next_state, :fin_wait_1, new_state, {:reply, from, :ok}}
+  end
+
+  # --- FIN_WAIT_1 state ---
+
+  def handle_event(:info, segment, :fin_wait_1, %__MODULE__{} = state) do
+    case Tcp.parse_segment(segment) do
+      %{flags: flags, seq: seq, ack: ack, window: window} ->
+        fin? = :fin in flags
+        ack? = :ack in flags
+        rst? = :rst in flags
+        ack_of_fin? = ack? and ack == state.snd_nxt
+
+        cond do
+          rst? ->
+            reset_state(state)
+            {:next_state, :closed, nil}
+
+          fin? and ack_of_fin? ->
+            # FIN+ACK of our FIN - go directly to TIME_WAIT
+            send_ack(seq + 1, %{state | rcv_nxt: seq + 1})
+            new_state = %{state | rcv_nxt: wrap_seq(seq + 1), snd_wnd: window, fin_received: true}
+            {:next_state, :time_wait, new_state, {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+
+          fin? ->
+            # FIN but not ACK of our FIN - simultaneous close
+            send_ack(seq + 1, %{state | rcv_nxt: seq + 1})
+            new_state = %{state | rcv_nxt: wrap_seq(seq + 1), snd_wnd: window, fin_received: true}
+            {:next_state, :closing, new_state}
+
+          ack_of_fin? ->
+            # ACK of our FIN - move to FIN_WAIT_2
+            new_state = %{state | snd_wnd: window}
+            {:next_state, :fin_wait_2, new_state}
+
+          true ->
+            :keep_state_and_data
+        end
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  # --- FIN_WAIT_2 state ---
+
+  def handle_event(:info, segment, :fin_wait_2, %__MODULE__{} = state) do
+    case Tcp.parse_segment(segment) do
+      %{flags: flags, seq: seq, ack: _ack, payload: payload, window: window} ->
+        fin? = :fin in flags
+        ack? = :ack in flags
+        rst? = :rst in flags
+
+        cond do
+          rst? ->
+            reset_state(state)
+            {:next_state, :closed, nil}
+
+          fin? and seq == state.rcv_nxt ->
+            # FIN from peer - ACK it and go to TIME_WAIT
+            # Handle any data that came with the FIN
+            new_rcv_nxt = wrap_seq(state.rcv_nxt + byte_size(payload) + 1)
+            send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
+            new_state = %{state | rcv_nxt: new_rcv_nxt, snd_wnd: window, fin_received: true}
+            {:next_state, :time_wait, new_state, {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+
+          ack? and seq == state.rcv_nxt and byte_size(payload) > 0 ->
+            # Data segment - half-close allows peer to still send data
+            new_rcv_nxt = wrap_seq(state.rcv_nxt + byte_size(payload))
+            send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
+            new_state = %{state | rcv_nxt: new_rcv_nxt, recv_buffer: state.recv_buffer <> payload, snd_wnd: window}
+            {:keep_state, new_state}
+
+          true ->
+            :keep_state_and_data
+        end
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  # --- TIME_WAIT state ---
+
+  def handle_event({:timeout, :time_wait}, :time_wait_expired, :time_wait, %__MODULE__{} = state) do
+    reset_state(state)
+    {:next_state, :closed, nil}
+  end
+
+  def handle_event(:info, segment, :time_wait, %__MODULE__{} = state) do
+    # Re-ACK any FIN received (peer may have missed our ACK)
+    case Tcp.parse_segment(segment) do
+      %{flags: flags, seq: _seq} ->
+        if :fin in flags do
+          send_ack(state.rcv_nxt, state)
+        end
+        :keep_state_and_data
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  # --- CLOSING state (simultaneous close) ---
+
+  def handle_event(:info, segment, :closing, %__MODULE__{} = state) do
+    case Tcp.parse_segment(segment) do
+      %{flags: flags, ack: ack, window: window} ->
+        ack? = :ack in flags
+        rst? = :rst in flags
+        ack_of_fin? = ack? and ack == state.snd_nxt
+
+        cond do
+          rst? ->
+            reset_state(state)
+            {:next_state, :closed, nil}
+
+          ack_of_fin? ->
+            # ACK of our FIN - go to TIME_WAIT
+            new_state = %{state | snd_wnd: window}
+            {:next_state, :time_wait, new_state, {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+
+          true ->
+            :keep_state_and_data
+        end
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  # --- CLOSE_WAIT state (peer closed, we can still send) ---
+
+  def handle_event({:call, from}, {:send, data}, :close_wait, %__MODULE__{} = state) do
+    new_state = %{state | send_buffer: state.send_buffer <> data}
+    {:keep_state, new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+  end
+
+  def handle_event(:internal, :flush_send_buffer, :close_wait, %__MODULE__{send_buffer: <<>>}) do
+    :keep_state_and_data
+  end
+
+  def handle_event(:internal, :flush_send_buffer, :close_wait, %__MODULE__{} = state) do
+    # Same as established - take up to snd_mss bytes from buffer
+    mss = state.snd_mss || @default_mss
+    {payload, rest} = split_binary(state.send_buffer, mss)
+
+    {{src_addr, src_port}, {dst_addr, dst_port}} = state.pair
+
+    tcp_segment =
+      Tcp.build_segment(
+        src_addr: src_addr,
+        dst_addr: dst_addr,
+        src_port: src_port,
+        dst_port: dst_port,
+        seq: state.snd_nxt,
+        ack: state.rcv_nxt,
+        flags: [:ack, :psh],
+        window: state.rcv_wnd,
+        payload: payload
+      )
+
+    packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
+    Tricep.Link.send(state.link, packet)
+
+    new_state = %{state | send_buffer: rest, snd_nxt: wrap_seq(state.snd_nxt + byte_size(payload))}
+    actions = if rest != <<>>, do: [{:next_event, :internal, :flush_send_buffer}], else: []
+    {:keep_state, new_state, actions}
+  end
+
+  def handle_event({:call, from}, {:recv, length, _timeout}, :close_wait, %__MODULE__{} = state) do
+    case deliver_data(state.recv_buffer, length) do
+      {:ok, data, rest} ->
+        new_state = %{state | recv_buffer: rest}
+        {:keep_state, new_state, {:reply, from, {:ok, data}}}
+
+      :wait ->
+        # No data and peer already sent FIN - return EOF
+        {:keep_state_and_data, {:reply, from, {:ok, <<>>}}}
+    end
+  end
+
+  def handle_event({:call, from}, :close, :close_wait, %__MODULE__{} = state) do
+    send_fin(state)
+    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1)}
+    {:next_state, :last_ack, new_state, {:reply, from, :ok}}
+  end
+
+  def handle_event(:info, segment, :close_wait, %__MODULE__{} = state) do
+    # Handle ACKs for data we sent
+    case Tcp.parse_segment(segment) do
+      %{flags: flags, ack: ack, window: window} ->
+        if :rst in flags do
+          reset_state(state)
+          {:next_state, :closed, nil}
+        else
+          if :ack in flags do
+            new_snd_una = if ack > state.snd_una, do: ack, else: state.snd_una
+            new_state = %{state | snd_una: new_snd_una, snd_wnd: window}
+            {:keep_state, new_state}
+          else
+            :keep_state_and_data
+          end
+        end
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  # --- LAST_ACK state ---
+
+  def handle_event(:info, segment, :last_ack, %__MODULE__{} = state) do
+    case Tcp.parse_segment(segment) do
+      %{flags: flags, ack: ack} ->
+        rst? = :rst in flags
+        ack? = :ack in flags
+        ack_of_fin? = ack? and ack == state.snd_nxt
+
+        cond do
+          rst? ->
+            reset_state(state)
+            {:next_state, :closed, nil}
+
+          ack_of_fin? ->
+            # ACK of our FIN - connection fully closed
+            reset_state(state)
+            {:next_state, :closed, nil}
+
+          true ->
+            :keep_state_and_data
+        end
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  # --- Catch-all handlers ---
+
   # Send/recv on non-established socket
   def handle_event({:call, from}, {:send, _data}, _state, _state_data) do
     {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
   end
 
   def handle_event({:call, from}, {:recv, _length, _timeout}, _state, _state_data) do
+    {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
+  end
+
+  def handle_event({:call, from}, :close, _state, _state_data) do
     {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
   end
 
@@ -378,6 +664,26 @@ defmodule Tricep.Socket do
         ack: 0,
         flags: [:rst],
         window: 0,
+        payload: <<>>
+      )
+
+    packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
+    Tricep.Link.send(state.link, packet)
+  end
+
+  defp send_fin(%__MODULE__{} = state) do
+    {{src_addr, src_port}, {dst_addr, dst_port}} = state.pair
+
+    tcp_segment =
+      Tcp.build_segment(
+        src_addr: src_addr,
+        dst_addr: dst_addr,
+        src_port: src_port,
+        dst_port: dst_port,
+        seq: state.snd_nxt,
+        ack: state.rcv_nxt,
+        flags: [:fin, :ack],
+        window: state.rcv_wnd,
         payload: <<>>
       )
 
@@ -447,6 +753,38 @@ defmodule Tricep.Socket do
       :wait ->
         # Can't satisfy this waiter, keep it
         process_waiters(buffer, rest, [{from, length, timer_ref} | remaining_waiters], actions)
+    end
+  end
+
+  # Process recv waiters when FIN is received - deliver data or EOF
+  defp process_waiters_eof(buffer, waiters) do
+    process_waiters_eof(buffer, waiters, [], [])
+  end
+
+  defp process_waiters_eof(buffer, [], _remaining_waiters, actions) do
+    # All waiters processed - no remaining waiters since we have EOF
+    {buffer, [], Enum.reverse(actions)}
+  end
+
+  defp process_waiters_eof(buffer, [{from, length, timer_ref} | rest], remaining_waiters, actions) do
+    case deliver_data(buffer, length) do
+      {:ok, data, new_buffer} ->
+        # Reply with data and cancel the timeout
+        new_actions = [
+          {:reply, from, {:ok, data}},
+          {{:timeout, timer_ref}, :cancel}
+        ]
+
+        process_waiters_eof(new_buffer, rest, remaining_waiters, new_actions ++ actions)
+
+      :wait ->
+        # No data available - return EOF ({:ok, <<>>})
+        new_actions = [
+          {:reply, from, {:ok, <<>>}},
+          {{:timeout, timer_ref}, :cancel}
+        ]
+
+        process_waiters_eof(buffer, rest, remaining_waiters, new_actions ++ actions)
     end
   end
 end

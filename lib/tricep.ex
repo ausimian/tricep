@@ -42,4 +42,9 @@ defmodule Tricep do
   def recv(socket, length, timeout) when is_pid(socket) do
     Tricep.Socket.recv(socket, length, timeout)
   end
+
+  @spec close(pid()) :: :ok | {:error, atom()}
+  def close(socket) when is_pid(socket) do
+    Tricep.Socket.close(socket)
+  end
 end
