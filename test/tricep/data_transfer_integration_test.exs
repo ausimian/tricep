@@ -264,6 +264,154 @@ defmodule Tricep.DataTransferIntegrationTest do
     end
   end
 
+  describe "close/1 integration" do
+    test "active close sends FIN to kernel socket", %{link: _link} do
+      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+
+      on_exit(fn -> :socket.close(listen_sock) end)
+
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      connect_task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+        end)
+
+      {:ok, client_sock} = accept_connection(listen_sock)
+
+      on_exit(fn -> :socket.close(client_sock) end)
+
+      assert Task.await(connect_task, 5000) == :ok
+
+      # Close Tricep socket
+      assert Tricep.close(socket) == :ok
+
+      # Kernel socket should receive EOF (recv returns 0 bytes or closed)
+      # Give time for FIN to be processed
+      Process.sleep(100)
+
+      result = :socket.recv(client_sock, 0, 1000)
+      # Kernel recv returns {:ok, <<>>} on FIN or {:error, :closed}
+      assert result in [{:ok, <<>>}, {:error, :closed}]
+    end
+
+    test "passive close receives FIN from kernel socket", %{link: _link} do
+      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+
+      on_exit(fn -> :socket.close(listen_sock) end)
+
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      connect_task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+        end)
+
+      {:ok, client_sock} = accept_connection(listen_sock)
+
+      assert Task.await(connect_task, 5000) == :ok
+
+      # Close kernel socket (sends FIN to Tricep)
+      :socket.close(client_sock)
+
+      # Tricep recv should return EOF
+      assert Tricep.recv(socket, 0, 5000) == {:ok, <<>>}
+    end
+
+    test "recv returns data then EOF after kernel close", %{link: _link} do
+      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+
+      on_exit(fn -> :socket.close(listen_sock) end)
+
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      connect_task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+        end)
+
+      {:ok, client_sock} = accept_connection(listen_sock)
+
+      assert Task.await(connect_task, 5000) == :ok
+
+      # Send data then close kernel socket
+      :ok = :socket.send(client_sock, "Final message")
+      :socket.close(client_sock)
+
+      # First recv gets the data
+      assert Tricep.recv(socket, 0, 5000) == {:ok, "Final message"}
+
+      # Second recv gets EOF
+      assert Tricep.recv(socket, 0, 5000) == {:ok, <<>>}
+    end
+
+    test "graceful bidirectional close", %{link: _link} do
+      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+
+      on_exit(fn -> :socket.close(listen_sock) end)
+
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      connect_task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+        end)
+
+      {:ok, client_sock} = accept_connection(listen_sock)
+
+      on_exit(fn -> :socket.close(client_sock) end)
+
+      assert Task.await(connect_task, 5000) == :ok
+
+      # Exchange some data first
+      assert Tricep.send(socket, "Hello") == :ok
+      {:ok, "Hello"} = :socket.recv(client_sock, 0, 5000)
+
+      :ok = :socket.send(client_sock, "Goodbye")
+      assert Tricep.recv(socket, 0, 5000) == {:ok, "Goodbye"}
+
+      # Close Tricep side
+      assert Tricep.close(socket) == :ok
+
+      # Kernel should see EOF
+      Process.sleep(100)
+      result = :socket.recv(client_sock, 0, 1000)
+      assert result in [{:ok, <<>>}, {:error, :closed}]
+
+      # Close kernel side
+      :socket.close(client_sock)
+    end
+
+    test "close with pending recv waiter", %{link: _link} do
+      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+
+      on_exit(fn -> :socket.close(listen_sock) end)
+
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      connect_task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+        end)
+
+      {:ok, client_sock} = accept_connection(listen_sock)
+
+      assert Task.await(connect_task, 5000) == :ok
+
+      # Start recv in background (will block waiting for data)
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, 10_000) end)
+
+      # Give it time to block
+      Process.sleep(100)
+
+      # Close kernel socket (sends FIN)
+      :socket.close(client_sock)
+
+      # recv should unblock with EOF
+      assert Task.await(recv_task, 5000) == {:ok, <<>>}
+    end
+  end
+
   # Helper to receive exactly `length` bytes
   defp recv_all(sock, length, timeout) do
     recv_all(sock, length, timeout, <<>>)
