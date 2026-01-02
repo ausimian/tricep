@@ -30,4 +30,16 @@ defmodule Tricep do
   end
 
   defdelegate connect(socket, address), to: Tricep.Socket
+
+  @spec send(pid(), binary()) :: :ok | {:error, atom()}
+  def send(socket, data) when is_pid(socket) and is_binary(data) do
+    Tricep.Socket.send_data(socket, data)
+  end
+
+  @spec recv(pid(), non_neg_integer(), timeout()) :: {:ok, binary()} | {:error, atom()}
+  def recv(socket, length \\ 0, timeout \\ :infinity)
+
+  def recv(socket, length, timeout) when is_pid(socket) do
+    Tricep.Socket.recv(socket, length, timeout)
+  end
 end

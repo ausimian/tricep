@@ -446,4 +446,210 @@ defmodule Tricep.SocketTest do
       assert state.snd_mss == 1220
     end
   end
+
+  describe "send/2" do
+    test "sends data segment with correct seq and ack", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Send data
+      assert Tricep.send(socket, "Hello") == :ok
+
+      # Should receive data segment
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+
+      <<_ip_header::binary-size(40), data_segment::binary>> = data_packet
+      parsed = Tcp.parse_segment(data_segment)
+
+      assert parsed.payload == "Hello"
+      assert :ack in parsed.flags
+      assert :psh in parsed.flags
+    end
+
+    test "segments large data at MSS boundary", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, mss: 10)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Send data larger than MSS
+      assert Tricep.send(socket, "Hello, World!") == :ok
+
+      # Should receive two segments
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+      assert_receive {:dummy_link_packet, _link, packet2}, 1000
+
+      <<_::binary-size(40), seg1::binary>> = packet1
+      <<_::binary-size(40), seg2::binary>> = packet2
+
+      parsed1 = Tcp.parse_segment(seg1)
+      parsed2 = Tcp.parse_segment(seg2)
+
+      assert parsed1.payload == "Hello, Wor"
+      assert parsed2.payload == "ld!"
+    end
+
+    test "returns error when not connected" do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+      assert Tricep.send(socket, "Hello") == {:error, :enotconn}
+    end
+  end
+
+  describe "recv/2" do
+    test "receives buffered data", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state to find src_port
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Inject data from peer
+      data_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:ack, :psh],
+          window: 32768,
+          payload: "Hello from peer"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      # Should be able to recv the data
+      assert Tricep.recv(socket, 0, 1000) == {:ok, "Hello from peer"}
+
+      # Should have sent an ACK
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_::binary-size(40), ack_seg::binary>> = ack_packet
+      ack_parsed = Tcp.parse_segment(ack_seg)
+      assert :ack in ack_parsed.flags
+      assert ack_parsed.ack == state.irs + 1 + byte_size("Hello from peer")
+    end
+
+    test "blocks until data arrives", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Start recv in a task (will block)
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, 5000) end)
+
+      # Give it time to block
+      Process.sleep(50)
+
+      # Inject data
+      data_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:ack, :psh],
+          window: 32768,
+          payload: "Delayed data"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      # Recv should complete with the data
+      assert Task.await(recv_task, 1000) == {:ok, "Delayed data"}
+    end
+
+    test "returns error when not connected" do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+      assert Tricep.recv(socket, 0, 100) == {:error, :enotconn}
+    end
+
+    test "times out and removes waiter from list", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Recv with short timeout
+      result = Tricep.recv(socket, 0, 100)
+      assert result == {:error, :timeout}
+
+      # Socket should still be usable - verify waiters list is empty
+      {:established, state} = :sys.get_state(socket)
+      assert state.recv_waiters == []
+    end
+  end
+
+  # Helper to establish a connection and return the socket
+  defp establish_connection(link, local_addr, remote_addr, opts \\ []) do
+    {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+    task =
+      Task.async(fn ->
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+      end)
+
+    # Wait for SYN
+    assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+
+    <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+    syn_parsed = Tcp.parse_segment(syn_segment)
+    <<src_port::16, _::binary>> = syn_segment
+
+    # Build SYN-ACK with optional MSS
+    server_seq = 5000
+    mss = Keyword.get(opts, :mss)
+
+    syn_ack_opts = [
+      src_addr: local_addr,
+      dst_addr: remote_addr,
+      src_port: @port,
+      dst_port: src_port,
+      seq: server_seq,
+      ack: syn_parsed.seq + 1,
+      flags: [:syn, :ack],
+      window: 32768
+    ]
+
+    syn_ack_opts = if mss, do: Keyword.put(syn_ack_opts, :mss, mss), else: syn_ack_opts
+    syn_ack_segment = Tcp.build_segment(syn_ack_opts)
+
+    DummyLink.inject_packet(link, syn_ack_segment)
+
+    assert Task.await(task, 1000) == :ok
+
+    socket
+  end
 end
