@@ -12,7 +12,14 @@ defmodule Tricep.MixProject do
       make_targets: ["all"],
       make_clean: ["clean"],
       deps: deps(),
-      test_coverage: [ignore_modules: ignored_coverage_modules()]
+      test_coverage: [tool: ExCoveralls, ignore_modules: ignored_coverage_modules()],
+      preferred_cli_env: [
+        coveralls: :test,
+        "coveralls.detail": :test,
+        "coveralls.post": :test,
+        "coveralls.html": :test,
+        "coveralls.github": :test
+      ]
     ]
   end
 
@@ -43,7 +50,8 @@ defmodule Tricep.MixProject do
     [
       {:typedstruct, "~> 0.5", runtime: false},
       {:tundra, "~> 0.3.0"},
-      {:elixir_make, "~> 0.9", runtime: false}
+      {:elixir_make, "~> 0.9", runtime: false},
+      {:excoveralls, "~> 0.18", only: :test}
     ]
   end
 end

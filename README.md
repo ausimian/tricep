@@ -1,5 +1,8 @@
 # Tricep
 
+[![Build](https://github.com/ausimian/tricep/actions/workflows/build.yaml/badge.svg)](https://github.com/ausimian/tricep/actions/workflows/build.yaml)
+[![Coverage Status](https://coveralls.io/repos/github/ausimian/tricep/badge.svg?branch=main)](https://coveralls.io/github/ausimian/tricep?branch=main)
+
 A user-mode IPv6/TCP stack written in Elixir.
 
 Tricep connects to TUN devices (or other transports) via a Link abstraction and implements the TCP/IP protocol in user space. This allows for custom networking stacks, testing, and experimentation without kernel modifications.
