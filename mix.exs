@@ -12,12 +12,23 @@ defmodule Tricep.MixProject do
       make_targets: ["all"],
       make_clean: ["clean"],
       deps: deps(),
-      test_coverage: [ignore_modules: [Tricep.IntegrationCase, Tricep.DummyLink]]
+      test_coverage: [ignore_modules: ignored_coverage_modules()]
     ]
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
+
+  defp ignored_coverage_modules do
+    base = [Tricep.IntegrationCase, Tricep.DummyLink]
+
+    # Exclude TunLink unless integration tests are included
+    if System.get_env("INTEGRATION") == "true" do
+      base
+    else
+      [Tricep.TunLink | base]
+    end
+  end
 
   # Run "mix help compile.app" to learn about applications.
   def application do
