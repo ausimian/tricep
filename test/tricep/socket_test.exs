@@ -199,6 +199,59 @@ defmodule Tricep.SocketTest do
       assert result == {:error, :enetunreach}
     end
 
+    test "returns error for invalid address format" do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      # Try to connect with an invalid address
+      result = Tricep.connect(socket, %{family: :inet6, addr: "not-an-ip", port: 80})
+
+      assert {:error, _} = result
+    end
+
+    test "ignores malformed segments in SYN_SENT state", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      # Wait for SYN
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn_parsed = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      # Inject a malformed/truncated segment (too short to parse)
+      DummyLink.inject_packet(link, <<1, 2, 3>>)
+
+      # Give it time to process
+      Process.sleep(50)
+
+      # Socket should still be waiting - send proper SYN-ACK
+      syn_ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: 5000,
+          ack: syn_parsed.seq + 1,
+          flags: [:syn, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      # Should succeed
+      assert Task.await(task, 1000) == :ok
+    end
+
     test "returns error when already connected", %{
       link: link,
       local_addr: local_addr,
@@ -609,6 +662,235 @@ defmodule Tricep.SocketTest do
       # Socket should still be usable - verify waiters list is empty
       {:established, state} = :sys.get_state(socket)
       assert state.recv_waiters == []
+    end
+
+    test "recv with specific length waits for enough data", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Start recv asking for 20 bytes
+      recv_task = Task.async(fn -> Tricep.recv(socket, 20, 5000) end)
+
+      # Give it time to block
+      Process.sleep(50)
+
+      # Inject only 10 bytes - should still be waiting
+      data_segment1 =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:ack, :psh],
+          window: 32768,
+          payload: "1234567890"
+        )
+
+      DummyLink.inject_packet(link, data_segment1)
+
+      # Wait for ACK
+      assert_receive {:dummy_link_packet, _link, _ack1}, 1000
+
+      # Task should still be waiting
+      Process.sleep(50)
+      refute Task.yield(recv_task, 0)
+
+      # Inject another 10 bytes
+      data_segment2 =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1 + 10,
+          ack: state.snd_nxt,
+          flags: [:ack, :psh],
+          window: 32768,
+          payload: "ABCDEFGHIJ"
+        )
+
+      DummyLink.inject_packet(link, data_segment2)
+
+      # Now should get exactly 20 bytes
+      assert Task.await(recv_task, 1000) == {:ok, "1234567890ABCDEFGHIJ"}
+    end
+  end
+
+  describe "established state edge cases" do
+    test "RST notifies waiting receivers", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Start recv in a task (will block waiting for data)
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, 5000) end)
+
+      # Give it time to block
+      Process.sleep(50)
+
+      # Inject RST
+      rst_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:rst],
+          window: 0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      # Recv should return error
+      assert Task.await(recv_task, 1000) == {:error, :econnreset}
+    end
+
+    test "pure ACK updates send window", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get initial state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+      initial_snd_wnd = state.snd_wnd
+
+      # Inject a pure ACK with different window
+      new_window = 65535
+
+      ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:ack],
+          window: new_window
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+
+      # Give time to process
+      Process.sleep(50)
+
+      # Check window was updated
+      {:established, new_state} = :sys.get_state(socket)
+      assert new_state.snd_wnd == new_window
+      assert new_state.snd_wnd != initial_snd_wnd or initial_snd_wnd == new_window
+    end
+
+    test "ignores out of order packets", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Inject packet with wrong sequence number (too high)
+      wrong_seq_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1000,
+          ack: state.snd_nxt,
+          flags: [:ack, :psh],
+          window: 32768,
+          payload: "Out of order"
+        )
+
+      DummyLink.inject_packet(link, wrong_seq_segment)
+
+      # Give time to process
+      Process.sleep(50)
+
+      # Recv should timeout since data was ignored
+      result = Tricep.recv(socket, 0, 100)
+      assert result == {:error, :timeout}
+
+      # rcv_nxt should not have changed
+      {:established, new_state} = :sys.get_state(socket)
+      assert new_state.rcv_nxt == state.rcv_nxt
+    end
+
+    test "ignores malformed segments in established state", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Inject malformed segment (too short to parse)
+      DummyLink.inject_packet(link, <<1, 2, 3>>)
+
+      # Give time to process
+      Process.sleep(50)
+
+      # Socket should still be in established state and usable
+      {:established, new_state} = :sys.get_state(socket)
+      assert new_state.rcv_nxt == state.rcv_nxt
+
+      # Can still recv properly formatted data
+      data_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:ack, :psh],
+          window: 32768,
+          payload: "Valid data"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+      assert Tricep.recv(socket, 0, 1000) == {:ok, "Valid data"}
     end
   end
 

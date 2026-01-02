@@ -32,6 +32,9 @@ defmodule Tricep.Socket do
     :ok
   end
 
+  # Ignore malformed packets that are too short to parse
+  def handle_packet(_src_addr, _dst_addr, _segment), do: :ok
+
   def child_spec(opts) do
     %{
       id: __MODULE__,
