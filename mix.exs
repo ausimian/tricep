@@ -11,7 +11,8 @@ defmodule Tricep.MixProject do
       compilers: [:elixir_make] ++ Mix.compilers(),
       make_targets: ["all"],
       make_clean: ["clean"],
-      deps: deps()
+      deps: deps(),
+      test_coverage: [ignore_modules: [Tricep.IntegrationCase, Tricep.DummyLink]]
     ]
   end
 
