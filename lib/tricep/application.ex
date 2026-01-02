@@ -9,13 +9,13 @@ defmodule Tricep.Application do
 
   @link_supervisor Tricep.LinkSupervisor
   @link_registry Tricep.LinkRegistry
-  @tcp_socket_registry Tricep.TcpSocketRegistry
+  @socket_registry Tricep.SocketRegistry
 
   @impl true
   def start(_type, _args) do
     children = [
       {Registry, keys: :unique, name: @link_registry},
-      {Registry, keys: :unique, name: @tcp_socket_registry},
+      {Registry, keys: :unique, name: @socket_registry},
       {DynamicSupervisor, strategy: :one_for_one, name: @link_supervisor}
       # Starts a worker by calling: Tricep.Worker.start_link(arg)
       # {Tricep.Worker, arg}
@@ -46,20 +46,20 @@ defmodule Tricep.Application do
 
   @spec register_socket_pair(any()) :: :ok | {:error, {:already_registered, pid()}}
   def register_socket_pair(pair) do
-    with {:ok, _pid} <- Registry.register(@tcp_socket_registry, pair, nil) do
+    with {:ok, _pid} <- Registry.register(@socket_registry, pair, nil) do
       :ok
     end
   end
 
   def deregister_socket_pair(pair) do
-    Registry.unregister(@tcp_socket_registry, pair)
+    Registry.unregister(@socket_registry, pair)
   end
 
   @spec lookup_socket_pair(any()) :: nil | pid()
   def lookup_socket_pair(pair) do
     Logger.debug("Looking up socket pair: #{inspect(pair)}")
 
-    case Registry.lookup(@tcp_socket_registry, pair) do
+    case Registry.lookup(@socket_registry, pair) do
       [{pid, nil}] -> pid
       [] -> nil
     end

@@ -123,7 +123,7 @@ defmodule Tricep.TunLink do
   end
 
   defp handle_tcp(data, src, dst, _state) do
-    Tricep.TcpSocket.handle_packet(src, dst, data)
+    Tricep.Socket.handle_packet(src, dst, data)
     {:keep_state_and_data, {:next_event, :internal, :read_tun}}
   end
 

@@ -1,4 +1,4 @@
-defmodule Tricep.TcpSocket do
+defmodule Tricep.Socket do
   @behaviour :gen_statem
 
   alias Tricep.Application

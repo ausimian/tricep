@@ -22,12 +22,12 @@ defmodule Tricep do
   end
 
   def open(:inet6, :stream, :tcp, opts) when is_map(opts) do
-    Tricep.TcpSocket.start_link(opts: opts)
+    Tricep.Socket.start_link(opts: opts)
   end
 
   def open(_, _, _, _) do
     {:error, :unsupported}
   end
 
-  defdelegate connect(socket, address), to: Tricep.TcpSocket
+  defdelegate connect(socket, address), to: Tricep.Socket
 end
