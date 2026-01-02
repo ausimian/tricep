@@ -1,9 +1,9 @@
 defmodule Tricep.DataTransferIntegrationTest do
   use Tricep.IntegrationCase, async: false
 
-  @ifaddr {0xFD00, 0, 0, 0, 0, 0, 0, 1}
-  @ifaddr_str "fd00::1"
-  @dstaddr_str "fd00::2"
+  @ifaddr {0xFD00, 0, 0, 0, 0, 0, 0, 0x11}
+  @ifaddr_str "fd00::11"
+  @dstaddr_str "fd00::12"
   @port 44444
 
   setup do

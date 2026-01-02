@@ -16,6 +16,8 @@ defmodule Tricep.IntegrationCase do
 
   using do
     quote do
+      use ExUnit.Case, async: false
+
       @moduletag :integration
 
       import Tricep.IntegrationCase

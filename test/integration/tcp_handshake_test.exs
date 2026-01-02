@@ -8,12 +8,22 @@ defmodule Tricep.Integration.TcpHandshakeTest do
 
   use Tricep.IntegrationCase
 
-  @ifaddr {0xFD00, 0, 0, 0, 0, 0, 0, 1}
+  @ifaddr {0xFD00, 0, 0, 0, 0, 0, 0, 0x21}
+  @ifaddr_str "fd00::21"
+  @dstaddr_str "fd00::22"
+
+  setup do
+    link = create_test_link(ifaddr: @ifaddr_str, dstaddr: @dstaddr_str)
+
+    on_exit(fn ->
+      Tricep.Link.drop(link)
+    end)
+
+    %{link: link}
+  end
 
   describe "TCP three-way handshake" do
-    test "completes handshake with kernel TCP listener" do
-      # Create TUN link
-      _link = create_test_link()
+    test "completes handshake with kernel TCP listener", %{link: _link} do
 
       # Start a kernel TCP listener on the interface address
       {:ok, listen_sock} = create_kernel_listener(@ifaddr, 44444)
@@ -44,10 +54,7 @@ defmodule Tricep.Integration.TcpHandshakeTest do
       :socket.close(listen_sock)
     end
 
-    test "returns error when connection is refused" do
-      # Create TUN link
-      _link = create_test_link()
-
+    test "returns error when connection is refused", %{link: _link} do
       # Open a Tricep socket and try to connect to a port with no listener
       {:ok, sock} = Tricep.open(:inet6, :stream, :tcp)
       address = %{family: :inet6, addr: @ifaddr, port: 55555}
@@ -58,10 +65,7 @@ defmodule Tricep.Integration.TcpHandshakeTest do
       assert result == {:error, :econnrefused}
     end
 
-    test "returns error for unreachable destination" do
-      # Create TUN link with specific addresses
-      _link = create_test_link()
-
+    test "returns error for unreachable destination", %{link: _link} do
       # Try to connect to an address not covered by the TUN link
       {:ok, sock} = Tricep.open(:inet6, :stream, :tcp)
       address = %{family: :inet6, addr: {0x2001, 0x0DB8, 0, 0, 0, 0, 0, 1}, port: 80}
@@ -73,10 +77,7 @@ defmodule Tricep.Integration.TcpHandshakeTest do
   end
 
   describe "multiple connections" do
-    test "can establish multiple simultaneous connections" do
-      # Create TUN link
-      _link = create_test_link()
-
+    test "can establish multiple simultaneous connections", %{link: _link} do
       # Start listeners on different ports
       {:ok, listen_sock1} = create_kernel_listener(@ifaddr, 44001)
       {:ok, listen_sock2} = create_kernel_listener(@ifaddr, 44002)

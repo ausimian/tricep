@@ -44,6 +44,10 @@ defmodule Tricep.Application do
     List.first(Registry.lookup(@link_registry, dstaddr))
   end
 
+  def deregister_link(dstaddr) do
+    Registry.unregister(@link_registry, dstaddr)
+  end
+
   @spec register_socket_pair(any()) :: :ok | {:error, {:already_registered, pid()}}
   def register_socket_pair(pair) do
     with {:ok, _pid} <- Registry.register(@socket_registry, pair, nil) do

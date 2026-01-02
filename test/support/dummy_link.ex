@@ -152,6 +152,12 @@ defmodule Tricep.DummyLink do
     {:stop, :normal, state}
   end
 
+  @impl true
+  def terminate(_reason, state) do
+    Tricep.Application.deregister_link(state.local_addr)
+    :ok
+  end
+
   # Helpers
 
   defp normalize_addr(addr) when is_binary(addr) and byte_size(addr) == 16, do: addr

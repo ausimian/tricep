@@ -7,9 +7,6 @@
 )
 IO.puts("Created TUN link")
 
-IO.gets("Press Enter to continue...")
-IO.puts("Continuing...")
-
 # Spawn a listener on fd00::1:33333
 listener_task = Task.async(fn ->
   {:ok, listen_sock} = :socket.open(:inet6, :stream, :tcp)
@@ -31,7 +28,10 @@ listener_task = Task.async(fn ->
 end)
 
 # Give the listener time to start
-Process.sleep(100)
+Process.sleep(1000)
+
+IO.gets("Press Enter to continue...")
+IO.puts("Continuing...")
 
 # Open a Tricep TCP socket and connect
 {:ok, sock} = Tricep.open(:inet6, :stream, :tcp)
@@ -47,3 +47,4 @@ IO.puts("Connect result: #{inspect(result)}")
 Task.await(listener_task, 15_000)
 
 IO.puts("Done")
+Process.sleep(1_000)
