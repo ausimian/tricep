@@ -5,8 +5,6 @@ defmodule Tricep.Application do
 
   use Application
 
-  require Logger
-
   @link_supervisor Tricep.LinkSupervisor
   @link_registry Tricep.LinkRegistry
   @socket_registry Tricep.SocketRegistry
@@ -33,8 +31,6 @@ defmodule Tricep.Application do
   end
 
   def register_link(srcaddr, dstaddr) do
-    IO.inspect({srcaddr, dstaddr}, label: "Registering link")
-
     with {:ok, _pid} <- Registry.register(@link_registry, dstaddr, srcaddr) do
       :ok
     end
@@ -61,8 +57,6 @@ defmodule Tricep.Application do
 
   @spec lookup_socket_pair(any()) :: nil | pid()
   def lookup_socket_pair(pair) do
-    Logger.debug("Looking up socket pair: #{inspect(pair)}")
-
     case Registry.lookup(@socket_registry, pair) do
       [{pid, nil}] -> pid
       [] -> nil

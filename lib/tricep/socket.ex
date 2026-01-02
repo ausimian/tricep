@@ -5,7 +5,6 @@ defmodule Tricep.Socket do
 
   alias Tricep.Application
   alias Tricep.Tcp
-  require Logger
 
   @spec connect(pid(), :socket.sockaddr_in6()) :: :ok | {:error, any()}
   def connect(pid, address) when is_pid(pid) do
@@ -401,7 +400,6 @@ defmodule Tricep.Socket do
         pair
 
       _ ->
-        Logger.debug("Port #{port} already in use, retrying")
         allocate_port(srcaddr_bin, dst, state)
     end
   end

@@ -56,7 +56,6 @@ defmodule Tricep.TunLink do
   def handle_event(:internal, :read_tun, _, %__MODULE__{} = state) do
     case Tundra.recv(state.tun, state.mtu, :nowait) do
       {:ok, <<_::32, ip_packet::binary>>} ->
-        Logger.debug("Rcvd #{byte_size(ip_packet)} bytes on #{state.name}")
         handle_ip_packet(ip_packet, state)
 
       {:select, _} ->
@@ -110,7 +109,6 @@ defmodule Tricep.TunLink do
         handle_icmpv6(data, src, dst, state)
 
       59 ->
-        Logger.debug("Ignoring IPv6 No Next Header packet (#{len} bytes)")
         {:keep_state_and_data, {:next_event, :internal, :read_tun}}
 
       _ ->
@@ -118,7 +116,6 @@ defmodule Tricep.TunLink do
         handle_ipv6_packet(nh, len - (8 + 8 * hlen), rest, src, dst, state)
     end
 
-    Logger.debug("Handling IPv6 packet (#{len} bytes) with protocol #{prot}")
     {:keep_state_and_data, {:next_event, :internal, :read_tun}}
   end
 
@@ -132,8 +129,7 @@ defmodule Tricep.TunLink do
     {:keep_state_and_data, {:next_event, :internal, :read_tun}}
   end
 
-  defp handle_icmpv6(data, _src, _dst, _state) do
-    Logger.debug("Handling ICMPv6 packet (#{byte_size(data)} bytes)")
+  defp handle_icmpv6(_data, _src, _dst, _state) do
     {:keep_state_and_data, {:next_event, :internal, :read_tun}}
   end
 end
