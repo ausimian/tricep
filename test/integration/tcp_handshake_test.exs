@@ -24,7 +24,6 @@ defmodule Tricep.Integration.TcpHandshakeTest do
 
   describe "TCP three-way handshake" do
     test "completes handshake with kernel TCP listener", %{link: _link} do
-
       # Start a kernel TCP listener on the interface address
       {:ok, listen_sock} = create_kernel_listener(@ifaddr, 44444)
 

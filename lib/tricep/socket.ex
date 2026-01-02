@@ -204,7 +204,12 @@ defmodule Tricep.Socket do
     {:keep_state, new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
   end
 
-  def handle_event(:internal, :flush_send_buffer, :established, %__MODULE__{send_buffer: <<>>} = _state) do
+  def handle_event(
+        :internal,
+        :flush_send_buffer,
+        :established,
+        %__MODULE__{send_buffer: <<>>} = _state
+      ) do
     :keep_state_and_data
   end
 
@@ -268,7 +273,12 @@ defmodule Tricep.Socket do
   end
 
   # Handle recv timeout
-  def handle_event({:timeout, timer_ref}, {:recv_timeout, timer_ref}, :established, %__MODULE__{} = state) do
+  def handle_event(
+        {:timeout, timer_ref},
+        {:recv_timeout, timer_ref},
+        :established,
+        %__MODULE__{} = state
+      ) do
     case List.keytake(state.recv_waiters, timer_ref, 2) do
       {{from, _length, ^timer_ref}, rest} ->
         new_state = %{state | recv_waiters: rest}
@@ -396,7 +406,9 @@ defmodule Tricep.Socket do
             # FIN+ACK of our FIN - go directly to TIME_WAIT
             send_ack(seq + 1, %{state | rcv_nxt: seq + 1})
             new_state = %{state | rcv_nxt: wrap_seq(seq + 1), snd_wnd: window, fin_received: true}
-            {:next_state, :time_wait, new_state, {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+
+            {:next_state, :time_wait, new_state,
+             {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
 
           fin? ->
             # FIN but not ACK of our FIN - simultaneous close
@@ -438,13 +450,22 @@ defmodule Tricep.Socket do
             new_rcv_nxt = wrap_seq(state.rcv_nxt + byte_size(payload) + 1)
             send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
             new_state = %{state | rcv_nxt: new_rcv_nxt, snd_wnd: window, fin_received: true}
-            {:next_state, :time_wait, new_state, {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+
+            {:next_state, :time_wait, new_state,
+             {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
 
           ack? and seq == state.rcv_nxt and byte_size(payload) > 0 ->
             # Data segment - half-close allows peer to still send data
             new_rcv_nxt = wrap_seq(state.rcv_nxt + byte_size(payload))
             send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
-            new_state = %{state | rcv_nxt: new_rcv_nxt, recv_buffer: state.recv_buffer <> payload, snd_wnd: window}
+
+            new_state = %{
+              state
+              | rcv_nxt: new_rcv_nxt,
+                recv_buffer: state.recv_buffer <> payload,
+                snd_wnd: window
+            }
+
             {:keep_state, new_state}
 
           true ->
@@ -470,6 +491,7 @@ defmodule Tricep.Socket do
         if :fin in flags do
           send_ack(state.rcv_nxt, state)
         end
+
         :keep_state_and_data
 
       _ ->
@@ -494,7 +516,9 @@ defmodule Tricep.Socket do
           ack_of_fin? ->
             # ACK of our FIN - go to TIME_WAIT
             new_state = %{state | snd_wnd: window}
-            {:next_state, :time_wait, new_state, {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+
+            {:next_state, :time_wait, new_state,
+             {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
 
           true ->
             :keep_state_and_data
@@ -539,7 +563,12 @@ defmodule Tricep.Socket do
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     Tricep.Link.send(state.link, packet)
 
-    new_state = %{state | send_buffer: rest, snd_nxt: wrap_seq(state.snd_nxt + byte_size(payload))}
+    new_state = %{
+      state
+      | send_buffer: rest,
+        snd_nxt: wrap_seq(state.snd_nxt + byte_size(payload))
+    }
+
     actions = if rest != <<>>, do: [{:next_event, :internal, :flush_send_buffer}], else: []
     {:keep_state, new_state, actions}
   end
