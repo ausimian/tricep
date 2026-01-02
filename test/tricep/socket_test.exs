@@ -728,6 +728,95 @@ defmodule Tricep.SocketTest do
     end
   end
 
+  describe "recv edge cases" do
+    test "recv returns immediately when data already buffered", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Inject data first
+      data_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:ack, :psh],
+          window: 32768,
+          payload: "Pre-buffered data"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      # Wait for it to be processed
+      Process.sleep(50)
+
+      # Drain the ACK
+      assert_receive {:dummy_link_packet, _link, _ack}, 1000
+
+      # Now recv should return immediately (data already buffered)
+      assert Tricep.recv(socket, 0, 1000) == {:ok, "Pre-buffered data"}
+    end
+
+    test "recv timeout that fires after data arrives is ignored", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Start recv with a longer timeout
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, 500) end)
+
+      # Give it time to register waiter
+      Process.sleep(20)
+
+      # Inject data - this should satisfy the waiter and remove it
+      data_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:ack, :psh],
+          window: 32768,
+          payload: "Data arrived"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      # recv should complete with data
+      assert Task.await(recv_task, 1000) == {:ok, "Data arrived"}
+
+      # Wait past the original timeout - no crash should occur
+      # (the timeout fires but waiter is already gone)
+      Process.sleep(600)
+
+      # Socket should still be usable
+      {:established, _} = :sys.get_state(socket)
+    end
+  end
+
   describe "established state edge cases" do
     test "RST notifies waiting receivers", %{
       link: link,
@@ -1126,6 +1215,1424 @@ defmodule Tricep.SocketTest do
 
       # recv should return EOF
       assert Task.await(recv_task, 1000) == {:ok, <<>>}
+    end
+  end
+
+  describe "FIN_WAIT_1 state" do
+    test "RST in FIN_WAIT_1 closes connection", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close to enter FIN_WAIT_1
+      assert Tricep.close(socket) == :ok
+
+      # Drain FIN
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      # Should be in FIN_WAIT_1
+      {:fin_wait_1, _} = :sys.get_state(socket)
+
+      # Send RST
+      rst_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:rst],
+          window: 0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+      Process.sleep(50)
+
+      # Should be closed
+      {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "FIN+ACK in FIN_WAIT_1 goes directly to TIME_WAIT", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close to enter FIN_WAIT_1
+      assert Tricep.close(socket) == :ok
+
+      # Drain FIN
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      {:fin_wait_1, _} = :sys.get_state(socket)
+
+      # Send FIN+ACK (acknowledging our FIN and sending their FIN)
+      fin_ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_ack_segment)
+      Process.sleep(50)
+
+      # Should go directly to TIME_WAIT (skipping FIN_WAIT_2)
+      {:time_wait, _} = :sys.get_state(socket)
+
+      # Should have sent ACK for peer's FIN
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_::binary-size(40), ack_seg::binary>> = ack_packet
+      assert :ack in Tcp.parse_segment(ack_seg).flags
+    end
+
+    test "simultaneous close (FIN without ACK) goes to CLOSING", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close to enter FIN_WAIT_1
+      assert Tricep.close(socket) == :ok
+
+      # Drain FIN
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      {:fin_wait_1, _} = :sys.get_state(socket)
+
+      # Send FIN without ACK of our FIN (simultaneous close - they didn't see our FIN yet)
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      # Should go to CLOSING (simultaneous close)
+      {:closing, _} = :sys.get_state(socket)
+
+      # Should have sent ACK for peer's FIN
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_::binary-size(40), ack_seg::binary>> = ack_packet
+      assert :ack in Tcp.parse_segment(ack_seg).flags
+    end
+
+    test "ignores malformed segment in FIN_WAIT_1", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close to enter FIN_WAIT_1
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      {:fin_wait_1, _} = :sys.get_state(socket)
+
+      # Inject malformed segment
+      DummyLink.inject_packet(link, <<1, 2, 3>>)
+      Process.sleep(50)
+
+      # Should still be in FIN_WAIT_1
+      {:fin_wait_1, _} = :sys.get_state(socket)
+
+      # Now send proper ACK
+      ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+      Process.sleep(50)
+
+      # Should transition to FIN_WAIT_2
+      {:fin_wait_2, _} = :sys.get_state(socket)
+    end
+
+    test "ignores unexpected segment in FIN_WAIT_1", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close to enter FIN_WAIT_1
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      {:fin_wait_1, _} = :sys.get_state(socket)
+
+      # Send ACK with wrong ack number (not ACKing our FIN)
+      wrong_ack =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, wrong_ack)
+      Process.sleep(50)
+
+      # Should still be in FIN_WAIT_1 (wrong ACK ignored)
+      {:fin_wait_1, _} = :sys.get_state(socket)
+    end
+  end
+
+  describe "FIN_WAIT_2 state" do
+    test "RST in FIN_WAIT_2 closes connection", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close and get to FIN_WAIT_2
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      # Send ACK of our FIN
+      ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+      Process.sleep(50)
+
+      {:fin_wait_2, _} = :sys.get_state(socket)
+
+      # Send RST
+      rst_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:rst],
+          window: 0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+      Process.sleep(50)
+
+      {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "data in FIN_WAIT_2 is buffered (half-close)", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close and get to FIN_WAIT_2
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      # Send ACK of our FIN
+      ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+      Process.sleep(50)
+
+      {:fin_wait_2, _} = :sys.get_state(socket)
+
+      # Send data (half-close allows peer to still send)
+      data_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:ack, :psh],
+          window: 32768,
+          payload: "Half-close data"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+      Process.sleep(50)
+
+      # Data should be buffered
+      {:fin_wait_2, fin_wait_2_state} = :sys.get_state(socket)
+      assert fin_wait_2_state.recv_buffer == "Half-close data"
+
+      # Should have sent ACK
+      assert_receive {:dummy_link_packet, _link, _data_ack}, 1000
+    end
+
+    test "ignores malformed segment in FIN_WAIT_2", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close and get to FIN_WAIT_2
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+      Process.sleep(50)
+
+      {:fin_wait_2, _} = :sys.get_state(socket)
+
+      # Inject malformed segment
+      DummyLink.inject_packet(link, <<1, 2, 3>>)
+      Process.sleep(50)
+
+      # Should still be in FIN_WAIT_2
+      {:fin_wait_2, _} = :sys.get_state(socket)
+    end
+
+    test "ignores unexpected segment in FIN_WAIT_2", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close and get to FIN_WAIT_2
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+      Process.sleep(50)
+
+      {:fin_wait_2, _} = :sys.get_state(socket)
+
+      # Send segment with wrong seq (out of order)
+      wrong_seq =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1000,
+          ack: state.snd_nxt + 1,
+          flags: [:ack, :psh],
+          window: 32768,
+          payload: "Wrong seq"
+        )
+
+      DummyLink.inject_packet(link, wrong_seq)
+      Process.sleep(50)
+
+      # Should still be in FIN_WAIT_2 with empty buffer
+      {:fin_wait_2, fin_wait_2_state} = :sys.get_state(socket)
+      assert fin_wait_2_state.recv_buffer == <<>>
+    end
+  end
+
+  describe "TIME_WAIT state" do
+    test "TIME_WAIT expires and closes connection", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close and get to TIME_WAIT via FIN_WAIT_1 -> FIN_WAIT_2 -> TIME_WAIT
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      # ACK our FIN
+      ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+      Process.sleep(50)
+
+      {:fin_wait_2, _} = :sys.get_state(socket)
+
+      # Send FIN from peer
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:time_wait, _} = :sys.get_state(socket)
+
+      # Drain ACK for peer's FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Wait for TIME_WAIT to expire (2 seconds + buffer)
+      Process.sleep(2100)
+
+      {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "FIN retransmit in TIME_WAIT is re-ACKed", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Get to TIME_WAIT
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      # ACK our FIN
+      ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+      Process.sleep(50)
+
+      # Send FIN from peer
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:time_wait, _} = :sys.get_state(socket)
+
+      # Drain first ACK
+      assert_receive {:dummy_link_packet, _link, _first_ack}, 1000
+
+      # Send FIN again (simulating retransmit because peer didn't get our ACK)
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      # Should re-ACK
+      assert_receive {:dummy_link_packet, _link, re_ack_packet}, 1000
+      <<_::binary-size(40), re_ack_seg::binary>> = re_ack_packet
+      assert :ack in Tcp.parse_segment(re_ack_seg).flags
+
+      # Should still be in TIME_WAIT
+      {:time_wait, _} = :sys.get_state(socket)
+    end
+
+    test "non-FIN segment in TIME_WAIT is ignored", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Get to TIME_WAIT
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+      Process.sleep(50)
+
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt + 1,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:time_wait, _} = :sys.get_state(socket)
+
+      # Drain first ACK
+      assert_receive {:dummy_link_packet, _link, _first_ack}, 1000
+
+      # Send non-FIN segment (just ACK)
+      just_ack =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 2,
+          ack: state.snd_nxt + 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, just_ack)
+      Process.sleep(50)
+
+      # Should not send any response (no new packet)
+      refute_receive {:dummy_link_packet, _link, _}, 100
+
+      # Should still be in TIME_WAIT
+      {:time_wait, _} = :sys.get_state(socket)
+    end
+  end
+
+  describe "CLOSING state" do
+    test "RST in CLOSING closes connection", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close to enter FIN_WAIT_1
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      {:fin_wait_1, _} = :sys.get_state(socket)
+
+      # Send FIN without ACK of our FIN (simultaneous close)
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:closing, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _their_fin_ack}, 1000
+
+      # Send RST
+      rst_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 2,
+          ack: state.snd_nxt + 1,
+          flags: [:rst],
+          window: 0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+      Process.sleep(50)
+
+      {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "ACK of our FIN in CLOSING goes to TIME_WAIT", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close to enter FIN_WAIT_1
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      {:fin_wait_1, _} = :sys.get_state(socket)
+
+      # Send FIN without ACK of our FIN (simultaneous close)
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:closing, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _their_fin_ack}, 1000
+
+      # Now send ACK of our FIN
+      our_fin_ack =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 2,
+          ack: state.snd_nxt + 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, our_fin_ack)
+      Process.sleep(50)
+
+      {:time_wait, _} = :sys.get_state(socket)
+    end
+
+    test "ignores malformed segment in CLOSING", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close to enter FIN_WAIT_1
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      # Send FIN without ACK of our FIN (simultaneous close)
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:closing, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _their_fin_ack}, 1000
+
+      # Inject malformed segment
+      DummyLink.inject_packet(link, <<1, 2, 3>>)
+      Process.sleep(50)
+
+      # Should still be in CLOSING
+      {:closing, _} = :sys.get_state(socket)
+    end
+
+    test "ignores unexpected segment in CLOSING", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Close to enter FIN_WAIT_1
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      # Send FIN without ACK of our FIN (simultaneous close)
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:closing, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _their_fin_ack}, 1000
+
+      # Send ACK with wrong ack number
+      wrong_ack =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 2,
+          ack: state.snd_nxt,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, wrong_ack)
+      Process.sleep(50)
+
+      # Should still be in CLOSING (wrong ACK ignored)
+      {:closing, _} = :sys.get_state(socket)
+    end
+  end
+
+  describe "CLOSE_WAIT state" do
+    test "can send data in CLOSE_WAIT", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer (passive close)
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Should still be able to send data
+      assert Tricep.send(socket, "Data after peer FIN") == :ok
+
+      # Should receive data segment
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+      <<_::binary-size(40), data_seg::binary>> = data_packet
+      parsed = Tcp.parse_segment(data_seg)
+      assert parsed.payload == "Data after peer FIN"
+    end
+
+    test "can send large data segmented in CLOSE_WAIT", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, mss: 10)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Send large data that will be segmented
+      assert Tricep.send(socket, "Hello, World!") == :ok
+
+      # Should receive two segments
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+      assert_receive {:dummy_link_packet, _link, packet2}, 1000
+
+      <<_::binary-size(40), seg1::binary>> = packet1
+      <<_::binary-size(40), seg2::binary>> = packet2
+
+      parsed1 = Tcp.parse_segment(seg1)
+      parsed2 = Tcp.parse_segment(seg2)
+
+      assert parsed1.payload == "Hello, Wor"
+      assert parsed2.payload == "ld!"
+    end
+
+    test "close in CLOSE_WAIT sends FIN and goes to LAST_ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Close our side
+      assert Tricep.close(socket) == :ok
+
+      # Should receive our FIN
+      assert_receive {:dummy_link_packet, _link, our_fin_packet}, 1000
+      <<_::binary-size(40), our_fin_seg::binary>> = our_fin_packet
+      parsed = Tcp.parse_segment(our_fin_seg)
+      assert :fin in parsed.flags
+
+      # Should be in LAST_ACK
+      {:last_ack, _} = :sys.get_state(socket)
+    end
+
+    test "RST in CLOSE_WAIT closes connection", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Send RST
+      rst_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 2,
+          ack: state.snd_nxt,
+          flags: [:rst],
+          window: 0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+      Process.sleep(50)
+
+      {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "ACK in CLOSE_WAIT updates snd_una", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, close_wait_state} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Send data
+      assert Tricep.send(socket, "Test") == :ok
+      assert_receive {:dummy_link_packet, _link, _data_packet}, 1000
+
+      # Send ACK for our data
+      data_ack =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 2,
+          ack: close_wait_state.snd_nxt + 4,
+          flags: [:ack],
+          window: 65535
+        )
+
+      DummyLink.inject_packet(link, data_ack)
+      Process.sleep(50)
+
+      # snd_una should be updated
+      {:close_wait, updated_state} = :sys.get_state(socket)
+      assert updated_state.snd_una == close_wait_state.snd_nxt + 4
+      assert updated_state.snd_wnd == 65535
+    end
+
+    test "ignores malformed segment in CLOSE_WAIT", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Inject malformed segment
+      DummyLink.inject_packet(link, <<1, 2, 3>>)
+      Process.sleep(50)
+
+      # Should still be in CLOSE_WAIT
+      {:close_wait, _} = :sys.get_state(socket)
+    end
+  end
+
+  describe "LAST_ACK state" do
+    test "RST in LAST_ACK closes connection", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer to get to CLOSE_WAIT
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Close to get to LAST_ACK
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _our_fin}, 1000
+
+      {:last_ack, _} = :sys.get_state(socket)
+
+      # Send RST
+      rst_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 2,
+          ack: state.snd_nxt + 1,
+          flags: [:rst],
+          window: 0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+      Process.sleep(50)
+
+      {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "ACK of our FIN in LAST_ACK closes connection", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer to get to CLOSE_WAIT
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, _close_wait_state} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Close to get to LAST_ACK
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _our_fin}, 1000
+
+      {:last_ack, last_ack_state} = :sys.get_state(socket)
+
+      # Send ACK of our FIN
+      our_fin_ack =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 2,
+          ack: last_ack_state.snd_nxt,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, our_fin_ack)
+      Process.sleep(50)
+
+      {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "ignores malformed segment in LAST_ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer to get to CLOSE_WAIT
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Close to get to LAST_ACK
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _our_fin}, 1000
+
+      {:last_ack, _} = :sys.get_state(socket)
+
+      # Inject malformed segment
+      DummyLink.inject_packet(link, <<1, 2, 3>>)
+      Process.sleep(50)
+
+      # Should still be in LAST_ACK
+      {:last_ack, _} = :sys.get_state(socket)
+    end
+
+    test "ignores unexpected segment in LAST_ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer to get to CLOSE_WAIT
+      fin_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 1,
+          ack: state.snd_nxt,
+          flags: [:fin, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, _} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Close to get to LAST_ACK
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _our_fin}, 1000
+
+      {:last_ack, last_ack_state} = :sys.get_state(socket)
+
+      # Send ACK with wrong ack number
+      wrong_ack =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: state.irs + 2,
+          ack: last_ack_state.snd_nxt - 1,
+          flags: [:ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, wrong_ack)
+      Process.sleep(50)
+
+      # Should still be in LAST_ACK (wrong ACK ignored)
+      {:last_ack, _} = :sys.get_state(socket)
     end
   end
 
