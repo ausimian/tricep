@@ -36,6 +36,9 @@ defmodule Tricep.Socket do
 
   use TypedStruct
 
+  # Default MSS for IPv6 (1280 min MTU - 40 IPv6 header - 20 TCP header)
+  @default_mss 1220
+
   @typep addr_port() :: {binary(), non_neg_integer()}
   typedstruct enforce: true do
     field :pair, {addr_port(), addr_port()}
@@ -47,6 +50,10 @@ defmodule Tricep.Socket do
     field :irs, non_neg_integer() | nil, default: nil
     field :rcv_nxt, non_neg_integer() | nil, default: nil
     field :rcv_wnd, non_neg_integer() | nil, default: nil
+    # MSS we advertise to peer (what we can receive)
+    field :rcv_mss, non_neg_integer() | nil, default: nil
+    # MSS peer advertised (max we can send)
+    field :snd_mss, non_neg_integer() | nil, default: nil
   end
 
   @impl true
@@ -83,6 +90,7 @@ defmodule Tricep.Socket do
   def handle_event(:internal, {:send_syn, from}, :closed, %__MODULE__{} = state) do
     iss = :crypto.strong_rand_bytes(4) |> :binary.decode_unsigned()
     rcv_wnd = 65535
+    rcv_mss = @default_mss
 
     {{src_addr, src_port}, {dst_addr, dst_port}} = state.pair
 
@@ -96,20 +104,28 @@ defmodule Tricep.Socket do
         ack: 0,
         flags: [:syn],
         window: rcv_wnd,
-        payload: <<>>
+        mss: rcv_mss
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     :ok = Tricep.Link.send(state.link, packet)
 
-    new_state = %{state | iss: iss, snd_una: iss, snd_nxt: iss + 1, snd_wnd: 0, rcv_wnd: rcv_wnd}
+    new_state = %{
+      state
+      | iss: iss,
+        snd_una: iss,
+        snd_nxt: iss + 1,
+        snd_wnd: 0,
+        rcv_wnd: rcv_wnd,
+        rcv_mss: rcv_mss
+    }
 
     {:next_state, {:syn_sent, from}, new_state}
   end
 
   def handle_event(:info, segment, {:syn_sent, from}, %__MODULE__{} = state) do
     case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, window: window} ->
+      %{flags: flags, seq: seq, ack: ack, window: window, options: options} ->
         syn? = :syn in flags
         ack? = :ack in flags
         rst? = :rst in flags
@@ -123,7 +139,17 @@ defmodule Tricep.Socket do
             # Valid SYN-ACK: send ACK and transition to ESTABLISHED
             send_ack(seq + 1, state)
 
-            new_state = %{state | irs: seq, rcv_nxt: seq + 1, snd_una: ack, snd_wnd: window}
+            # Extract peer's MSS from options, default to 1220 (IPv6 min MTU 1280 - 60) if not present
+            snd_mss = Map.get(options, :mss, @default_mss)
+
+            new_state = %{
+              state
+              | irs: seq,
+                rcv_nxt: seq + 1,
+                snd_una: ack,
+                snd_wnd: window,
+                snd_mss: snd_mss
+            }
 
             {:next_state, :established, new_state, {:reply, from, :ok}}
 

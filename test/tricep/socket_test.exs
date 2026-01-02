@@ -336,4 +336,114 @@ defmodule Tricep.SocketTest do
       assert Task.await(task, 1000) == :ok
     end
   end
+
+  describe "MSS option" do
+    test "SYN packet includes MSS option" do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      # Wait for the SYN packet
+      assert_receive {:dummy_link_packet, _link, packet}, 1000
+
+      <<_ip_header::binary-size(40), tcp_segment::binary>> = packet
+      parsed = Tcp.parse_segment(tcp_segment)
+
+      # Should have MSS option set to default (1220 for IPv6)
+      assert parsed.options.mss == 1220
+
+      Task.shutdown(task, :brutal_kill)
+    end
+
+    test "stores peer MSS from SYN-ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      # Wait for SYN
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn_parsed = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      # Send SYN-ACK with MSS option
+      peer_mss = 1460
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: 5000,
+          ack: syn_parsed.seq + 1,
+          flags: [:syn, :ack],
+          window: 32768,
+          mss: peer_mss
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert Task.await(task, 1000) == :ok
+
+      # Check that the socket stored the peer's MSS
+      # gen_statem returns {state_name, state_data}
+      {:established, state} = :sys.get_state(socket)
+      assert state.snd_mss == peer_mss
+      assert state.rcv_mss == 1220
+    end
+
+    test "defaults to 1220 MSS when peer doesn't send MSS option", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      # Wait for SYN
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn_parsed = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      # Send SYN-ACK WITHOUT MSS option
+      syn_ack_segment =
+        Tcp.build_segment(
+          src_addr: local_addr,
+          dst_addr: remote_addr,
+          src_port: @port,
+          dst_port: src_port,
+          seq: 5000,
+          ack: syn_parsed.seq + 1,
+          flags: [:syn, :ack],
+          window: 32768
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert Task.await(task, 1000) == :ok
+
+      # Check that the socket defaulted to 1220 (IPv6 min MTU 1280 - 60 headers)
+      # gen_statem returns {state_name, state_data}
+      {:established, state} = :sys.get_state(socket)
+      assert state.snd_mss == 1220
+    end
+  end
 end

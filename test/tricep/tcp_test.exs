@@ -298,5 +298,145 @@ defmodule Tricep.TcpTest do
       assert parsed.window == 16384
       assert parsed.payload == <<"roundtrip test">>
     end
+
+    test "roundtrip preserves MSS option" do
+      segment =
+        Tcp.build_segment(
+          src_addr: @src_addr,
+          dst_addr: @dst_addr,
+          src_port: 54321,
+          dst_port: 443,
+          seq: 1000,
+          ack: 0,
+          flags: [:syn],
+          window: 65535,
+          mss: 1460
+        )
+
+      parsed = Tcp.parse_segment(segment)
+
+      assert parsed.options.mss == 1460
+    end
+  end
+
+  describe "MSS option" do
+    test "build_segment includes MSS option when specified" do
+      segment =
+        Tcp.build_segment(
+          src_addr: @src_addr,
+          dst_addr: @dst_addr,
+          src_port: 12345,
+          dst_port: 80,
+          seq: 1000,
+          ack: 0,
+          flags: [:syn],
+          window: 65535,
+          mss: 1220
+        )
+
+      # With MSS option (4 bytes padded to 4), header is 24 bytes (data_offset = 6)
+      <<_ports::32, _seq::32, _ack::32, data_offset::4, _::4, _rest::binary>> = segment
+      assert data_offset == 6
+
+      # Segment should be 24 bytes (20 base + 4 options)
+      assert byte_size(segment) == 24
+    end
+
+    test "build_segment without MSS has 20 byte header" do
+      segment =
+        Tcp.build_segment(
+          src_addr: @src_addr,
+          dst_addr: @dst_addr,
+          src_port: 12345,
+          dst_port: 80,
+          seq: 1000,
+          ack: 0,
+          flags: [:syn],
+          window: 65535
+        )
+
+      <<_ports::32, _seq::32, _ack::32, data_offset::4, _::4, _rest::binary>> = segment
+      assert data_offset == 5
+      assert byte_size(segment) == 20
+    end
+
+    test "parse_segment extracts MSS from options" do
+      # Manually build a segment with MSS option
+      # MSS option: kind=2, len=4, value=1460 (0x05B4)
+      options = <<2, 4, 0x05, 0xB4>>
+
+      segment = <<
+        # src_port, dst_port
+        0x30,
+        0x39,
+        0x00,
+        0x50,
+        # seq
+        0x00,
+        0x00,
+        0x03,
+        0xE8,
+        # ack
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        # data_offset=6 (24 bytes), reserved, flags=SYN
+        0x60,
+        0x02,
+        # window
+        0xFF,
+        0xFF,
+        # checksum (ignored in parse)
+        0x00,
+        0x00,
+        # urgent ptr
+        0x00,
+        0x00,
+        # options
+        options::binary
+      >>
+
+      parsed = Tcp.parse_segment(segment)
+      assert parsed.options.mss == 1460
+    end
+
+    test "parse_segment returns empty options map when no options" do
+      segment =
+        Tcp.build_segment(
+          src_addr: @src_addr,
+          dst_addr: @dst_addr,
+          src_port: 12345,
+          dst_port: 80,
+          seq: 1000,
+          ack: 0,
+          flags: [:syn],
+          window: 65535
+        )
+
+      parsed = Tcp.parse_segment(segment)
+      assert parsed.options == %{}
+    end
+
+    test "parse_options handles NOP padding" do
+      # NOP (1), NOP (1), MSS option
+      options = <<1, 1, 2, 4, 0x04, 0xC4>>
+      parsed = Tcp.parse_options(options)
+      assert parsed.mss == 1220
+    end
+
+    test "parse_options handles END option" do
+      # MSS option, then END (0), then garbage
+      options = <<2, 4, 0x04, 0xC4, 0, 99, 99, 99>>
+      parsed = Tcp.parse_options(options)
+      assert parsed.mss == 1220
+    end
+
+    test "parse_options skips unknown options" do
+      # Unknown option kind=42, length=4, then MSS
+      options = <<42, 4, 0xFF, 0xFF, 2, 4, 0x04, 0xC4>>
+      parsed = Tcp.parse_options(options)
+      assert parsed.mss == 1220
+    end
   end
 end

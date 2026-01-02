@@ -7,12 +7,17 @@ defmodule Tricep.Tcp do
 
   @type flag :: :fin | :syn | :rst | :psh | :ack | :urg | :ece | :cwr
 
+  @type tcp_options :: %{
+          optional(:mss) => non_neg_integer()
+        }
+
   @type parsed_segment :: %{
           seq: non_neg_integer(),
           ack: non_neg_integer(),
           flags: [flag()],
           window: non_neg_integer(),
-          payload: binary()
+          payload: binary(),
+          options: tcp_options()
         }
 
   @doc """
@@ -30,6 +35,7 @@ defmodule Tricep.Tcp do
 
   Optional:
   - `:payload` - data payload (default: `<<>>`)
+  - `:mss` - Maximum Segment Size option (typically sent in SYN)
   """
   @spec build_segment(keyword()) :: binary()
   def build_segment(opts) do
@@ -42,8 +48,14 @@ defmodule Tricep.Tcp do
     flags = Keyword.fetch!(opts, :flags)
     window = Keyword.fetch!(opts, :window)
     payload = Keyword.get(opts, :payload, <<>>)
+    mss = Keyword.get(opts, :mss)
 
-    data_offset = 5
+    # Build TCP options
+    options = encode_options(mss: mss)
+    options_len = byte_size(options)
+
+    # data_offset is in 32-bit words (base header is 5 words = 20 bytes)
+    data_offset = 5 + div(options_len, 4)
     reserved = 0
     urgent_ptr = 0
     flag_bits = encode_flags(flags)
@@ -60,6 +72,7 @@ defmodule Tricep.Tcp do
       window::16,
       0::16,
       urgent_ptr::16,
+      options::binary,
       payload::binary
     >>
 
@@ -76,8 +89,31 @@ defmodule Tricep.Tcp do
       window::16,
       checksum::16,
       urgent_ptr::16,
+      options::binary,
       payload::binary
     >>
+  end
+
+  defp encode_options(opts) do
+    mss = Keyword.get(opts, :mss)
+
+    options =
+      if mss do
+        # MSS option: Kind=2, Length=4, Value=MSS
+        <<2, 4, mss::16>>
+      else
+        <<>>
+      end
+
+    # Pad to 32-bit boundary with NOP (kind=1) or END (kind=0)
+    pad_options(options)
+  end
+
+  defp pad_options(options) do
+    case rem(byte_size(options), 4) do
+      0 -> options
+      n -> options <> :binary.copy(<<0>>, 4 - n)
+    end
   end
 
   @doc """
@@ -103,13 +139,14 @@ defmodule Tricep.Tcp do
     options_len = header_bytes - 20
 
     case rest do
-      <<_options::binary-size(options_len), payload::binary>> ->
+      <<options_bin::binary-size(options_len), payload::binary>> ->
         %{
           seq: seq,
           ack: ack,
           flags: decode_flags(flags),
           window: window,
-          payload: payload
+          payload: payload,
+          options: parse_options(options_bin)
         }
 
       _ ->
@@ -118,6 +155,43 @@ defmodule Tricep.Tcp do
   end
 
   def parse_segment(_), do: nil
+
+  @doc """
+  Parses TCP options from the options portion of a TCP header.
+  """
+  @spec parse_options(binary()) :: tcp_options()
+  def parse_options(options_bin) do
+    parse_options(options_bin, %{})
+  end
+
+  defp parse_options(<<>>, acc), do: acc
+
+  # End of options (kind=0)
+  defp parse_options(<<0, _rest::binary>>, acc), do: acc
+
+  # NOP (kind=1)
+  defp parse_options(<<1, rest::binary>>, acc), do: parse_options(rest, acc)
+
+  # MSS (kind=2, length=4)
+  defp parse_options(<<2, 4, mss::16, rest::binary>>, acc) do
+    parse_options(rest, Map.put(acc, :mss, mss))
+  end
+
+  # Unknown option with length - skip it
+  defp parse_options(<<_kind, len, rest::binary>>, acc) when len >= 2 do
+    skip_len = len - 2
+
+    case rest do
+      <<_::binary-size(skip_len), remaining::binary>> ->
+        parse_options(remaining, acc)
+
+      _ ->
+        acc
+    end
+  end
+
+  # Malformed - stop parsing
+  defp parse_options(_, acc), do: acc
 
   @doc """
   Decodes TCP flag bits into a list of flag atoms.
