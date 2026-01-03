@@ -227,32 +227,16 @@ defmodule Tricep.Tcp do
   Calculates the TCP checksum for a segment.
 
   Uses the IPv6 pseudo-header as specified in RFC 2460.
+  The segment can be iodata, avoiding binary concatenation.
   """
-  @spec checksum(binary(), binary(), binary()) :: non_neg_integer()
+  @spec checksum(binary(), binary(), iodata()) :: non_neg_integer()
   def checksum(src_addr, dst_addr, segment)
       when byte_size(src_addr) == 16 and byte_size(dst_addr) == 16 do
-    tcp_len = byte_size(segment)
-
-    pseudo_header = <<
-      src_addr::binary-size(16),
-      dst_addr::binary-size(16),
-      tcp_len::32,
-      0::24,
-      6::8
-    >>
-
-    data = pseudo_header <> segment
-    data = if rem(byte_size(data), 2) == 1, do: data <> <<0>>, else: data
-
-    sum = checksum_fold(data, 0)
-    bnot(sum) &&& 0xFFFF
+    Tricep.Nifs.checksum([
+      src_addr,
+      dst_addr,
+      <<IO.iodata_length(segment)::32, 0::24, 6::8>>,
+      segment
+    ])
   end
-
-  defp checksum_fold(<<word::16, rest::binary>>, acc) do
-    sum = acc + word
-    carry = sum >>> 16
-    checksum_fold(rest, (sum &&& 0xFFFF) + carry)
-  end
-
-  defp checksum_fold(<<>>, acc), do: acc
 end
