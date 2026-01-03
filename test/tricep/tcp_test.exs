@@ -81,19 +81,10 @@ defmodule Tricep.TcpTest do
     end
   end
 
-  describe "build_segment/1" do
+  describe "build_segment/6" do
     test "builds valid TCP segment with SYN flag" do
       segment =
-        Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 12345,
-          dst_port: 80,
-          seq: 1000,
-          ack: 0,
-          flags: [:syn],
-          window: 65535
-        )
+        Tcp.build_segment({{@src_addr, 12345}, {@dst_addr, 80}}, 1000, 0, [:syn], 65535)
 
       # Minimum TCP header is 20 bytes (no options, data_offset=5)
       assert byte_size(segment) == 20
@@ -126,14 +117,11 @@ defmodule Tricep.TcpTest do
 
       segment =
         Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 12345,
-          dst_port: 80,
-          seq: 1000,
-          ack: 2000,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{@src_addr, 12345}, {@dst_addr, 80}},
+          1000,
+          2000,
+          [:ack, :psh],
+          32768,
           payload: payload
         )
 
@@ -145,16 +133,7 @@ defmodule Tricep.TcpTest do
 
     test "calculates non-zero checksum" do
       segment =
-        Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 12345,
-          dst_port: 80,
-          seq: 1000,
-          ack: 0,
-          flags: [:syn],
-          window: 65535
-        )
+        Tcp.build_segment({{@src_addr, 12345}, {@dst_addr, 80}}, 1000, 0, [:syn], 65535)
 
       <<_::binary-size(16), checksum::16, _::binary>> = segment
       assert checksum != 0
@@ -164,16 +143,7 @@ defmodule Tricep.TcpTest do
   describe "parse_segment/1" do
     test "parses valid SYN segment" do
       segment =
-        Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 12345,
-          dst_port: 80,
-          seq: 1000,
-          ack: 0,
-          flags: [:syn],
-          window: 65535
-        )
+        Tcp.build_segment({{@src_addr, 12345}, {@dst_addr, 80}}, 1000, 0, [:syn], 65535)
 
       parsed = Tcp.parse_segment(segment)
 
@@ -189,14 +159,11 @@ defmodule Tricep.TcpTest do
 
       segment =
         Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 12345,
-          dst_port: 80,
-          seq: 1000,
-          ack: 2000,
-          flags: [:ack],
-          window: 32768,
+          {{@src_addr, 12345}, {@dst_addr, 80}},
+          1000,
+          2000,
+          [:ack],
+          32768,
           payload: payload
         )
 
@@ -249,16 +216,7 @@ defmodule Tricep.TcpTest do
     test "checksum validates correctly" do
       # Build a segment, then verify the checksum is valid
       segment =
-        Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 12345,
-          dst_port: 80,
-          seq: 1000,
-          ack: 0,
-          flags: [:syn],
-          window: 65535
-        )
+        Tcp.build_segment({{@src_addr, 12345}, {@dst_addr, 80}}, 1000, 0, [:syn], 65535)
 
       # Extract the checksum
       <<_::binary-size(16), original_checksum::16, _::binary>> = segment
@@ -274,18 +232,15 @@ defmodule Tricep.TcpTest do
     end
   end
 
-  describe "build_segment/1 and parse_segment/1 roundtrip" do
+  describe "build_segment/6 and parse_segment/1 roundtrip" do
     test "roundtrip preserves segment data" do
       segment =
         Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 54321,
-          dst_port: 443,
-          seq: 0xDEADBEEF,
-          ack: 0xCAFEBABE,
-          flags: [:syn, :ack],
-          window: 16384,
+          {{@src_addr, 54321}, {@dst_addr, 443}},
+          0xDEADBEEF,
+          0xCAFEBABE,
+          [:syn, :ack],
+          16384,
           payload: <<"roundtrip test">>
         )
 
@@ -302,14 +257,11 @@ defmodule Tricep.TcpTest do
     test "roundtrip preserves MSS option" do
       segment =
         Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 54321,
-          dst_port: 443,
-          seq: 1000,
-          ack: 0,
-          flags: [:syn],
-          window: 65535,
+          {{@src_addr, 54321}, {@dst_addr, 443}},
+          1000,
+          0,
+          [:syn],
+          65535,
           mss: 1460
         )
 
@@ -323,14 +275,11 @@ defmodule Tricep.TcpTest do
     test "build_segment includes MSS option when specified" do
       segment =
         Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 12345,
-          dst_port: 80,
-          seq: 1000,
-          ack: 0,
-          flags: [:syn],
-          window: 65535,
+          {{@src_addr, 12345}, {@dst_addr, 80}},
+          1000,
+          0,
+          [:syn],
+          65535,
           mss: 1220
         )
 
@@ -344,16 +293,7 @@ defmodule Tricep.TcpTest do
 
     test "build_segment without MSS has 20 byte header" do
       segment =
-        Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 12345,
-          dst_port: 80,
-          seq: 1000,
-          ack: 0,
-          flags: [:syn],
-          window: 65535
-        )
+        Tcp.build_segment({{@src_addr, 12345}, {@dst_addr, 80}}, 1000, 0, [:syn], 65535)
 
       <<_ports::32, _seq::32, _ack::32, data_offset::4, _::4, _rest::binary>> = segment
       assert data_offset == 5
@@ -403,16 +343,7 @@ defmodule Tricep.TcpTest do
 
     test "parse_segment returns empty options map when no options" do
       segment =
-        Tcp.build_segment(
-          src_addr: @src_addr,
-          dst_addr: @dst_addr,
-          src_port: 12345,
-          dst_port: 80,
-          seq: 1000,
-          ack: 0,
-          flags: [:syn],
-          window: 65535
-        )
+        Tcp.build_segment({{@src_addr, 12345}, {@dst_addr, 80}}, 1000, 0, [:syn], 65535)
 
       parsed = Tcp.parse_segment(segment)
       assert parsed.options == %{}

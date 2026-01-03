@@ -21,32 +21,30 @@ defmodule Tricep.Tcp do
         }
 
   @doc """
-  Builds a TCP segment with the given options.
+  Builds a TCP segment.
 
-  Required options:
-  - `:src_addr` - source IPv6 address (16 bytes)
-  - `:dst_addr` - destination IPv6 address (16 bytes)
-  - `:src_port` - source port
-  - `:dst_port` - destination port
-  - `:seq` - sequence number
-  - `:ack` - acknowledgment number
-  - `:flags` - list of flags (e.g., `[:syn, :ack]`)
-  - `:window` - window size
+  ## Arguments
 
-  Optional:
-  - `:payload` - data payload (default: `<<>>`)
-  - `:mss` - Maximum Segment Size option (typically sent in SYN)
+  - `pair` - tuple of `{{src_addr, src_port}, {dst_addr, dst_port}}`
+  - `seq` - sequence number
+  - `ack` - acknowledgment number
+  - `flags` - list of flags (e.g., `[:syn, :ack]`)
+  - `window` - window size
+  - `opts` - optional keyword list:
+    - `:payload` - data payload (default: `<<>>`)
+    - `:mss` - Maximum Segment Size option (typically sent in SYN)
   """
-  @spec build_segment(keyword()) :: binary()
-  def build_segment(opts) do
-    src_addr = Keyword.fetch!(opts, :src_addr)
-    dst_addr = Keyword.fetch!(opts, :dst_addr)
-    src_port = Keyword.fetch!(opts, :src_port)
-    dst_port = Keyword.fetch!(opts, :dst_port)
-    seq = Keyword.fetch!(opts, :seq)
-    ack = Keyword.fetch!(opts, :ack)
-    flags = Keyword.fetch!(opts, :flags)
-    window = Keyword.fetch!(opts, :window)
+  @spec build_segment(
+          {{binary(), non_neg_integer()}, {binary(), non_neg_integer()}},
+          non_neg_integer(),
+          non_neg_integer(),
+          [flag()],
+          non_neg_integer(),
+          keyword()
+        ) :: binary()
+  def build_segment(pair, seq, ack, flags, window, opts \\ [])
+
+  def build_segment({{src_addr, src_port}, {dst_addr, dst_port}}, seq, ack, flags, window, opts) do
     payload = Keyword.get(opts, :payload, <<>>)
     mss = Keyword.get(opts, :mss)
 

@@ -121,20 +121,10 @@ defmodule Tricep.Socket do
     rcv_wnd = 65535
     rcv_mss = @default_mss
 
-    {{src_addr, src_port}, {dst_addr, dst_port}} = state.pair
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(
-        src_addr: src_addr,
-        dst_addr: dst_addr,
-        src_port: src_port,
-        dst_port: dst_port,
-        seq: iss,
-        ack: 0,
-        flags: [:syn],
-        window: rcv_wnd,
-        mss: rcv_mss
-      )
+      Tcp.build_segment(state.pair, iss, 0, [:syn], rcv_wnd, mss: rcv_mss)
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     :ok = Tricep.Link.send(state.link, packet)
@@ -218,18 +208,15 @@ defmodule Tricep.Socket do
     mss = state.snd_mss || @default_mss
     {payload, rest} = split_binary(state.send_buffer, mss)
 
-    {{src_addr, src_port}, {dst_addr, dst_port}} = state.pair
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
       Tcp.build_segment(
-        src_addr: src_addr,
-        dst_addr: dst_addr,
-        src_port: src_port,
-        dst_port: dst_port,
-        seq: state.snd_nxt,
-        ack: state.rcv_nxt,
-        flags: [:ack, :psh],
-        window: state.rcv_wnd,
+        state.pair,
+        state.snd_nxt,
+        state.rcv_nxt,
+        [:ack, :psh],
+        state.rcv_wnd,
         payload: payload
       )
 
@@ -545,18 +532,15 @@ defmodule Tricep.Socket do
     mss = state.snd_mss || @default_mss
     {payload, rest} = split_binary(state.send_buffer, mss)
 
-    {{src_addr, src_port}, {dst_addr, dst_port}} = state.pair
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
       Tcp.build_segment(
-        src_addr: src_addr,
-        dst_addr: dst_addr,
-        src_port: src_port,
-        dst_port: dst_port,
-        seq: state.snd_nxt,
-        ack: state.rcv_nxt,
-        flags: [:ack, :psh],
-        window: state.rcv_wnd,
+        state.pair,
+        state.snd_nxt,
+        state.rcv_nxt,
+        [:ack, :psh],
+        state.rcv_wnd,
         payload: payload
       )
 
@@ -661,60 +645,28 @@ defmodule Tricep.Socket do
   end
 
   defp send_ack(ack_num, %__MODULE__{} = state) do
-    {{src_addr, src_port}, {dst_addr, dst_port}} = state.pair
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
-    tcp_segment =
-      Tcp.build_segment(
-        src_addr: src_addr,
-        dst_addr: dst_addr,
-        src_port: src_port,
-        dst_port: dst_port,
-        seq: state.snd_nxt,
-        ack: ack_num,
-        flags: [:ack],
-        window: state.rcv_wnd,
-        payload: <<>>
-      )
+    tcp_segment = Tcp.build_segment(state.pair, state.snd_nxt, ack_num, [:ack], state.rcv_wnd)
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     Tricep.Link.send(state.link, packet)
   end
 
   defp send_rst(seq_num, %__MODULE__{} = state) do
-    {{src_addr, src_port}, {dst_addr, dst_port}} = state.pair
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
-    tcp_segment =
-      Tcp.build_segment(
-        src_addr: src_addr,
-        dst_addr: dst_addr,
-        src_port: src_port,
-        dst_port: dst_port,
-        seq: seq_num,
-        ack: 0,
-        flags: [:rst],
-        window: 0,
-        payload: <<>>
-      )
+    tcp_segment = Tcp.build_segment(state.pair, seq_num, 0, [:rst], 0)
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     Tricep.Link.send(state.link, packet)
   end
 
   defp send_fin(%__MODULE__{} = state) do
-    {{src_addr, src_port}, {dst_addr, dst_port}} = state.pair
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(
-        src_addr: src_addr,
-        dst_addr: dst_addr,
-        src_port: src_port,
-        dst_port: dst_port,
-        seq: state.snd_nxt,
-        ack: state.rcv_nxt,
-        flags: [:fin, :ack],
-        window: state.rcv_wnd,
-        payload: <<>>
-      )
+      Tcp.build_segment(state.pair, state.snd_nxt, state.rcv_nxt, [:fin, :ack], state.rcv_wnd)
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     Tricep.Link.send(state.link, packet)

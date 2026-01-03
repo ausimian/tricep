@@ -81,14 +81,11 @@ defmodule Tricep.SocketTest do
 
       syn_ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: server_seq,
-          ack: syn_parsed.seq + 1,
-          flags: [:syn, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          server_seq,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
         )
 
       # Inject the SYN-ACK
@@ -129,14 +126,11 @@ defmodule Tricep.SocketTest do
       # Build a RST response
       rst_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: 0,
-          ack: 0,
-          flags: [:rst],
-          window: 0
+          {{local_addr, @port}, {remote_addr, src_port}},
+          0,
+          0,
+          [:rst],
+          0
         )
 
       DummyLink.inject_packet(link, rst_segment)
@@ -167,14 +161,11 @@ defmodule Tricep.SocketTest do
       # Build an ACK with wrong ACK number (not SYN-ACK, just ACK)
       bad_ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: 5000,
-          ack: syn_parsed.seq + 999,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 999,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, bad_ack_segment)
@@ -236,14 +227,11 @@ defmodule Tricep.SocketTest do
       # Socket should still be waiting - send proper SYN-ACK
       syn_ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: 5000,
-          ack: syn_parsed.seq + 1,
-          flags: [:syn, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, syn_ack_segment)
@@ -274,14 +262,11 @@ defmodule Tricep.SocketTest do
       # Send SYN-ACK
       syn_ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: 5000,
-          ack: syn_parsed.seq + 1,
-          flags: [:syn, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, syn_ack_segment)
@@ -319,14 +304,11 @@ defmodule Tricep.SocketTest do
       # Send a SYN-only packet (should be ignored, we need SYN+ACK)
       syn_only =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: 1000,
-          ack: 0,
-          flags: [:syn],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          1000,
+          0,
+          [:syn],
+          32768
         )
 
       DummyLink.inject_packet(link, syn_only)
@@ -337,14 +319,11 @@ defmodule Tricep.SocketTest do
       # Socket should still be waiting - send proper SYN-ACK
       syn_ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: 5000,
-          ack: syn_parsed.seq + 1,
-          flags: [:syn, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, syn_ack_segment)
@@ -373,14 +352,11 @@ defmodule Tricep.SocketTest do
       # Use handle_packet directly to route a SYN-ACK
       syn_ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: 5000,
-          ack: syn_parsed.seq + 1,
-          flags: [:syn, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
         )
 
       # Call handle_packet directly (simulating what DummyLink.inject_packet does)
@@ -435,14 +411,11 @@ defmodule Tricep.SocketTest do
 
       syn_ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: 5000,
-          ack: syn_parsed.seq + 1,
-          flags: [:syn, :ack],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768,
           mss: peer_mss
         )
 
@@ -479,14 +452,11 @@ defmodule Tricep.SocketTest do
       # Send SYN-ACK WITHOUT MSS option
       syn_ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: 5000,
-          ack: syn_parsed.seq + 1,
-          flags: [:syn, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, syn_ack_segment)
@@ -576,14 +546,11 @@ defmodule Tricep.SocketTest do
       # Inject data from peer
       data_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
           payload: "Hello from peer"
         )
 
@@ -623,14 +590,11 @@ defmodule Tricep.SocketTest do
       # Inject data
       data_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
           payload: "Delayed data"
         )
 
@@ -687,14 +651,11 @@ defmodule Tricep.SocketTest do
       # Inject only 10 bytes - should still be waiting
       data_segment1 =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
           payload: "1234567890"
         )
 
@@ -710,14 +671,11 @@ defmodule Tricep.SocketTest do
       # Inject another 10 bytes
       data_segment2 =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1 + 10,
-          ack: state.snd_nxt,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1 + 10,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
           payload: "ABCDEFGHIJ"
         )
 
@@ -746,14 +704,11 @@ defmodule Tricep.SocketTest do
       # Inject data first
       data_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
           payload: "Pre-buffered data"
         )
 
@@ -792,14 +747,11 @@ defmodule Tricep.SocketTest do
       # Inject data - this should satisfy the waiter and remove it
       data_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
           payload: "Data arrived"
         )
 
@@ -841,14 +793,11 @@ defmodule Tricep.SocketTest do
       # Inject RST
       rst_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:rst],
-          window: 0
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:rst],
+          0
         )
 
       DummyLink.inject_packet(link, rst_segment)
@@ -877,14 +826,11 @@ defmodule Tricep.SocketTest do
 
       ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:ack],
-          window: new_window
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack],
+          new_window
         )
 
       DummyLink.inject_packet(link, ack_segment)
@@ -915,14 +861,11 @@ defmodule Tricep.SocketTest do
       # Inject packet with wrong sequence number (too high)
       wrong_seq_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1000,
-          ack: state.snd_nxt,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1000,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
           payload: "Out of order"
         )
 
@@ -967,14 +910,11 @@ defmodule Tricep.SocketTest do
       # Can still recv properly formatted data
       data_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
           payload: "Valid data"
         )
 
@@ -1033,14 +973,11 @@ defmodule Tricep.SocketTest do
       # Send ACK of our FIN
       ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, ack_segment)
@@ -1052,14 +989,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -1092,14 +1026,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -1132,14 +1063,11 @@ defmodule Tricep.SocketTest do
       # Send data with FIN
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768,
           payload: "Final data"
         )
 
@@ -1201,14 +1129,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -1245,14 +1170,11 @@ defmodule Tricep.SocketTest do
       # Send RST
       rst_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:rst],
-          window: 0
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:rst],
+          0
         )
 
       DummyLink.inject_packet(link, rst_segment)
@@ -1287,14 +1209,11 @@ defmodule Tricep.SocketTest do
       # Send FIN+ACK (acknowledging our FIN and sending their FIN)
       fin_ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_ack_segment)
@@ -1334,14 +1253,11 @@ defmodule Tricep.SocketTest do
       # Send FIN without ACK of our FIN (simultaneous close - they didn't see our FIN yet)
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -1386,14 +1302,11 @@ defmodule Tricep.SocketTest do
       # Now send proper ACK
       ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, ack_segment)
@@ -1426,14 +1339,11 @@ defmodule Tricep.SocketTest do
       # Send ACK with wrong ack number (not ACKing our FIN)
       wrong_ack =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, wrong_ack)
@@ -1466,14 +1376,11 @@ defmodule Tricep.SocketTest do
       # Send ACK of our FIN
       ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, ack_segment)
@@ -1484,14 +1391,11 @@ defmodule Tricep.SocketTest do
       # Send RST
       rst_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:rst],
-          window: 0
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:rst],
+          0
         )
 
       DummyLink.inject_packet(link, rst_segment)
@@ -1521,14 +1425,11 @@ defmodule Tricep.SocketTest do
       # Send ACK of our FIN
       ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, ack_segment)
@@ -1539,14 +1440,11 @@ defmodule Tricep.SocketTest do
       # Send data (half-close allows peer to still send)
       data_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack, :psh],
+          32768,
           payload: "Half-close data"
         )
 
@@ -1581,14 +1479,11 @@ defmodule Tricep.SocketTest do
 
       ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, ack_segment)
@@ -1624,14 +1519,11 @@ defmodule Tricep.SocketTest do
 
       ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, ack_segment)
@@ -1642,14 +1534,11 @@ defmodule Tricep.SocketTest do
       # Send segment with wrong seq (out of order)
       wrong_seq =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1000,
-          ack: state.snd_nxt + 1,
-          flags: [:ack, :psh],
-          window: 32768,
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1000,
+          state.snd_nxt + 1,
+          [:ack, :psh],
+          32768,
           payload: "Wrong seq"
         )
 
@@ -1684,14 +1573,11 @@ defmodule Tricep.SocketTest do
       # ACK our FIN
       ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, ack_segment)
@@ -1702,14 +1588,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -1747,14 +1630,11 @@ defmodule Tricep.SocketTest do
       # ACK our FIN
       ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, ack_segment)
@@ -1763,14 +1643,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -1814,14 +1691,11 @@ defmodule Tricep.SocketTest do
 
       ack_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, ack_segment)
@@ -1829,14 +1703,11 @@ defmodule Tricep.SocketTest do
 
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt + 1,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -1850,14 +1721,11 @@ defmodule Tricep.SocketTest do
       # Send non-FIN segment (just ACK)
       just_ack =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 2,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 2,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, just_ack)
@@ -1895,14 +1763,11 @@ defmodule Tricep.SocketTest do
       # Send FIN without ACK of our FIN (simultaneous close)
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -1916,14 +1781,11 @@ defmodule Tricep.SocketTest do
       # Send RST
       rst_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 2,
-          ack: state.snd_nxt + 1,
-          flags: [:rst],
-          window: 0
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 2,
+          state.snd_nxt + 1,
+          [:rst],
+          0
         )
 
       DummyLink.inject_packet(link, rst_segment)
@@ -1955,14 +1817,11 @@ defmodule Tricep.SocketTest do
       # Send FIN without ACK of our FIN (simultaneous close)
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -1976,14 +1835,11 @@ defmodule Tricep.SocketTest do
       # Now send ACK of our FIN
       our_fin_ack =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 2,
-          ack: state.snd_nxt + 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 2,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, our_fin_ack)
@@ -2013,14 +1869,11 @@ defmodule Tricep.SocketTest do
       # Send FIN without ACK of our FIN (simultaneous close)
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2060,14 +1913,11 @@ defmodule Tricep.SocketTest do
       # Send FIN without ACK of our FIN (simultaneous close)
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2081,14 +1931,11 @@ defmodule Tricep.SocketTest do
       # Send ACK with wrong ack number
       wrong_ack =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 2,
-          ack: state.snd_nxt,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 2,
+          state.snd_nxt,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, wrong_ack)
@@ -2117,14 +1964,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer (passive close)
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2162,14 +2006,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2214,14 +2055,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2262,14 +2100,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2283,14 +2118,11 @@ defmodule Tricep.SocketTest do
       # Send RST
       rst_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 2,
-          ack: state.snd_nxt,
-          flags: [:rst],
-          window: 0
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 2,
+          state.snd_nxt,
+          [:rst],
+          0
         )
 
       DummyLink.inject_packet(link, rst_segment)
@@ -2316,14 +2148,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2341,14 +2170,11 @@ defmodule Tricep.SocketTest do
       # Send ACK for our data
       data_ack =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 2,
-          ack: close_wait_state.snd_nxt + 4,
-          flags: [:ack],
-          window: 65535
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 2,
+          close_wait_state.snd_nxt + 4,
+          [:ack],
+          65535
         )
 
       DummyLink.inject_packet(link, data_ack)
@@ -2377,14 +2203,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2422,14 +2245,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer to get to CLOSE_WAIT
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2449,14 +2269,11 @@ defmodule Tricep.SocketTest do
       # Send RST
       rst_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 2,
-          ack: state.snd_nxt + 1,
-          flags: [:rst],
-          window: 0
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 2,
+          state.snd_nxt + 1,
+          [:rst],
+          0
         )
 
       DummyLink.inject_packet(link, rst_segment)
@@ -2482,14 +2299,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer to get to CLOSE_WAIT
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2509,14 +2323,11 @@ defmodule Tricep.SocketTest do
       # Send ACK of our FIN
       our_fin_ack =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 2,
-          ack: last_ack_state.snd_nxt,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 2,
+          last_ack_state.snd_nxt,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, our_fin_ack)
@@ -2542,14 +2353,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer to get to CLOSE_WAIT
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2591,14 +2399,11 @@ defmodule Tricep.SocketTest do
       # Send FIN from peer to get to CLOSE_WAIT
       fin_segment =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 1,
-          ack: state.snd_nxt,
-          flags: [:fin, :ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
         )
 
       DummyLink.inject_packet(link, fin_segment)
@@ -2618,14 +2423,11 @@ defmodule Tricep.SocketTest do
       # Send ACK with wrong ack number
       wrong_ack =
         Tcp.build_segment(
-          src_addr: local_addr,
-          dst_addr: remote_addr,
-          src_port: @port,
-          dst_port: src_port,
-          seq: state.irs + 2,
-          ack: last_ack_state.snd_nxt - 1,
-          flags: [:ack],
-          window: 32768
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 2,
+          last_ack_state.snd_nxt - 1,
+          [:ack],
+          32768
         )
 
       DummyLink.inject_packet(link, wrong_ack)
@@ -2656,19 +2458,17 @@ defmodule Tricep.SocketTest do
     server_seq = 5000
     mss = Keyword.get(opts, :mss)
 
-    syn_ack_opts = [
-      src_addr: local_addr,
-      dst_addr: remote_addr,
-      src_port: @port,
-      dst_port: src_port,
-      seq: server_seq,
-      ack: syn_parsed.seq + 1,
-      flags: [:syn, :ack],
-      window: 32768
-    ]
+    segment_opts = if mss, do: [mss: mss], else: []
 
-    syn_ack_opts = if mss, do: Keyword.put(syn_ack_opts, :mss, mss), else: syn_ack_opts
-    syn_ack_segment = Tcp.build_segment(syn_ack_opts)
+    syn_ack_segment =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        server_seq,
+        syn_parsed.seq + 1,
+        [:syn, :ack],
+        32768,
+        segment_opts
+      )
 
     DummyLink.inject_packet(link, syn_ack_segment)
 
