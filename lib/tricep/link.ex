@@ -6,7 +6,13 @@ defmodule Tricep.Link do
   end
 
   def drop(pid) when is_pid(pid) do
+    ref = Process.monitor(pid)
     Kernel.send(pid, {:stop, :shutdown})
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    end
+
     :ok
   end
 

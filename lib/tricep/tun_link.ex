@@ -23,6 +23,7 @@ defmodule Tricep.TunLink do
     field :tun, Tundra.tun_device()
     field :name, String.t()
     field :mtu, non_neg_integer() | nil, default: nil
+    field :tph, binary()
   end
 
   @impl true
@@ -34,11 +35,17 @@ defmodule Tricep.TunLink do
     dstaddr = Keyword.fetch!(opts, :dstaddr)
     ifopts = Keyword.take(opts, [:dstaddr, :netmask, :mtu])
 
+    tph =
+      case :os.type() do
+        {:unix, :linux} -> <<0::16, 0x86DD::16>>
+        {:unix, :darwin} -> <<30::32-big>>
+      end
+
     with {:ok, ifaddr_bin} <- Tricep.Address.from(ifaddr),
          {:ok, dstaddr_bin} <- Tricep.Address.from(dstaddr),
          {:ok, {tun, name}} <- Tundra.create(ifaddr, ifopts),
          :ok <- Tricep.Application.register_link(dstaddr_bin, ifaddr_bin) do
-      {:ok, :ready, %__MODULE__{tun: tun, name: name}, {:next_event, :internal, :read_mtu}}
+      {:ok, :ready, %__MODULE__{tun: tun, name: name, tph: tph}, {:next_event, :internal, :read_mtu}}
     end
   end
 
@@ -58,16 +65,17 @@ defmodule Tricep.TunLink do
       {:ok, <<_::32, ip_packet::binary>>} ->
         handle_ip_packet(ip_packet, state)
 
+      {:ok, <<>>} ->
+        # Empty read on macOS means socket was closed
+        {:stop, :normal, state}
+
       {:select, _} ->
         :keep_state_and_data
     end
   end
 
   def handle_event(:info, {:send, packet}, :ready, %__MODULE__{} = state) do
-    # TUN devices expect a 4-byte header: 2 bytes flags + 2 bytes protocol (Linux)
-    # For IPv6: protocol = 0x86DD
-    # TODO: macOS uses a different header format (4-byte AF in host byte order, AF_INET6 = 30)
-    frame = <<0::16, 0x86DD::16, packet::binary>>
+    frame = [state.tph, packet]
 
     case Tundra.send(state.tun, frame, :nowait) do
       :ok ->

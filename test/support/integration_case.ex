@@ -25,36 +25,27 @@ defmodule Tricep.IntegrationCase do
   end
 
   @doc """
-  Creates a TUN link for testing and returns it.
-  The link is automatically cleaned up when the test process exits.
-  """
-  def create_test_link(opts \\ []) do
-    ifaddr = Keyword.get(opts, :ifaddr, "fd00::1")
-    dstaddr = Keyword.get(opts, :dstaddr, "fd00::2")
-    netmask = Keyword.get(opts, :netmask, "ffff:ffff:ffff:ffff::")
-    mtu = Keyword.get(opts, :mtu, 1500)
-
-    {:ok, link} =
-      Tricep.Link.new(
-        ifaddr: ifaddr,
-        dstaddr: dstaddr,
-        netmask: netmask,
-        mtu: mtu
-      )
-
-    link
-  end
-
-  @doc """
   Creates a listening TCP socket on the kernel network stack.
-  Returns `{:ok, listen_socket}` or `{:error, reason}`.
+  Returns `{:ok, listen_socket, port}` or `{:error, reason}`.
+  Uses ephemeral port by default (port 0).
   """
-  def create_kernel_listener(addr, port) do
-    with {:ok, sock} <- :socket.open(:inet6, :stream, :tcp),
-         :ok <- :socket.setopt(sock, {:socket, :reuseaddr}, true),
-         :ok <- :socket.bind(sock, %{family: :inet6, addr: addr, port: port}),
-         :ok <- :socket.listen(sock) do
-      {:ok, sock}
+  def create_kernel_listener(addr, port \\ 0, attempts \\ 100)
+  def create_kernel_listener(_addr, _port, 0), do: {:error, :eaddrnotavail}
+
+  def create_kernel_listener(addr, port, attempts) do
+    {:ok, sock} = :socket.open(:inet6, :stream, :tcp)
+    :ok = :socket.setopt(sock, {:socket, :reuseaddr}, true)
+
+    case :socket.bind(sock, %{family: :inet6, addr: addr, port: port}) do
+      :ok ->
+        :ok = :socket.listen(sock)
+        {:ok, %{port: actual_port}} = :socket.sockname(sock)
+        {:ok, sock, actual_port}
+
+      {:error, :eaddrnotavail} ->
+        :socket.close(sock)
+        Process.sleep(20)
+        create_kernel_listener(addr, port, attempts - 1)
     end
   end
 

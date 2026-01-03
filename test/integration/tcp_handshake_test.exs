@@ -8,24 +8,15 @@ defmodule Tricep.Integration.TcpHandshakeTest do
 
   use Tricep.IntegrationCase
 
-  @ifaddr {0xFD00, 0, 0, 0, 0, 0, 0, 0x21}
-  @ifaddr_str "fd00::21"
-  @dstaddr_str "fd00::22"
-
   setup do
-    link = create_test_link(ifaddr: @ifaddr_str, dstaddr: @dstaddr_str)
-
-    on_exit(fn ->
-      Tricep.Link.drop(link)
-    end)
-
-    %{link: link}
+    # Use shared TUN from test_helper.exs
+    ExUnit.configuration()[:tricep]
   end
 
   describe "TCP three-way handshake" do
-    test "completes handshake with kernel TCP listener", %{link: _link} do
+    test "completes handshake with kernel TCP listener", ctx do
       # Start a kernel TCP listener on the interface address
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, 44444)
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       # Start an async task to accept the connection
       accept_task =
@@ -38,7 +29,7 @@ defmodule Tricep.Integration.TcpHandshakeTest do
 
       # Open a Tricep socket and connect
       {:ok, sock} = Tricep.open(:inet6, :stream, :tcp)
-      address = %{family: :inet6, addr: @ifaddr, port: 44444}
+      address = %{family: :inet6, addr: ctx.ifaddr, port: port}
 
       # This should complete the three-way handshake
       result = Tricep.connect(sock, address)
@@ -53,10 +44,10 @@ defmodule Tricep.Integration.TcpHandshakeTest do
       :socket.close(listen_sock)
     end
 
-    test "returns error when connection is refused", %{link: _link} do
+    test "returns error when connection is refused", ctx do
       # Open a Tricep socket and try to connect to a port with no listener
       {:ok, sock} = Tricep.open(:inet6, :stream, :tcp)
-      address = %{family: :inet6, addr: @ifaddr, port: 55555}
+      address = %{family: :inet6, addr: ctx.ifaddr, port: 55555}
 
       # This should fail with connection refused (RST received)
       result = Tricep.connect(sock, address)
@@ -64,7 +55,7 @@ defmodule Tricep.Integration.TcpHandshakeTest do
       assert result == {:error, :econnrefused}
     end
 
-    test "returns error for unreachable destination", %{link: _link} do
+    test "returns error for unreachable destination", _ctx do
       # Try to connect to an address not covered by the TUN link
       {:ok, sock} = Tricep.open(:inet6, :stream, :tcp)
       address = %{family: :inet6, addr: {0x2001, 0x0DB8, 0, 0, 0, 0, 0, 1}, port: 80}
@@ -76,10 +67,10 @@ defmodule Tricep.Integration.TcpHandshakeTest do
   end
 
   describe "multiple connections" do
-    test "can establish multiple simultaneous connections", %{link: _link} do
+    test "can establish multiple simultaneous connections", ctx do
       # Start listeners on different ports
-      {:ok, listen_sock1} = create_kernel_listener(@ifaddr, 44001)
-      {:ok, listen_sock2} = create_kernel_listener(@ifaddr, 44002)
+      {:ok, listen_sock1, port1} = create_kernel_listener(ctx.ifaddr)
+      {:ok, listen_sock2, port2} = create_kernel_listener(ctx.ifaddr)
 
       # Start accept tasks
       accept1 = Task.async(fn -> accept_connection(listen_sock1, 10_000) end)
@@ -91,8 +82,8 @@ defmodule Tricep.Integration.TcpHandshakeTest do
       {:ok, sock1} = Tricep.open(:inet6, :stream, :tcp)
       {:ok, sock2} = Tricep.open(:inet6, :stream, :tcp)
 
-      addr1 = %{family: :inet6, addr: @ifaddr, port: 44001}
-      addr2 = %{family: :inet6, addr: @ifaddr, port: 44002}
+      addr1 = %{family: :inet6, addr: ctx.ifaddr, port: port1}
+      addr2 = %{family: :inet6, addr: ctx.ifaddr, port: port2}
 
       assert Tricep.connect(sock1, addr1) == :ok
       assert Tricep.connect(sock2, addr2) == :ok

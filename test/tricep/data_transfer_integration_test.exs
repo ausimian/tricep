@@ -1,25 +1,15 @@
 defmodule Tricep.DataTransferIntegrationTest do
   use Tricep.IntegrationCase, async: false
 
-  @ifaddr {0xFD00, 0, 0, 0, 0, 0, 0, 0x11}
-  @ifaddr_str "fd00::11"
-  @dstaddr_str "fd00::12"
-  @port 44444
-
   setup do
-    link = create_test_link(ifaddr: @ifaddr_str, dstaddr: @dstaddr_str)
-
-    on_exit(fn ->
-      Tricep.Link.drop(link)
-    end)
-
-    %{link: link}
+    # Use shared TUN from test_helper.exs
+    ExUnit.configuration()[:tricep]
   end
 
   describe "send/2 integration" do
-    test "sends data to kernel socket", %{link: _link} do
+    test "sends data to kernel socket", ctx do
       # Create kernel listener
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -29,7 +19,7 @@ defmodule Tricep.DataTransferIntegrationTest do
       # Start connect in background
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       # Accept the connection on kernel side
@@ -48,8 +38,8 @@ defmodule Tricep.DataTransferIntegrationTest do
       assert data == "Hello from Tricep!"
     end
 
-    test "sends large data split into segments", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "sends large data split into segments", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -57,7 +47,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -77,8 +67,8 @@ defmodule Tricep.DataTransferIntegrationTest do
   end
 
   describe "recv/2 integration" do
-    test "receives data from kernel socket", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "receives data from kernel socket", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -86,7 +76,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -102,8 +92,8 @@ defmodule Tricep.DataTransferIntegrationTest do
       assert Tricep.recv(socket, 0, 5000) == {:ok, "Hello from kernel!"}
     end
 
-    test "receives multiple messages", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "receives multiple messages", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -111,7 +101,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -133,8 +123,8 @@ defmodule Tricep.DataTransferIntegrationTest do
       assert data == "FirstSecondThird"
     end
 
-    test "times out when no data arrives", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "times out when no data arrives", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -142,7 +132,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -161,8 +151,8 @@ defmodule Tricep.DataTransferIntegrationTest do
       assert elapsed >= 180 and elapsed < 400
     end
 
-    test "recv returns immediately if data already buffered", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "recv returns immediately if data already buffered", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -170,7 +160,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -196,8 +186,8 @@ defmodule Tricep.DataTransferIntegrationTest do
   end
 
   describe "bidirectional communication" do
-    test "echo server pattern", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "echo server pattern", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -205,7 +195,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -229,8 +219,8 @@ defmodule Tricep.DataTransferIntegrationTest do
       assert Task.await(echo_task, 5000) == :ok
     end
 
-    test "multiple round trips", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "multiple round trips", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -238,7 +228,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -265,8 +255,8 @@ defmodule Tricep.DataTransferIntegrationTest do
   end
 
   describe "close/1 integration" do
-    test "active close sends FIN to kernel socket", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "active close sends FIN to kernel socket", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -274,7 +264,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -295,8 +285,8 @@ defmodule Tricep.DataTransferIntegrationTest do
       assert result in [{:ok, <<>>}, {:error, :closed}]
     end
 
-    test "passive close receives FIN from kernel socket", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "passive close receives FIN from kernel socket", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -304,7 +294,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -318,8 +308,8 @@ defmodule Tricep.DataTransferIntegrationTest do
       assert Tricep.recv(socket, 0, 5000) == {:ok, <<>>}
     end
 
-    test "recv returns data then EOF after kernel close", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "recv returns data then EOF after kernel close", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -327,7 +317,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -345,8 +335,8 @@ defmodule Tricep.DataTransferIntegrationTest do
       assert Tricep.recv(socket, 0, 5000) == {:ok, <<>>}
     end
 
-    test "graceful bidirectional close", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "graceful bidirectional close", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -354,7 +344,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
@@ -382,8 +372,8 @@ defmodule Tricep.DataTransferIntegrationTest do
       :socket.close(client_sock)
     end
 
-    test "close with pending recv waiter", %{link: _link} do
-      {:ok, listen_sock} = create_kernel_listener(@ifaddr, @port)
+    test "close with pending recv waiter", ctx do
+      {:ok, listen_sock, port} = create_kernel_listener(ctx.ifaddr)
 
       on_exit(fn -> :socket.close(listen_sock) end)
 
@@ -391,7 +381,7 @@ defmodule Tricep.DataTransferIntegrationTest do
 
       connect_task =
         Task.async(fn ->
-          Tricep.connect(socket, %{family: :inet6, addr: @ifaddr_str, port: @port})
+          Tricep.connect(socket, %{family: :inet6, addr: ctx.ifaddr_str, port: port})
         end)
 
       {:ok, client_sock} = accept_connection(listen_sock)
