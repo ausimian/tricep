@@ -4,6 +4,7 @@ defmodule Tricep.Socket do
   import Bitwise
 
   alias Tricep.Application
+  alias Tricep.DataBuffer
   alias Tricep.Tcp
 
   @spec connect(pid(), :socket.sockaddr_in6()) :: :ok | {:error, any()}
@@ -74,7 +75,7 @@ defmodule Tricep.Socket do
     # MSS peer advertised (max we can send)
     field :snd_mss, non_neg_integer() | nil, default: nil
     # Buffers for data transfer
-    field :send_buffer, binary(), default: <<>>
+    field :send_buffer, DataBuffer.t(), default: DataBuffer.new()
     field :recv_buffer, binary(), default: <<>>
     # Callers waiting on recv (list of {from, length, timer_ref})
     field :recv_waiters, list(), default: []
@@ -189,48 +190,16 @@ defmodule Tricep.Socket do
   # --- Established state: send ---
 
   def handle_event({:call, from}, {:send, data}, :established, %__MODULE__{} = state) do
-    new_state = %{state | send_buffer: state.send_buffer <> data}
+    new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
     {:keep_state, new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
   end
 
-  def handle_event(
-        :internal,
-        :flush_send_buffer,
-        :established,
-        %__MODULE__{send_buffer: <<>>} = _state
-      ) do
-    :keep_state_and_data
-  end
-
   def handle_event(:internal, :flush_send_buffer, :established, %__MODULE__{} = state) do
-    # Take up to snd_mss bytes from buffer
-    mss = state.snd_mss || @default_mss
-    {payload, rest} = split_binary(state.send_buffer, mss)
-
-    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
-
-    tcp_segment =
-      Tcp.build_segment(
-        state.pair,
-        state.snd_nxt,
-        state.rcv_nxt,
-        [:ack, :psh],
-        state.rcv_wnd,
-        payload: payload
-      )
-
-    packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
-    Tricep.Link.send(state.link, packet)
-
-    new_state = %{
-      state
-      | send_buffer: rest,
-        snd_nxt: wrap_seq(state.snd_nxt + byte_size(payload))
-    }
-
-    # If more data to send, schedule another flush
-    actions = if rest != <<>>, do: [{:next_event, :internal, :flush_send_buffer}], else: []
-    {:keep_state, new_state, actions}
+    if DataBuffer.empty?(state.send_buffer) do
+      :keep_state_and_data
+    else
+      do_flush_send_buffer(state)
+    end
   end
 
   # --- Established state: recv ---
@@ -518,42 +487,16 @@ defmodule Tricep.Socket do
   # --- CLOSE_WAIT state (peer closed, we can still send) ---
 
   def handle_event({:call, from}, {:send, data}, :close_wait, %__MODULE__{} = state) do
-    new_state = %{state | send_buffer: state.send_buffer <> data}
+    new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
     {:keep_state, new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
   end
 
-  def handle_event(:internal, :flush_send_buffer, :close_wait, %__MODULE__{send_buffer: <<>>}) do
-    :keep_state_and_data
-  end
-
   def handle_event(:internal, :flush_send_buffer, :close_wait, %__MODULE__{} = state) do
-    # Same as established - take up to snd_mss bytes from buffer
-    mss = state.snd_mss || @default_mss
-    {payload, rest} = split_binary(state.send_buffer, mss)
-
-    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
-
-    tcp_segment =
-      Tcp.build_segment(
-        state.pair,
-        state.snd_nxt,
-        state.rcv_nxt,
-        [:ack, :psh],
-        state.rcv_wnd,
-        payload: payload
-      )
-
-    packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
-    Tricep.Link.send(state.link, packet)
-
-    new_state = %{
-      state
-      | send_buffer: rest,
-        snd_nxt: wrap_seq(state.snd_nxt + byte_size(payload))
-    }
-
-    actions = if rest != <<>>, do: [{:next_event, :internal, :flush_send_buffer}], else: []
-    {:keep_state, new_state, actions}
+    if DataBuffer.empty?(state.send_buffer) do
+      :keep_state_and_data
+    else
+      do_flush_send_buffer(state)
+    end
   end
 
   def handle_event({:call, from}, {:recv, length, _timeout}, :close_wait, %__MODULE__{} = state) do
@@ -637,6 +580,42 @@ defmodule Tricep.Socket do
 
   def handle_event({:call, from}, :close, _state, _state_data) do
     {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
+  end
+
+  defp do_flush_send_buffer(%__MODULE__{} = state) do
+    # Take up to snd_mss bytes from buffer
+    mss = state.snd_mss || @default_mss
+    {payload_iodata, new_send_buffer} = DataBuffer.take(state.send_buffer, mss)
+    payload = IO.iodata_to_binary(payload_iodata)
+
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
+
+    tcp_segment =
+      Tcp.build_segment(
+        state.pair,
+        state.snd_nxt,
+        state.rcv_nxt,
+        [:ack, :psh],
+        state.rcv_wnd,
+        payload: payload
+      )
+
+    packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
+    Tricep.Link.send(state.link, packet)
+
+    new_state = %{
+      state
+      | send_buffer: new_send_buffer,
+        snd_nxt: wrap_seq(state.snd_nxt + byte_size(payload))
+    }
+
+    # If more data to send, schedule another flush
+    actions =
+      if not DataBuffer.empty?(new_send_buffer),
+        do: [{:next_event, :internal, :flush_send_buffer}],
+        else: []
+
+    {:keep_state, new_state, actions}
   end
 
   defp reset_state(%__MODULE__{} = state) do
