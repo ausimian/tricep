@@ -98,10 +98,11 @@ defmodule Tricep.Socket do
     case Tricep.Address.from(addr) do
       {:ok, dstaddr_bin} ->
         case Application.lookup_link(dstaddr_bin) do
-          {pid, srcaddr_bin} ->
+          {pid, {srcaddr_bin, mtu}} ->
             pair = allocate_port(srcaddr_bin, {dstaddr_bin, address.port})
             send_syn = {:next_event, :internal, {:send_syn, from}}
-            {:next_state, :closed, %__MODULE__{pair: pair, link: pid}, send_syn}
+            state = %__MODULE__{pair: pair, link: pid, rcv_mss: mtu - 60}
+            {:next_state, :closed, state, send_syn}
 
           nil ->
             {:keep_state_and_data, {:reply, from, {:error, :enetunreach}}}
@@ -119,12 +120,11 @@ defmodule Tricep.Socket do
   def handle_event(:internal, {:send_syn, from}, :closed, %__MODULE__{} = state) do
     iss = :crypto.strong_rand_bytes(4) |> :binary.decode_unsigned()
     rcv_wnd = 65535
-    rcv_mss = @default_mss
 
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(state.pair, iss, 0, [:syn], rcv_wnd, mss: rcv_mss)
+      Tcp.build_segment(state.pair, iss, 0, [:syn], rcv_wnd, mss: state.rcv_mss)
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     :ok = Tricep.Link.send(state.link, packet)
@@ -135,8 +135,7 @@ defmodule Tricep.Socket do
         snd_una: iss,
         snd_nxt: iss + 1,
         snd_wnd: 0,
-        rcv_wnd: rcv_wnd,
-        rcv_mss: rcv_mss
+        rcv_wnd: rcv_wnd
     }
 
     {:next_state, {:syn_sent, from}, new_state}

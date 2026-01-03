@@ -79,7 +79,7 @@ defmodule Tricep.DummyLink do
     # Register with the application so Socket can find us when connecting to local_addr
     # register_link(srcaddr, dstaddr) -> key=dstaddr, value=srcaddr
     # We want: key=local_addr (what Socket connects to), value=remote_addr (Socket's source)
-    :ok = Tricep.Application.register_link(remote_addr, local_addr)
+    :ok = Tricep.Application.register_link(remote_addr, {local_addr, 1500})
 
     {:ok,
      %__MODULE__{

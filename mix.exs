@@ -49,9 +49,9 @@ defmodule Tricep.MixProject do
   defp deps do
     [
       {:typedstruct, "~> 0.5", runtime: false},
-      {:tundra, "~> 0.3.0"},
       {:elixir_make, "~> 0.9", runtime: false},
-      {:excoveralls, "~> 0.18", only: :test}
+      {:excoveralls, "~> 0.18", only: :test},
+      {:tundra, "~> 0.4.0"}
     ]
   end
 end

@@ -382,7 +382,7 @@ defmodule Tricep.SocketTest do
       parsed = Tcp.parse_segment(tcp_segment)
 
       # Should have MSS option set to default (1220 for IPv6)
-      assert parsed.options.mss == 1220
+      assert parsed.options.mss == 1440
 
       Task.shutdown(task, :brutal_kill)
     end
@@ -427,10 +427,10 @@ defmodule Tricep.SocketTest do
       # gen_statem returns {state_name, state_data}
       {:established, state} = :sys.get_state(socket)
       assert state.snd_mss == peer_mss
-      assert state.rcv_mss == 1220
+      assert state.rcv_mss == 1440
     end
 
-    test "defaults to 1220 MSS when peer doesn't send MSS option", %{
+    test "defaults to 1440 MSS when peer doesn't send MSS option", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr

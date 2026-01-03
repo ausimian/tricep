@@ -23,7 +23,6 @@ defmodule Tricep.TunLink do
     field :tun, Tundra.tun_device()
     field :name, String.t()
     field :mtu, non_neg_integer() | nil, default: nil
-    field :tph, binary()
   end
 
   @impl true
@@ -35,39 +34,25 @@ defmodule Tricep.TunLink do
     dstaddr = Keyword.fetch!(opts, :dstaddr)
     ifopts = Keyword.take(opts, [:dstaddr, :netmask, :mtu])
 
-    tph =
-      case :os.type() do
-        {:unix, :linux} -> <<0::16, 0x86DD::16>>
-        {:unix, :darwin} -> <<30::32-big>>
-      end
-
     with {:ok, ifaddr_bin} <- Tricep.Address.from(ifaddr),
          {:ok, dstaddr_bin} <- Tricep.Address.from(dstaddr),
          {:ok, {tun, name}} <- Tundra.create(ifaddr, ifopts),
-         :ok <- Tricep.Application.register_link(dstaddr_bin, ifaddr_bin) do
-      {:ok, :ready, %__MODULE__{tun: tun, name: name, tph: tph}, {:next_event, :internal, :read_mtu}}
+         {:ok, mtu} <- Tricep.Nifs.get_mtu(name),
+         :ok <- Tricep.Application.register_link(dstaddr_bin, {ifaddr_bin, mtu}) do
+      state = %__MODULE__{tun: tun, mtu: mtu, name: name}
+      {:ok, :ready, state, {:next_event, :internal, :read_tun}}
     end
   end
 
   @impl true
-  def handle_event(:internal, :read_mtu, :ready, %__MODULE__{mtu: nil} = state) do
-    case Tricep.Nifs.get_mtu(state.name) do
-      {:ok, mtu} ->
-        {:keep_state, %{state | mtu: mtu + 4}, {:next_event, :internal, :read_tun}}
-
-      {:error, _} = err ->
-        {:stop, err, state}
-    end
-  end
-
   def handle_event(:internal, :read_tun, _, %__MODULE__{} = state) do
     case Tundra.recv(state.tun, state.mtu, :nowait) do
-      {:ok, <<_::32, ip_packet::binary>>} ->
-        handle_ip_packet(ip_packet, state)
-
       {:ok, <<>>} ->
         # Empty read on macOS means socket was closed
         {:stop, :normal, state}
+
+      {:ok, ip_packet} ->
+        handle_ip_packet(ip_packet, state)
 
       {:select, _} ->
         :keep_state_and_data
@@ -75,15 +60,18 @@ defmodule Tricep.TunLink do
   end
 
   def handle_event(:info, {:send, packet}, :ready, %__MODULE__{} = state) do
-    frame = [state.tph, packet]
-
-    case Tundra.send(state.tun, frame, :nowait) do
+    case Tundra.send(state.tun, packet, :nowait) do
       :ok ->
         :keep_state_and_data
 
       {:select, {:select_info, :send, handle}} ->
         {:next_state, {:waiting, handle}, state, :postpone}
     end
+  end
+
+  # Postpone send messages while waiting for TUN device to become ready
+  def handle_event(:info, {:send, _packet}, {:waiting, _handle}, _state) do
+    {:keep_state_and_data, :postpone}
   end
 
   def handle_event(:info, {:"$socket", _tun, :select, handle}, {:waiting, handle}, state) do

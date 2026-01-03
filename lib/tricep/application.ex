@@ -30,8 +30,8 @@ defmodule Tricep.Application do
     DynamicSupervisor.start_child(@link_supervisor, {Tricep.TunLink, opts})
   end
 
-  def register_link(srcaddr, dstaddr) do
-    with {:ok, _pid} <- Registry.register(@link_registry, dstaddr, srcaddr) do
+  def register_link(srcaddr, {dstaddr, mtu}) do
+    with {:ok, _pid} <- Registry.register(@link_registry, dstaddr, {srcaddr, mtu}) do
       :ok
     end
   end
