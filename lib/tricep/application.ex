@@ -27,7 +27,8 @@ defmodule Tricep.Application do
 
   @spec new_link(keyword()) :: DynamicSupervisor.on_start_child()
   def new_link(opts) do
-    DynamicSupervisor.start_child(@link_supervisor, {Tricep.TunLink, opts})
+    {module, opts} = Keyword.pop(opts, :module, Tricep.TunLink)
+    DynamicSupervisor.start_child(@link_supervisor, {module, opts})
   end
 
   def register_link(srcaddr, {dstaddr, mtu}) do
