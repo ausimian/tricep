@@ -1102,8 +1102,8 @@ defmodule Tricep.SocketTest do
       # Drain FIN
       assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
 
-      # send should fail
-      assert Tricep.send(socket, "data") == {:error, :enotconn}
+      # send should fail with epipe (connection closing)
+      assert Tricep.send(socket, "data") == {:error, :epipe}
     end
 
     test "close with pending recv waiter delivers EOF", %{
@@ -2828,4 +2828,246 @@ defmodule Tricep.SocketTest do
 
     socket
   end
+
+  # --- Timeout and :nowait tests ---
+
+  describe "connect with :nowait" do
+    test "returns select tuple immediately", %{remote_addr: remote_addr} do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      result = Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, :nowait)
+
+      assert {:select, {:select_info, :connect, ref}} = result
+      assert is_reference(ref)
+
+      # SYN should still be sent
+      assert_receive {:dummy_link_packet, _link, packet}, 1000
+      <<_ip_header::binary-size(40), tcp_segment::binary>> = packet
+      parsed = Tcp.parse_segment(tcp_segment)
+      assert :syn in parsed.flags
+    end
+
+    test "sends notification on SYN-ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      {:select, {:select_info, :connect, ref}} =
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, :nowait)
+
+      # Wait for SYN
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn_parsed = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      # Inject SYN-ACK
+      server_seq = 5000
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          server_seq,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      # Should receive select notification
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+    end
+
+    test "subsequent connect returns :ok after notification", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      {:select, {:select_info, :connect, ref}} =
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, :nowait)
+
+      # Wait for SYN
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn_parsed = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      # Inject SYN-ACK
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      # Wait for notification
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Now connect should return :eisconn (already connected)
+      assert Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, :nowait) ==
+               {:error, :eisconn}
+    end
+  end
+
+  describe "connect with timeout" do
+    test "returns {:error, :timeout} when no SYN-ACK received", %{remote_addr: remote_addr} do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      start_time = System.monotonic_time(:millisecond)
+
+      result =
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, 200)
+
+      elapsed = System.monotonic_time(:millisecond) - start_time
+
+      assert result == {:error, :timeout}
+      # Should have waited approximately 200ms (allow some variance)
+      assert elapsed >= 180 and elapsed < 400
+    end
+  end
+
+  describe "recv with :nowait" do
+    test "returns data if buffered", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get source port for building data segment
+      src_port = get_socket_src_port(socket)
+
+      # Inject data
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5001,
+          wrap_seq(get_socket_snd_nxt(socket)),
+          [:ack],
+          32768,
+          payload: "buffered data"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      # Give time for data to be processed
+      Process.sleep(50)
+
+      # Drain data ACK
+      assert_receive {:dummy_link_packet, _link, _data_ack}, 1000
+
+      # recv with :nowait should return data immediately
+      assert Tricep.recv(socket, 0, :nowait) == {:ok, "buffered data"}
+    end
+
+    test "returns select tuple if no data", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # recv with :nowait should return select tuple
+      result = Tricep.recv(socket, 0, :nowait)
+      assert {:select, {:select_info, :recv, ref}} = result
+      assert is_reference(ref)
+    end
+
+    test "notification sent when data arrives", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Start recv with :nowait
+      {:select, {:select_info, :recv, ref}} = Tricep.recv(socket, 0, :nowait)
+
+      # Get source port for building data segment
+      src_port = get_socket_src_port(socket)
+
+      # Inject data
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5001,
+          wrap_seq(get_socket_snd_nxt(socket)),
+          [:ack],
+          32768,
+          payload: "arriving data"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      # Should receive notification
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+
+      # Drain data ACK
+      assert_receive {:dummy_link_packet, _link, _data_ack}, 1000
+
+      # Now recv should return data
+      assert Tricep.recv(socket, 0, :nowait) == {:ok, "arriving data"}
+    end
+  end
+
+  describe "send with :nowait" do
+    test "returns :ok if window available", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Send with :nowait should return :ok when window is available
+      assert Tricep.send(socket, "test data", :nowait) == :ok
+
+      # Data should be sent
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+      <<_ip_header::binary-size(40), tcp_segment::binary>> = data_packet
+      parsed = Tcp.parse_segment(tcp_segment)
+      assert :ack in parsed.flags
+      assert parsed.payload == "test data"
+    end
+  end
+
+  # Helper functions for timeout tests
+  defp get_socket_src_port(socket) do
+    {_state_name, state} = :sys.get_state(socket)
+    {{_, src_port}, _} = state.pair
+    src_port
+  end
+
+  defp get_socket_snd_nxt(socket) do
+    {_state_name, state} = :sys.get_state(socket)
+    state.snd_nxt
+  end
+
+  defp wrap_seq(n), do: Bitwise.band(n, 0xFFFFFFFF)
 end

@@ -7,17 +7,23 @@ defmodule Tricep.Socket do
   alias Tricep.DataBuffer
   alias Tricep.Tcp
 
-  @spec connect(pid(), :socket.sockaddr_in6()) :: :ok | {:error, any()}
-  def connect(pid, address) when is_pid(pid) do
-    :gen_statem.call(pid, {:connect, address})
+  @type socket_timeout :: non_neg_integer() | :infinity | :nowait
+  @type select_info :: {:select_info, :connect | :recv | :send, reference()}
+
+  @spec connect(pid(), :socket.sockaddr_in6(), socket_timeout()) ::
+          :ok | {:error, any()} | {:select, select_info()}
+  def connect(pid, address, timeout \\ :infinity) when is_pid(pid) do
+    :gen_statem.call(pid, {:connect, address, timeout})
   end
 
-  @spec send_data(pid(), binary()) :: :ok | {:error, atom()}
-  def send_data(pid, data) when is_pid(pid) and is_binary(data) do
-    :gen_statem.call(pid, {:send, data})
+  @spec send_data(pid(), binary(), socket_timeout()) ::
+          :ok | {:error, atom()} | {:select, select_info()}
+  def send_data(pid, data, timeout \\ :infinity) when is_pid(pid) and is_binary(data) do
+    :gen_statem.call(pid, {:send, data, timeout})
   end
 
-  @spec recv(pid(), non_neg_integer(), timeout()) :: {:ok, binary()} | {:error, atom()}
+  @spec recv(pid(), non_neg_integer(), socket_timeout()) ::
+          {:ok, binary()} | {:error, atom()} | {:select, select_info()}
   def recv(pid, length \\ 0, timeout \\ :infinity) when is_pid(pid) do
     :gen_statem.call(pid, {:recv, length, timeout})
   end
@@ -94,6 +100,12 @@ defmodule Tricep.Socket do
     field :rto_timer_active, boolean(), default: false
     # SYN retransmit count (for connection phase)
     field :syn_retransmit_count, non_neg_integer(), default: 0
+    # For :nowait connect - {caller_pid, ref}
+    field :connect_select, {pid(), reference()} | nil, default: nil
+    # For :nowait recv - {caller_pid, ref, length}
+    field :recv_select, {pid(), reference(), non_neg_integer()} | nil, default: nil
+    # For send backpressure - [{caller_pid, ref, data} | {from, ref, data, timer_ref}]
+    field :send_waiters, list(), default: []
   end
 
   # TIME_WAIT duration (2*MSL - using short value for TUN-based stack)
@@ -108,13 +120,13 @@ defmodule Tricep.Socket do
   end
 
   @impl true
-  def handle_event({:call, from}, {:connect, %{addr: addr} = address}, :closed, nil) do
+  def handle_event({:call, from}, {:connect, %{addr: addr} = address, timeout}, :closed, nil) do
     case Tricep.Address.from(addr) do
       {:ok, dstaddr_bin} ->
         case Application.lookup_link(dstaddr_bin) do
           {pid, {srcaddr_bin, mtu}} ->
             pair = allocate_port(srcaddr_bin, {dstaddr_bin, address.port})
-            send_syn = {:next_event, :internal, {:send_syn, from}}
+            send_syn = {:next_event, :internal, {:send_syn, from, timeout}}
             state = %__MODULE__{pair: pair, link: pid, rcv_mss: mtu - 60}
             {:next_state, :closed, state, send_syn}
 
@@ -127,11 +139,16 @@ defmodule Tricep.Socket do
     end
   end
 
-  def handle_event({:call, from}, {:connect, _address}, _, %__MODULE__{}) do
+  def handle_event({:call, from}, {:connect, _address, _timeout}, _, %__MODULE__{}) do
     {:keep_state_and_data, {:reply, from, {:error, :eisconn}}}
   end
 
-  def handle_event(:internal, {:send_syn, from}, :closed, %__MODULE__{} = state) do
+  # Connect completion after :nowait - already established
+  def handle_event({:call, from}, {:connect, _address, _timeout}, :established, %__MODULE__{}) do
+    {:keep_state_and_data, {:reply, from, :ok}}
+  end
+
+  def handle_event(:internal, {:send_syn, from, timeout}, :closed, %__MODULE__{} = state) do
     iss = :crypto.strong_rand_bytes(4) |> :binary.decode_unsigned()
     rcv_wnd = 65535
 
@@ -143,7 +160,7 @@ defmodule Tricep.Socket do
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     :ok = Tricep.Link.send(state.link, packet)
 
-    new_state = %{
+    base_state = %{
       state
       | iss: iss,
         snd_una: iss,
@@ -154,13 +171,35 @@ defmodule Tricep.Socket do
         rto_ms: @initial_rto_ms
     }
 
-    # Start SYN retransmission timer
-    actions = [{{:timeout, :rto}, @initial_rto_ms, {:syn_timeout, from}}]
+    case timeout do
+      :nowait ->
+        # Return select tuple immediately, store caller info for notification
+        ref = make_ref()
+        {caller_pid, _} = from
+        new_state = %{base_state | connect_select: {caller_pid, ref}}
+        actions = [
+          {{:timeout, :rto}, @initial_rto_ms, :syn_timeout_nowait},
+          {:reply, from, {:select, {:select_info, :connect, ref}}}
+        ]
+        {:next_state, {:syn_sent, :nowait}, new_state, actions}
 
-    {:next_state, {:syn_sent, from}, new_state, actions}
+      :infinity ->
+        # Block until TCP-level timeout (no user timeout)
+        actions = [{{:timeout, :rto}, @initial_rto_ms, {:syn_timeout, from}}]
+        {:next_state, {:syn_sent, from}, base_state, actions}
+
+      ms when is_integer(ms) ->
+        # Block with user-specified timeout
+        actions = [
+          {{:timeout, :rto}, @initial_rto_ms, {:syn_timeout, from}},
+          {{:timeout, :connect_timeout}, ms, {:connect_timeout, from}}
+        ]
+        {:next_state, {:syn_sent, from}, base_state, actions}
+    end
   end
 
-  def handle_event(:info, segment, {:syn_sent, from}, %__MODULE__{} = state) do
+  # SYN-ACK handler for blocking connect (from is a gen_statem from tuple)
+  def handle_event(:info, segment, {:syn_sent, from}, %__MODULE__{} = state) when is_tuple(from) do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, window: window, options: options} ->
         syn? = :syn in flags
@@ -170,7 +209,11 @@ defmodule Tricep.Socket do
         cond do
           rst? ->
             reset_state(state)
-            actions = [{{:timeout, :rto}, :cancel}, {:reply, from, {:error, :econnrefused}}]
+            actions = [
+              {{:timeout, :rto}, :cancel},
+              {{:timeout, :connect_timeout}, :cancel},
+              {:reply, from, {:error, :econnrefused}}
+            ]
             {:next_state, :closed, nil, actions}
 
           syn? and ack? and ack == state.iss + 1 ->
@@ -191,8 +234,12 @@ defmodule Tricep.Socket do
                 rto_ms: @initial_rto_ms
             }
 
-            # Cancel RTO timer and reply success
-            actions = [{{:timeout, :rto}, :cancel}, {:reply, from, :ok}]
+            # Cancel timers and reply success
+            actions = [
+              {{:timeout, :rto}, :cancel},
+              {{:timeout, :connect_timeout}, :cancel},
+              {:reply, from, :ok}
+            ]
             {:next_state, :established, new_state, actions}
 
           ack? and ack != state.iss + 1 ->
@@ -210,7 +257,62 @@ defmodule Tricep.Socket do
     end
   end
 
-  # --- SYN retransmission timeout ---
+  # SYN-ACK handler for :nowait connect
+  def handle_event(:info, segment, {:syn_sent, :nowait}, %__MODULE__{} = state) do
+    case Tcp.parse_segment(segment) do
+      %{flags: flags, seq: seq, ack: ack, window: window, options: options} ->
+        syn? = :syn in flags
+        ack? = :ack in flags
+        rst? = :rst in flags
+
+        cond do
+          rst? ->
+            # Connection refused - no notification, caller will get error on next connect call
+            reset_state(state)
+            actions = [{{:timeout, :rto}, :cancel}]
+            {:next_state, :closed, nil, actions}
+
+          syn? and ack? and ack == state.iss + 1 ->
+            # Valid SYN-ACK: send ACK, notify caller, transition to ESTABLISHED
+            send_ack(seq + 1, state)
+
+            snd_mss = Map.get(options, :mss, @default_mss)
+
+            # Notify the caller that connect can complete
+            case state.connect_select do
+              {caller_pid, ref} -> notify_select(caller_pid, ref)
+              nil -> :ok
+            end
+
+            new_state = %{
+              state
+              | irs: seq,
+                rcv_nxt: seq + 1,
+                snd_una: ack,
+                snd_wnd: window,
+                snd_mss: snd_mss,
+                syn_retransmit_count: 0,
+                rto_ms: @initial_rto_ms,
+                connect_select: nil
+            }
+
+            actions = [{{:timeout, :rto}, :cancel}]
+            {:next_state, :established, new_state, actions}
+
+          ack? and ack != state.iss + 1 ->
+            send_rst(ack, state)
+            :keep_state_and_data
+
+          true ->
+            :keep_state_and_data
+        end
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  # --- SYN retransmission timeout (blocking connect) ---
 
   def handle_event(
         {:timeout, :rto},
@@ -221,31 +323,126 @@ defmodule Tricep.Socket do
     if state.syn_retransmit_count >= @max_retransmit_count do
       # Max retries exceeded - connection failure
       reset_state(state)
-      {:next_state, :closed, nil, {:reply, from, {:error, :etimedout}}}
+      actions = [{{:timeout, :connect_timeout}, :cancel}, {:reply, from, {:error, :etimedout}}]
+      {:next_state, :closed, nil, actions}
     else
-      # Retransmit SYN
-      {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
-
-      tcp_segment =
-        Tcp.build_segment(state.pair, state.iss, 0, [:syn], state.rcv_wnd, mss: state.rcv_mss)
-
-      packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
-      :ok = Tricep.Link.send(state.link, packet)
-
-      # Exponential backoff
-      new_rto = min(state.rto_ms * 2, @max_rto_ms)
-      new_state = %{state | syn_retransmit_count: state.syn_retransmit_count + 1, rto_ms: new_rto}
-
-      actions = [{{:timeout, :rto}, new_rto, {:syn_timeout, from}}]
-      {:keep_state, new_state, actions}
+      retransmit_syn(state, {:syn_timeout, from})
     end
+  end
+
+  # --- SYN retransmission timeout (:nowait connect) ---
+
+  def handle_event(
+        {:timeout, :rto},
+        :syn_timeout_nowait,
+        {:syn_sent, :nowait},
+        %__MODULE__{} = state
+      ) do
+    if state.syn_retransmit_count >= @max_retransmit_count do
+      # Max retries exceeded - no notification, caller will get error on next connect call
+      reset_state(state)
+      {:next_state, :closed, nil}
+    else
+      retransmit_syn(state, :syn_timeout_nowait)
+    end
+  end
+
+  # --- User-level connect timeout (blocking only) ---
+
+  def handle_event(
+        {:timeout, :connect_timeout},
+        {:connect_timeout, from},
+        {:syn_sent, from},
+        %__MODULE__{} = state
+      ) do
+    reset_state(state)
+    actions = [{{:timeout, :rto}, :cancel}, {:reply, from, {:error, :timeout}}]
+    {:next_state, :closed, nil, actions}
+  end
+
+  defp retransmit_syn(state, timeout_event) do
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
+
+    tcp_segment =
+      Tcp.build_segment(state.pair, state.iss, 0, [:syn], state.rcv_wnd, mss: state.rcv_mss)
+
+    packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
+    :ok = Tricep.Link.send(state.link, packet)
+
+    # Exponential backoff
+    new_rto = min(state.rto_ms * 2, @max_rto_ms)
+    new_state = %{state | syn_retransmit_count: state.syn_retransmit_count + 1, rto_ms: new_rto}
+
+    actions = [{{:timeout, :rto}, new_rto, timeout_event}]
+    {:keep_state, new_state, actions}
+  end
+
+  # --- Send in invalid states ---
+
+  # Not connected
+  def handle_event({:call, from}, {:send, _data, _timeout}, :closed, nil) do
+    {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
+  end
+
+  # Connection closing - can't send after initiating close
+  def handle_event({:call, from}, {:send, _data, _timeout}, state_name, %__MODULE__{})
+      when state_name in [:fin_wait_1, :fin_wait_2, :closing, :last_ack, :time_wait] do
+    {:keep_state_and_data, {:reply, from, {:error, :epipe}}}
   end
 
   # --- Established state: send ---
 
-  def handle_event({:call, from}, {:send, data}, :established, %__MODULE__{} = state) do
-    new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
-    {:keep_state, new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+  def handle_event({:call, from}, {:send, data, timeout}, :established, %__MODULE__{} = state) do
+    available = send_window_available(state)
+
+    cond do
+      available > 0 ->
+        # Window available, enqueue data and return immediately
+        new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
+        {:keep_state, new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+
+      timeout == :nowait ->
+        # Window exhausted, return select tuple
+        ref = make_ref()
+        {caller_pid, _} = from
+        waiter = {caller_pid, ref, data}
+        new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
+        {:keep_state, new_state, {:reply, from, {:select, {:select_info, :send, ref}}}}
+
+      timeout == :infinity ->
+        # Block until window opens
+        ref = make_ref()
+        waiter = {from, ref, data, nil}
+        new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
+        {:keep_state, new_state}
+
+      is_integer(timeout) ->
+        # Block with timeout
+        ref = make_ref()
+        timer_ref = make_ref()
+        waiter = {from, ref, data, timer_ref}
+        new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
+        actions = [{{:timeout, timer_ref}, timeout, {:send_timeout, timer_ref}}]
+        {:keep_state, new_state, actions}
+    end
+  end
+
+  # Handle send timeout
+  def handle_event(
+        {:timeout, timer_ref},
+        {:send_timeout, timer_ref},
+        :established,
+        %__MODULE__{} = state
+      ) do
+    case List.keytake(state.send_waiters, timer_ref, 3) do
+      {{from, _ref, _data, ^timer_ref}, rest} ->
+        new_state = %{state | send_waiters: rest}
+        {:keep_state, new_state, {:reply, from, {:error, :timeout}}}
+
+      nil ->
+        # Already fulfilled, ignore
+        :keep_state_and_data
+    end
   end
 
   def handle_event(:internal, :flush_send_buffer, :established, %__MODULE__{} = state) do
@@ -265,19 +462,29 @@ defmodule Tricep.Socket do
         {:keep_state, new_state, {:reply, from, {:ok, data}}}
 
       :wait ->
-        # No data available, add to waiters with timeout
-        timer_ref = make_ref()
-        waiter = {from, length, timer_ref}
-        new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
+        case timeout do
+          :nowait ->
+            # Return select tuple immediately, store caller info for notification
+            ref = make_ref()
+            {caller_pid, _} = from
+            new_state = %{state | recv_select: {caller_pid, ref, length}}
+            {:keep_state, new_state, {:reply, from, {:select, {:select_info, :recv, ref}}}}
 
-        actions =
-          if timeout == :infinity do
-            []
-          else
-            [{{:timeout, timer_ref}, timeout, {:recv_timeout, timer_ref}}]
-          end
+          :infinity ->
+            # Block indefinitely
+            timer_ref = make_ref()
+            waiter = {from, length, timer_ref}
+            new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
+            {:keep_state, new_state}
 
-        {:keep_state, new_state, actions}
+          ms when is_integer(ms) ->
+            # Block with timeout
+            timer_ref = make_ref()
+            waiter = {from, length, timer_ref}
+            new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
+            actions = [{{:timeout, timer_ref}, ms, {:recv_timeout, timer_ref}}]
+            {:keep_state, new_state, actions}
+        end
     end
   end
 
@@ -332,6 +539,17 @@ defmodule Tricep.Socket do
             # Send ACK for FIN (and any data)
             send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
 
+            # Notify :nowait recv caller if pending
+            new_recv_select =
+              case state.recv_select do
+                {caller_pid, ref, _length} ->
+                  notify_select(caller_pid, ref)
+                  nil
+
+                nil ->
+                  nil
+              end
+
             # Notify waiters: deliver buffered data or EOF
             {new_recv_buffer, new_waiters, replies} =
               process_waiters_eof(new_recv_buffer, state.recv_waiters)
@@ -341,6 +559,7 @@ defmodule Tricep.Socket do
               | rcv_nxt: new_rcv_nxt,
                 recv_buffer: new_recv_buffer,
                 recv_waiters: new_waiters,
+                recv_select: new_recv_select,
                 snd_una: new_snd_una,
                 snd_wnd: window,
                 fin_received: true
@@ -356,7 +575,18 @@ defmodule Tricep.Socket do
             # Send ACK for received data
             send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
 
-            # Check if any waiters can be satisfied
+            # Notify :nowait recv caller if pending
+            new_recv_select =
+              case state.recv_select do
+                {caller_pid, ref, _length} ->
+                  notify_select(caller_pid, ref)
+                  nil
+
+                nil ->
+                  nil
+              end
+
+            # Check if any blocking waiters can be satisfied
             {new_recv_buffer, new_waiters, replies} =
               process_waiters(new_recv_buffer, state.recv_waiters)
 
@@ -367,7 +597,8 @@ defmodule Tricep.Socket do
               ack_state
               | rcv_nxt: new_rcv_nxt,
                 recv_buffer: new_recv_buffer,
-                recv_waiters: new_waiters
+                recv_waiters: new_waiters,
+                recv_select: new_recv_select
             }
 
             {:keep_state, new_state, replies ++ timer_actions}
@@ -549,9 +780,39 @@ defmodule Tricep.Socket do
 
   # --- CLOSE_WAIT state (peer closed, we can still send) ---
 
-  def handle_event({:call, from}, {:send, data}, :close_wait, %__MODULE__{} = state) do
-    new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
-    {:keep_state, new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+  def handle_event({:call, from}, {:send, data, timeout}, :close_wait, %__MODULE__{} = state) do
+    available = send_window_available(state)
+
+    cond do
+      available > 0 ->
+        # Window available, enqueue data and return immediately
+        new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
+        {:keep_state, new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+
+      timeout == :nowait ->
+        # Window exhausted, return select tuple
+        ref = make_ref()
+        {caller_pid, _} = from
+        waiter = {caller_pid, ref, data}
+        new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
+        {:keep_state, new_state, {:reply, from, {:select, {:select_info, :send, ref}}}}
+
+      timeout == :infinity ->
+        # Block until window opens
+        ref = make_ref()
+        waiter = {from, ref, data, nil}
+        new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
+        {:keep_state, new_state}
+
+      is_integer(timeout) ->
+        # Block with timeout
+        ref = make_ref()
+        timer_ref = make_ref()
+        waiter = {from, ref, data, timer_ref}
+        new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
+        actions = [{{:timeout, timer_ref}, timeout, {:send_timeout, timer_ref}}]
+        {:keep_state, new_state, actions}
+    end
   end
 
   def handle_event(:internal, :flush_send_buffer, :close_wait, %__MODULE__{} = state) do
@@ -559,6 +820,24 @@ defmodule Tricep.Socket do
       :keep_state_and_data
     else
       do_flush_send_buffer(state)
+    end
+  end
+
+  # Handle send timeout in close_wait
+  def handle_event(
+        {:timeout, timer_ref},
+        {:send_timeout, timer_ref},
+        :close_wait,
+        %__MODULE__{} = state
+      ) do
+    case List.keytake(state.send_waiters, timer_ref, 3) do
+      {{from, _ref, _data, ^timer_ref}, rest} ->
+        new_state = %{state | send_waiters: rest}
+        {:keep_state, new_state, {:reply, from, {:error, :timeout}}}
+
+      nil ->
+        # Already fulfilled, ignore
+        :keep_state_and_data
     end
   end
 
@@ -825,6 +1104,17 @@ defmodule Tricep.Socket do
   # Returns true if a <= b in sequence space
   defp seq_leq(a, b), do: not seq_gt(a, b)
 
+  # Calculate available send window (for backpressure detection)
+  defp send_window_available(state) do
+    bytes_in_flight = wrap_seq(state.snd_nxt - state.snd_una)
+    max(0, state.snd_wnd - bytes_in_flight)
+  end
+
+  # Send select notification to caller
+  defp notify_select(caller_pid, ref) do
+    send(caller_pid, {:"$socket", self(), :select, ref})
+  end
+
   # Process ACK and update retransmission queue
   # Returns {new_state, timer_actions}
   defp process_ack(state, ack, window) do
@@ -835,13 +1125,16 @@ defmodule Tricep.Socket do
           seq_leq(seq_end, ack)
         end)
 
-      new_state = %{
+      base_state = %{
         state
         | snd_una: ack,
           snd_wnd: window,
           unacked_segments: new_unacked,
           rto_ms: @initial_rto_ms
       }
+
+      # Check if window opened and we have send_waiters
+      {new_state, send_waiter_actions} = process_send_waiters(base_state)
 
       # Manage RTO timer based on remaining unacked segments
       timer_actions =
@@ -853,10 +1146,45 @@ defmodule Tricep.Socket do
           [{{:timeout, :rto}, @initial_rto_ms, :retransmit}]
         end
 
-      {%{new_state | rto_timer_active: new_unacked != []}, timer_actions}
+      {%{new_state | rto_timer_active: new_unacked != []}, timer_actions ++ send_waiter_actions}
     else
-      # Duplicate or old ACK - just update window
-      {%{state | snd_wnd: window}, []}
+      # Duplicate or old ACK - just update window (but still check send waiters)
+      base_state = %{state | snd_wnd: window}
+      {new_state, send_waiter_actions} = process_send_waiters(base_state)
+      {new_state, send_waiter_actions}
+    end
+  end
+
+  # Process send_waiters when window opens
+  defp process_send_waiters(%{send_waiters: []} = state) do
+    {state, []}
+  end
+
+  defp process_send_waiters(state) do
+    available = send_window_available(state)
+
+    if available > 0 do
+      case state.send_waiters do
+        [] ->
+          {state, []}
+
+        [{caller_pid, ref, data} | rest] when is_pid(caller_pid) ->
+          # :nowait waiter - notify and enqueue data
+          notify_select(caller_pid, ref)
+          new_send_buffer = DataBuffer.append(state.send_buffer, data)
+          new_state = %{state | send_waiters: rest, send_buffer: new_send_buffer}
+          # Return flush action so data gets sent
+          {new_state, [{:next_event, :internal, :flush_send_buffer}]}
+
+        [{from, _ref, data, timer_ref} | rest] when is_tuple(from) ->
+          # Blocking waiter - enqueue data and reply
+          new_send_buffer = DataBuffer.append(state.send_buffer, data)
+          new_state = %{state | send_waiters: rest, send_buffer: new_send_buffer}
+          cancel_action = if timer_ref, do: [{{:timeout, timer_ref}, :cancel}], else: []
+          {new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}] ++ cancel_action}
+      end
+    else
+      {state, []}
     end
   end
 

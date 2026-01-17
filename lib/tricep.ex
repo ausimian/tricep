@@ -29,14 +29,27 @@ defmodule Tricep do
     {:error, :unsupported}
   end
 
-  defdelegate connect(socket, address), to: Tricep.Socket
+  @type socket_timeout :: non_neg_integer() | :infinity | :nowait
+  @type select_info :: {:select_info, :connect | :recv | :send, reference()}
 
-  @spec send(pid(), binary()) :: :ok | {:error, atom()}
-  def send(socket, data) when is_pid(socket) and is_binary(data) do
-    Tricep.Socket.send_data(socket, data)
+  @spec connect(pid(), :socket.sockaddr_in6(), socket_timeout()) ::
+          :ok | {:error, atom()} | {:select, select_info()}
+  def connect(socket, address, timeout \\ :infinity)
+
+  def connect(socket, address, timeout) when is_pid(socket) do
+    Tricep.Socket.connect(socket, address, timeout)
   end
 
-  @spec recv(pid(), non_neg_integer(), timeout()) :: {:ok, binary()} | {:error, atom()}
+  @spec send(pid(), binary(), socket_timeout()) ::
+          :ok | {:error, atom()} | {:select, select_info()}
+  def send(socket, data, timeout \\ :infinity)
+
+  def send(socket, data, timeout) when is_pid(socket) and is_binary(data) do
+    Tricep.Socket.send_data(socket, data, timeout)
+  end
+
+  @spec recv(pid(), non_neg_integer(), socket_timeout()) ::
+          {:ok, binary()} | {:error, atom()} | {:select, select_info()}
   def recv(socket, length \\ 0, timeout \\ :infinity)
 
   def recv(socket, length, timeout) when is_pid(socket) do
