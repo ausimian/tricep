@@ -360,23 +360,6 @@ defmodule Tricep.Socket do
     {:next_state, :closed, nil, actions}
   end
 
-  defp retransmit_syn(state, timeout_event) do
-    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
-
-    tcp_segment =
-      Tcp.build_segment(state.pair, state.iss, 0, [:syn], state.rcv_wnd, mss: state.rcv_mss)
-
-    packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
-    :ok = Tricep.Link.send(state.link, packet)
-
-    # Exponential backoff
-    new_rto = min(state.rto_ms * 2, @max_rto_ms)
-    new_state = %{state | syn_retransmit_count: state.syn_retransmit_count + 1, rto_ms: new_rto}
-
-    actions = [{{:timeout, :rto}, new_rto, timeout_event}]
-    {:keep_state, new_state, actions}
-  end
-
   # --- Send in invalid states ---
 
   # Not connected
@@ -922,6 +905,23 @@ defmodule Tricep.Socket do
 
   def handle_event({:call, from}, :close, _state, _state_data) do
     {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
+  end
+
+  defp retransmit_syn(state, timeout_event) do
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
+
+    tcp_segment =
+      Tcp.build_segment(state.pair, state.iss, 0, [:syn], state.rcv_wnd, mss: state.rcv_mss)
+
+    packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
+    :ok = Tricep.Link.send(state.link, packet)
+
+    # Exponential backoff
+    new_rto = min(state.rto_ms * 2, @max_rto_ms)
+    new_state = %{state | syn_retransmit_count: state.syn_retransmit_count + 1, rto_ms: new_rto}
+
+    actions = [{{:timeout, :rto}, new_rto, timeout_event}]
+    {:keep_state, new_state, actions}
   end
 
   defp do_retransmit(%__MODULE__{unacked_segments: []} = state) do

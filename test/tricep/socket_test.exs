@@ -2937,7 +2937,7 @@ defmodule Tricep.SocketTest do
   end
 
   describe "connect with timeout" do
-    test "returns {:error, :timeout} when no SYN-ACK received", %{remote_addr: remote_addr} do
+    test "returns {:error, :timeout} when no SYN-ACK received", %{} do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
 
       start_time = System.monotonic_time(:millisecond)
