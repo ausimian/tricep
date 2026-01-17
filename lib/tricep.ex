@@ -313,4 +313,41 @@ defmodule Tricep do
   def close(socket) when is_pid(socket) do
     Tricep.Socket.close(socket)
   end
+
+  @doc """
+  Shuts down part of a full-duplex connection.
+
+  Unlike `close/1` which initiates a full graceful close, `shutdown/2` allows
+  closing only one direction of the connection (half-close).
+
+  ## Arguments
+
+    * `socket` - The socket pid returned by `open/3`
+    * `how` - Which side(s) to shut down:
+      * `:read` - Disable receives (local only, no network action). Subsequent
+        `recv/3` calls return `{:error, :closed}` after any buffered data is consumed.
+      * `:write` - Disable sends and send FIN to peer. Subsequent `send/3` calls
+        return `{:error, :epipe}`.
+      * `:read_write` - Disable both directions (equivalent to `close/1`).
+
+  ## Returns
+
+    * `:ok` - Shutdown successful
+    * `{:error, :enotconn}` - Socket is not connected
+
+  ## Examples
+
+      # Half-close: signal no more data to send, but can still receive
+      :ok = Tricep.shutdown(socket, :write)
+
+      # Stop receiving data, but can still send
+      :ok = Tricep.shutdown(socket, :read)
+
+      # Full shutdown (same as close)
+      :ok = Tricep.shutdown(socket, :read_write)
+  """
+  @spec shutdown(pid(), :read | :write | :read_write) :: :ok | {:error, atom()}
+  def shutdown(socket, how) when is_pid(socket) and how in [:read, :write, :read_write] do
+    Tricep.Socket.shutdown(socket, how)
+  end
 end

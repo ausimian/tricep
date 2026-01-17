@@ -3253,4 +3253,210 @@ defmodule Tricep.SocketTest do
       100 -> :ok
     end
   end
+
+  describe "shutdown/2" do
+    test "shutdown(:write) sends FIN and transitions to fin_wait_1", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Shutdown write should return immediately
+      assert Tricep.shutdown(socket, :write) == :ok
+
+      # Should receive FIN packet
+      assert_receive {:dummy_link_packet, _link, fin_packet}, 1000
+
+      <<_ip_header::binary-size(40), fin_segment::binary>> = fin_packet
+      parsed = Tcp.parse_segment(fin_segment)
+
+      assert :fin in parsed.flags
+      assert :ack in parsed.flags
+
+      # Should be in FIN_WAIT_1
+      {:fin_wait_1, _} = :sys.get_state(socket)
+    end
+
+    test "shutdown(:read) marks read as shutdown and stays in established", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Shutdown read should return immediately
+      assert Tricep.shutdown(socket, :read) == :ok
+
+      # Should still be in established
+      {:established, state} = :sys.get_state(socket)
+      assert state.read_shutdown == true
+
+      # No FIN should be sent
+      refute_receive {:dummy_link_packet, _link, _fin_packet}, 100
+    end
+
+    test "shutdown(:read_write) sends FIN and transitions to fin_wait_1", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Shutdown read_write should return immediately
+      assert Tricep.shutdown(socket, :read_write) == :ok
+
+      # Should receive FIN packet
+      assert_receive {:dummy_link_packet, _link, fin_packet}, 1000
+
+      <<_ip_header::binary-size(40), fin_segment::binary>> = fin_packet
+      parsed = Tcp.parse_segment(fin_segment)
+
+      assert :fin in parsed.flags
+
+      # Should be in FIN_WAIT_1 with read_shutdown set
+      {:fin_wait_1, state} = :sys.get_state(socket)
+      assert state.read_shutdown == true
+    end
+
+    test "recv after shutdown(:read) returns {:error, :closed}", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Shutdown read
+      assert Tricep.shutdown(socket, :read) == :ok
+
+      # Recv should return closed
+      assert Tricep.recv(socket, 0, 100) == {:error, :closed}
+    end
+
+    test "recv after shutdown(:read) returns buffered data first", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Inject data packet
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.iss + 1,
+          [:ack, :psh],
+          32768,
+          payload: "buffered data"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+      Process.sleep(50)
+
+      # Drain the ACK for the data
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Now shutdown read
+      assert Tricep.shutdown(socket, :read) == :ok
+
+      # First recv should return the buffered data
+      assert Tricep.recv(socket, 0, 100) == {:ok, "buffered data"}
+
+      # Second recv should return closed
+      assert Tricep.recv(socket, 0, 100) == {:error, :closed}
+    end
+
+    test "send after shutdown(:write) returns {:error, :epipe}", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Shutdown write
+      assert Tricep.shutdown(socket, :write) == :ok
+
+      # Drain the FIN packet
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      # Send should return epipe (socket is in fin_wait_1)
+      assert Tricep.send(socket, "data") == {:error, :epipe}
+    end
+
+    test "shutdown(:write) in close_wait sends FIN and transitions to last_ack", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Inject FIN from peer
+      fin_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.iss + 1,
+          [:fin, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      # Should be in close_wait
+      {:close_wait, _} = :sys.get_state(socket)
+
+      # Drain the ACK for the FIN
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Shutdown write
+      assert Tricep.shutdown(socket, :write) == :ok
+
+      # Should receive our FIN
+      assert_receive {:dummy_link_packet, _link, fin_packet}, 1000
+
+      <<_ip_header::binary-size(40), fin_seg::binary>> = fin_packet
+      parsed = Tcp.parse_segment(fin_seg)
+      assert :fin in parsed.flags
+
+      # Should be in last_ack
+      {:last_ack, _} = :sys.get_state(socket)
+    end
+
+    test "shutdown on closed socket returns {:error, :enotconn}", %{} do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.shutdown(socket, :write) == {:error, :enotconn}
+      assert Tricep.shutdown(socket, :read) == {:error, :enotconn}
+      assert Tricep.shutdown(socket, :read_write) == {:error, :enotconn}
+    end
+  end
 end

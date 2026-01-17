@@ -35,6 +35,11 @@ defmodule Tricep.Socket do
     :gen_statem.call(pid, :close)
   end
 
+  @spec shutdown(pid(), :read | :write | :read_write) :: :ok | {:error, atom()}
+  def shutdown(pid, how) when is_pid(pid) and how in [:read, :write, :read_write] do
+    :gen_statem.call(pid, {:shutdown, how})
+  end
+
   def handle_packet(src_addr, dst_addr, <<src_port::16, dst_port::16, _::binary>> = segment) do
     pair = {{dst_addr, dst_port}, {src_addr, src_port}}
 
@@ -108,6 +113,8 @@ defmodule Tricep.Socket do
     field :recv_select, {pid(), reference(), non_neg_integer()} | nil, default: nil
     # For send backpressure - [{caller_pid, ref, data} | {from, ref, data, timer_ref}]
     field :send_waiters, list(), default: []
+    # Track if read side has been shutdown
+    field :read_shutdown, boolean(), default: false
   end
 
   # TIME_WAIT duration (2*MSL - using short value for TUN-based stack)
@@ -456,28 +463,33 @@ defmodule Tricep.Socket do
         {:keep_state, new_state, {:reply, from, {:ok, data}}}
 
       :wait ->
-        case timeout do
-          :nowait ->
-            # Return select tuple immediately, store caller info for notification
-            ref = make_ref()
-            {caller_pid, _} = from
-            new_state = %{state | recv_select: {caller_pid, ref, length}}
-            {:keep_state, new_state, {:reply, from, {:select, {:select_info, :recv, ref}}}}
+        # If read is shutdown and no data buffered, return closed
+        if state.read_shutdown do
+          {:keep_state_and_data, {:reply, from, {:error, :closed}}}
+        else
+          case timeout do
+            :nowait ->
+              # Return select tuple immediately, store caller info for notification
+              ref = make_ref()
+              {caller_pid, _} = from
+              new_state = %{state | recv_select: {caller_pid, ref, length}}
+              {:keep_state, new_state, {:reply, from, {:select, {:select_info, :recv, ref}}}}
 
-          :infinity ->
-            # Block indefinitely
-            timer_ref = make_ref()
-            waiter = {from, length, timer_ref}
-            new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
-            {:keep_state, new_state}
+            :infinity ->
+              # Block indefinitely
+              timer_ref = make_ref()
+              waiter = {from, length, timer_ref}
+              new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
+              {:keep_state, new_state}
 
-          ms when is_integer(ms) ->
-            # Block with timeout
-            timer_ref = make_ref()
-            waiter = {from, length, timer_ref}
-            new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
-            actions = [{{:timeout, timer_ref}, ms, {:recv_timeout, timer_ref}}]
-            {:keep_state, new_state, actions}
+            ms when is_integer(ms) ->
+              # Block with timeout
+              timer_ref = make_ref()
+              waiter = {from, length, timer_ref}
+              new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
+              actions = [{{:timeout, timer_ref}, ms, {:recv_timeout, timer_ref}}]
+              {:keep_state, new_state, actions}
+          end
         end
     end
   end
@@ -627,6 +639,28 @@ defmodule Tricep.Socket do
   def handle_event({:call, from}, :close, :established, %__MODULE__{} = state) do
     send_fin(state)
     new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1)}
+    {:next_state, :fin_wait_1, new_state, {:reply, from, :ok}}
+  end
+
+  # --- Shutdown from established ---
+
+  # shutdown(:write) - send FIN, transition to fin_wait_1
+  def handle_event({:call, from}, {:shutdown, :write}, :established, %__MODULE__{} = state) do
+    send_fin(state)
+    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1)}
+    {:next_state, :fin_wait_1, new_state, {:reply, from, :ok}}
+  end
+
+  # shutdown(:read) - just mark read as shutdown, stay in established
+  def handle_event({:call, from}, {:shutdown, :read}, :established, %__MODULE__{} = state) do
+    new_state = %{state | read_shutdown: true}
+    {:keep_state, new_state, {:reply, from, :ok}}
+  end
+
+  # shutdown(:read_write) - same as close
+  def handle_event({:call, from}, {:shutdown, :read_write}, :established, %__MODULE__{} = state) do
+    send_fin(state)
+    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1), read_shutdown: true}
     {:next_state, :fin_wait_1, new_state, {:reply, from, :ok}}
   end
 
@@ -855,6 +889,26 @@ defmodule Tricep.Socket do
     {:next_state, :last_ack, new_state, {:reply, from, :ok}}
   end
 
+  # shutdown(:write) in close_wait - send FIN, go to last_ack
+  def handle_event({:call, from}, {:shutdown, :write}, :close_wait, %__MODULE__{} = state) do
+    send_fin(state)
+    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1)}
+    {:next_state, :last_ack, new_state, {:reply, from, :ok}}
+  end
+
+  # shutdown(:read) in close_wait - already received FIN, just mark it
+  def handle_event({:call, from}, {:shutdown, :read}, :close_wait, %__MODULE__{} = state) do
+    new_state = %{state | read_shutdown: true}
+    {:keep_state, new_state, {:reply, from, :ok}}
+  end
+
+  # shutdown(:read_write) in close_wait - send FIN, go to last_ack
+  def handle_event({:call, from}, {:shutdown, :read_write}, :close_wait, %__MODULE__{} = state) do
+    send_fin(state)
+    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1), read_shutdown: true}
+    {:next_state, :last_ack, new_state, {:reply, from, :ok}}
+  end
+
   def handle_event(:info, segment, :close_wait, %__MODULE__{} = state) do
     # Handle ACKs for data we sent
     case Tcp.parse_segment(segment) do
@@ -917,6 +971,11 @@ defmodule Tricep.Socket do
   end
 
   def handle_event({:call, from}, :close, _state, _state_data) do
+    {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
+  end
+
+  # Catch-all shutdown handler for invalid states
+  def handle_event({:call, from}, {:shutdown, _how}, _state, _state_data) do
     {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
   end
 
