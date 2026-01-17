@@ -1,5 +1,7 @@
-# Exclude integration tests by default (require TUN device / root privileges)
-# Run with: INTEGRATION=true mix test
+# Exclude integration and slow tests by default
+# Run with: INTEGRATION=true mix test        (integration tests)
+# Run with: mix test --include slow          (include slow tests)
+# Run with: INTEGRATION=true mix test --include slow  (all tests)
 if System.get_env("INTEGRATION") == "true" do
   import Bitwise, only: [&&&: 2]
   pid = System.pid() |> String.to_integer()
@@ -41,7 +43,7 @@ if System.get_env("INTEGRATION") == "true" do
       dstaddr_str: dstaddr_str
     ]
 
-  ExUnit.start(tricep: tricep_config)
+  ExUnit.start(tricep: tricep_config, exclude: [:slow])
 else
-  ExUnit.start(exclude: [:integration])
+  ExUnit.start(exclude: [:integration, :slow])
 end

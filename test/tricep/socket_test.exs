@@ -2439,6 +2439,7 @@ defmodule Tricep.SocketTest do
   end
 
   describe "SYN retransmission" do
+    @tag :slow
     test "retransmits SYN after timeout" do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
 
@@ -2468,6 +2469,7 @@ defmodule Tricep.SocketTest do
       Task.shutdown(task, :brutal_kill)
     end
 
+    @tag :slow
     @tag timeout: 120_000
     test "connection fails after max SYN retries", %{
       link: _link,
@@ -2514,6 +2516,7 @@ defmodule Tricep.SocketTest do
       assert result == {:error, :etimedout}
     end
 
+    @tag :slow
     test "SYN retransmit cancelled on RST", %{
       link: link,
       local_addr: local_addr,
@@ -2553,6 +2556,7 @@ defmodule Tricep.SocketTest do
   end
 
   describe "data retransmission" do
+    @tag :slow
     test "retransmits data segment after RTO", %{
       link: link,
       local_addr: local_addr,
@@ -2582,6 +2586,7 @@ defmodule Tricep.SocketTest do
       assert parsed2.seq == parsed1.seq
     end
 
+    @tag :slow
     test "ACK prevents retransmission", %{
       link: link,
       local_addr: local_addr,
@@ -2621,6 +2626,7 @@ defmodule Tricep.SocketTest do
       refute_receive {:dummy_link_packet, _link, _}, 1500
     end
 
+    @tag :slow
     test "exponential backoff doubles RTO", %{
       link: link,
       local_addr: local_addr,
@@ -2662,6 +2668,7 @@ defmodule Tricep.SocketTest do
       assert delta2 > delta1 * 1.5, "Expected exponential backoff"
     end
 
+    @tag :slow
     @tag timeout: 120_000
     test "connection closes after max data retries", %{
       link: link,
