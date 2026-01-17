@@ -1,4 +1,6 @@
 defmodule Tricep.Nifs do
+  @moduledoc false
+
   @on_load :load_nif
 
   @doc """

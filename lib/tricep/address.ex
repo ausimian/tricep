@@ -1,4 +1,6 @@
 defmodule Tricep.Address do
+  @moduledoc false
+
   def to_bytes({a, b, c, d, e, f, g, h}) do
     <<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>
   end

@@ -1,11 +1,5 @@
 defmodule Tricep.DataBuffer do
-  @moduledoc """
-  A queue-based data buffer for efficient append and take operations.
-
-  Avoids binary copy overhead by storing chunks in a queue rather than
-  concatenating them. Provides O(1) amortized append and O(k) take where
-  k is the number of chunks consumed.
-  """
+  @moduledoc false
 
   @opaque t :: %__MODULE__{
             queue: :queue.queue(binary()),

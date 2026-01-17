@@ -1,7 +1,5 @@
 defmodule Tricep.Tcp do
-  @moduledoc """
-  TCP segment building, parsing, and checksum calculation.
-  """
+  @moduledoc false
 
   import Bitwise
 

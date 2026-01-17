@@ -1,4 +1,6 @@
 defmodule Tricep.Link do
+  @moduledoc false
+
   import Kernel, except: [send: 2]
 
   def new(opts) when is_list(opts) do

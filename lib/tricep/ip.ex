@@ -1,4 +1,6 @@
 defmodule Tricep.Ip do
+  @moduledoc false
+
   @tcp 6
   @udp 17
   @icmpv6 58

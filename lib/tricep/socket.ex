@@ -1,4 +1,6 @@
 defmodule Tricep.Socket do
+  @moduledoc false
+
   @behaviour :gen_statem
 
   import Bitwise
