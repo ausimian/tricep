@@ -59,6 +59,11 @@ defmodule Tricep.Socket do
   # Default MSS for IPv6 (1280 min MTU - 40 IPv6 header - 20 TCP header)
   @default_mss 1220
 
+  # Retransmission timeout constants
+  @initial_rto_ms 1_000
+  @max_rto_ms 60_000
+  @max_retransmit_count 5
+
   @typep addr_port() :: {binary(), non_neg_integer()}
   typedstruct enforce: true do
     field :pair, {addr_port(), addr_port()}
@@ -81,6 +86,14 @@ defmodule Tricep.Socket do
     field :recv_waiters, list(), default: []
     # Track if peer has sent FIN (EOF)
     field :fin_received, boolean(), default: false
+    # Retransmission support: list of {seq_start, seq_end, payload, retransmit_count}
+    field :unacked_segments, list(), default: []
+    # Current RTO in milliseconds
+    field :rto_ms, non_neg_integer(), default: 1_000
+    # Whether the RTO timer is currently active
+    field :rto_timer_active, boolean(), default: false
+    # SYN retransmit count (for connection phase)
+    field :syn_retransmit_count, non_neg_integer(), default: 0
   end
 
   # TIME_WAIT duration (2*MSL - using short value for TUN-based stack)
@@ -136,10 +149,15 @@ defmodule Tricep.Socket do
         snd_una: iss,
         snd_nxt: iss + 1,
         snd_wnd: 0,
-        rcv_wnd: rcv_wnd
+        rcv_wnd: rcv_wnd,
+        syn_retransmit_count: 0,
+        rto_ms: @initial_rto_ms
     }
 
-    {:next_state, {:syn_sent, from}, new_state}
+    # Start SYN retransmission timer
+    actions = [{{:timeout, :rto}, @initial_rto_ms, {:syn_timeout, from}}]
+
+    {:next_state, {:syn_sent, from}, new_state, actions}
   end
 
   def handle_event(:info, segment, {:syn_sent, from}, %__MODULE__{} = state) do
@@ -152,7 +170,8 @@ defmodule Tricep.Socket do
         cond do
           rst? ->
             reset_state(state)
-            {:next_state, :closed, nil, {:reply, from, {:error, :econnrefused}}}
+            actions = [{{:timeout, :rto}, :cancel}, {:reply, from, {:error, :econnrefused}}]
+            {:next_state, :closed, nil, actions}
 
           syn? and ack? and ack == state.iss + 1 ->
             # Valid SYN-ACK: send ACK and transition to ESTABLISHED
@@ -167,10 +186,14 @@ defmodule Tricep.Socket do
                 rcv_nxt: seq + 1,
                 snd_una: ack,
                 snd_wnd: window,
-                snd_mss: snd_mss
+                snd_mss: snd_mss,
+                syn_retransmit_count: 0,
+                rto_ms: @initial_rto_ms
             }
 
-            {:next_state, :established, new_state, {:reply, from, :ok}}
+            # Cancel RTO timer and reply success
+            actions = [{{:timeout, :rto}, :cancel}, {:reply, from, :ok}]
+            {:next_state, :established, new_state, actions}
 
           ack? and ack != state.iss + 1 ->
             # Bad ACK: send RST
@@ -184,6 +207,37 @@ defmodule Tricep.Socket do
 
       _ ->
         :keep_state_and_data
+    end
+  end
+
+  # --- SYN retransmission timeout ---
+
+  def handle_event(
+        {:timeout, :rto},
+        {:syn_timeout, from},
+        {:syn_sent, from},
+        %__MODULE__{} = state
+      ) do
+    if state.syn_retransmit_count >= @max_retransmit_count do
+      # Max retries exceeded - connection failure
+      reset_state(state)
+      {:next_state, :closed, nil, {:reply, from, {:error, :etimedout}}}
+    else
+      # Retransmit SYN
+      {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
+
+      tcp_segment =
+        Tcp.build_segment(state.pair, state.iss, 0, [:syn], state.rcv_wnd, mss: state.rcv_mss)
+
+      packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
+      :ok = Tricep.Link.send(state.link, packet)
+
+      # Exponential backoff
+      new_rto = min(state.rto_ms * 2, @max_rto_ms)
+      new_state = %{state | syn_retransmit_count: state.syn_retransmit_count + 1, rto_ms: new_rto}
+
+      actions = [{{:timeout, :rto}, new_rto, {:syn_timeout, from}}]
+      {:keep_state, new_state, actions}
     end
   end
 
@@ -298,7 +352,6 @@ defmodule Tricep.Socket do
             # Data segment with expected sequence number
             new_rcv_nxt = wrap_seq(state.rcv_nxt + byte_size(payload))
             new_recv_buffer = state.recv_buffer <> payload
-            new_snd_una = if ack > state.snd_una, do: ack, else: state.snd_una
 
             # Send ACK for received data
             send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
@@ -307,22 +360,22 @@ defmodule Tricep.Socket do
             {new_recv_buffer, new_waiters, replies} =
               process_waiters(new_recv_buffer, state.recv_waiters)
 
+            # Process ACK portion to update retransmission queue
+            {ack_state, timer_actions} = process_ack(state, ack, window)
+
             new_state = %{
-              state
+              ack_state
               | rcv_nxt: new_rcv_nxt,
                 recv_buffer: new_recv_buffer,
-                recv_waiters: new_waiters,
-                snd_una: new_snd_una,
-                snd_wnd: window
+                recv_waiters: new_waiters
             }
 
-            {:keep_state, new_state, replies}
+            {:keep_state, new_state, replies ++ timer_actions}
 
           ack? and byte_size(payload) == 0 ->
-            # Pure ACK - update send window
-            new_snd_una = if ack > state.snd_una, do: ack, else: state.snd_una
-            new_state = %{state | snd_una: new_snd_una, snd_wnd: window}
-            {:keep_state, new_state}
+            # Pure ACK - process ACK and update retransmission queue
+            {new_state, timer_actions} = process_ack(state, ack, window)
+            {:keep_state, new_state, timer_actions}
 
           true ->
             # Out of order or unexpected - ignore for now
@@ -332,6 +385,16 @@ defmodule Tricep.Socket do
       _ ->
         :keep_state_and_data
     end
+  end
+
+  # --- Data retransmission timeout ---
+
+  def handle_event({:timeout, :rto}, :retransmit, :established, %__MODULE__{} = state) do
+    do_retransmit(state)
+  end
+
+  def handle_event({:timeout, :rto}, :retransmit, :close_wait, %__MODULE__{} = state) do
+    do_retransmit(state)
   end
 
   # --- Active close from established ---
@@ -526,9 +589,9 @@ defmodule Tricep.Socket do
           {:next_state, :closed, nil}
         else
           if :ack in flags do
-            new_snd_una = if ack > state.snd_una, do: ack, else: state.snd_una
-            new_state = %{state | snd_una: new_snd_una, snd_wnd: window}
-            {:keep_state, new_state}
+            # Process ACK and update retransmission queue
+            {new_state, timer_actions} = process_ack(state, ack, window)
+            {:keep_state, new_state, timer_actions}
           else
             :keep_state_and_data
           end
@@ -582,18 +645,80 @@ defmodule Tricep.Socket do
     {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
   end
 
+  defp do_retransmit(%__MODULE__{unacked_segments: []} = state) do
+    # Nothing to retransmit, clear timer state
+    {:keep_state, %{state | rto_timer_active: false}}
+  end
+
+  defp do_retransmit(
+         %__MODULE__{unacked_segments: [{seq, _seq_end, payload, count} | rest]} = state
+       ) do
+    if count >= @max_retransmit_count do
+      # Max retries exceeded - connection failure
+      reset_state(state)
+      actions = notify_recv_waiters_error(state.recv_waiters, :etimedout)
+      {:next_state, :closed, nil, actions}
+    else
+      # Retransmit the oldest unacked segment
+      {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
+
+      tcp_segment =
+        Tcp.build_segment(
+          state.pair,
+          seq,
+          state.rcv_nxt,
+          [:ack, :psh],
+          state.rcv_wnd,
+          payload: payload
+        )
+
+      packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
+      Tricep.Link.send(state.link, packet)
+
+      # Update segment with incremented retransmit count
+      updated_entry = {seq, wrap_seq(seq + byte_size(payload)), payload, count + 1}
+      new_unacked = [updated_entry | rest]
+
+      # Exponential backoff
+      new_rto = min(state.rto_ms * 2, @max_rto_ms)
+
+      new_state = %{
+        state
+        | unacked_segments: new_unacked,
+          rto_ms: new_rto,
+          rto_timer_active: true
+      }
+
+      # Schedule next RTO timer
+      actions = [{{:timeout, :rto}, new_rto, :retransmit}]
+      {:keep_state, new_state, actions}
+    end
+  end
+
+  defp notify_recv_waiters_error(waiters, error) do
+    Enum.flat_map(waiters, fn {from, _length, timer_ref} ->
+      [
+        {:reply, from, {:error, error}},
+        {{:timeout, timer_ref}, :cancel}
+      ]
+    end)
+  end
+
   defp do_flush_send_buffer(%__MODULE__{} = state) do
     # Take up to snd_mss bytes from buffer
     mss = state.snd_mss || @default_mss
     {payload_iodata, new_send_buffer} = DataBuffer.take(state.send_buffer, mss)
     payload = IO.iodata_to_binary(payload_iodata)
 
+    seq_start = state.snd_nxt
+    seq_end = wrap_seq(seq_start + byte_size(payload))
+
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
       Tcp.build_segment(
         state.pair,
-        state.snd_nxt,
+        seq_start,
         state.rcv_nxt,
         [:ack, :psh],
         state.rcv_wnd,
@@ -603,17 +728,33 @@ defmodule Tricep.Socket do
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     Tricep.Link.send(state.link, packet)
 
+    # Track segment for retransmission: {seq_start, seq_end, payload, retransmit_count}
+    unacked_entry = {seq_start, seq_end, payload, 0}
+    new_unacked = state.unacked_segments ++ [unacked_entry]
+
     new_state = %{
       state
       | send_buffer: new_send_buffer,
-        snd_nxt: wrap_seq(state.snd_nxt + byte_size(payload))
+        snd_nxt: seq_end,
+        unacked_segments: new_unacked
     }
 
-    # If more data to send, schedule another flush
+    # Build actions: continue flushing if more data, start RTO timer if not active
+    actions = []
+
     actions =
       if not DataBuffer.empty?(new_send_buffer),
-        do: [{:next_event, :internal, :flush_send_buffer}],
-        else: []
+        do: [{:next_event, :internal, :flush_send_buffer} | actions],
+        else: actions
+
+    # Start RTO timer if not already running
+    {new_state, actions} =
+      if not state.rto_timer_active do
+        {%{new_state | rto_timer_active: true},
+         [{{:timeout, :rto}, state.rto_ms, :retransmit} | actions]}
+      else
+        {new_state, actions}
+      end
 
     {:keep_state, new_state, actions}
   end
@@ -673,6 +814,51 @@ defmodule Tricep.Socket do
 
   # Wrap sequence number at 32 bits
   defp wrap_seq(n), do: n &&& 0xFFFFFFFF
+
+  # Sequence number comparison (handles 32-bit wrap-around)
+  # Returns true if a > b in sequence space
+  defp seq_gt(a, b) do
+    diff = a - b &&& 0xFFFFFFFF
+    diff > 0 and diff < 0x80000000
+  end
+
+  # Returns true if a <= b in sequence space
+  defp seq_leq(a, b), do: not seq_gt(a, b)
+
+  # Process ACK and update retransmission queue
+  # Returns {new_state, timer_actions}
+  defp process_ack(state, ack, window) do
+    if seq_gt(ack, state.snd_una) do
+      # ACK acknowledges new data - remove acknowledged segments from queue
+      new_unacked =
+        Enum.drop_while(state.unacked_segments, fn {_seq_start, seq_end, _payload, _count} ->
+          seq_leq(seq_end, ack)
+        end)
+
+      new_state = %{
+        state
+        | snd_una: ack,
+          snd_wnd: window,
+          unacked_segments: new_unacked,
+          rto_ms: @initial_rto_ms
+      }
+
+      # Manage RTO timer based on remaining unacked segments
+      timer_actions =
+        if new_unacked == [] do
+          # All data acknowledged - cancel timer
+          [{{:timeout, :rto}, :cancel}]
+        else
+          # More unacked data - restart timer with fresh RTO
+          [{{:timeout, :rto}, @initial_rto_ms, :retransmit}]
+        end
+
+      {%{new_state | rto_timer_active: new_unacked != []}, timer_actions}
+    else
+      # Duplicate or old ACK - just update window
+      {%{state | snd_wnd: window}, []}
+    end
+  end
 
   # Split binary at position (or end if shorter)
   defp split_binary(bin, pos) when byte_size(bin) <= pos, do: {bin, <<>>}

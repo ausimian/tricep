@@ -2438,6 +2438,358 @@ defmodule Tricep.SocketTest do
     end
   end
 
+  describe "SYN retransmission" do
+    test "retransmits SYN after timeout" do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      # Start connect in a task (it will block waiting for SYN-ACK)
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      # Wait for the first SYN packet
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+
+      <<_ip_header::binary-size(40), syn_segment1::binary>> = packet1
+      parsed1 = Tcp.parse_segment(syn_segment1)
+      assert :syn in parsed1.flags
+
+      # Don't send SYN-ACK, wait for retransmission (RTO = 1000ms)
+      # Wait for second SYN
+      assert_receive {:dummy_link_packet, _link, packet2}, 1500
+
+      <<_ip_header::binary-size(40), syn_segment2::binary>> = packet2
+      parsed2 = Tcp.parse_segment(syn_segment2)
+      assert :syn in parsed2.flags
+      # Same sequence number as first SYN
+      assert parsed2.seq == parsed1.seq
+
+      Task.shutdown(task, :brutal_kill)
+    end
+
+    @tag timeout: 120_000
+    test "connection fails after max SYN retries", %{
+      link: _link,
+      local_addr: _local_addr,
+      remote_addr: _remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      # Drain all SYN packets without responding
+      # Timing: initial + retransmits with exponential backoff
+      # count=0, RTO=1s -> retransmit -> count=1, RTO=2s
+      # count=1, RTO=2s -> retransmit -> count=2, RTO=4s
+      # count=2, RTO=4s -> retransmit -> count=3, RTO=8s
+      # count=3, RTO=8s -> retransmit -> count=4, RTO=16s
+      # count=4, RTO=16s -> retransmit -> count=5, RTO=32s
+      # count=5 >= 5, connection fails
+      # Total: 1+2+4+8+16+32 = 63s
+
+      # Receive initial SYN
+      assert_receive {:dummy_link_packet, _link, _packet0}, 1000
+
+      # Receive retransmission 1 (after ~1s)
+      assert_receive {:dummy_link_packet, _link, _packet1}, 1500
+
+      # Receive retransmission 2 (after ~2s more)
+      assert_receive {:dummy_link_packet, _link, _packet2}, 2500
+
+      # Receive retransmission 3 (after ~4s more)
+      assert_receive {:dummy_link_packet, _link, _packet3}, 4500
+
+      # Receive retransmission 4 (after ~8s more)
+      assert_receive {:dummy_link_packet, _link, _packet4}, 8500
+
+      # Receive retransmission 5 (after ~16s more)
+      assert_receive {:dummy_link_packet, _link, _packet5}, 16500
+
+      # After 5 retransmissions, the 6th timeout (after ~32s) should fail
+      result = Task.await(task, 35_000)
+      assert result == {:error, :etimedout}
+    end
+
+    test "SYN retransmit cancelled on RST", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      # Wait for the first SYN packet
+      assert_receive {:dummy_link_packet, _link, packet}, 1000
+
+      <<_ip_header::binary-size(40), syn_segment::binary>> = packet
+      <<src_port::16, _::binary>> = syn_segment
+
+      # Send RST response
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          0,
+          0,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      # Connect should fail with connection refused
+      assert Task.await(task, 1000) == {:error, :econnrefused}
+
+      # No more SYN retransmissions should occur
+      refute_receive {:dummy_link_packet, _link, _}, 1500
+    end
+  end
+
+  describe "data retransmission" do
+    test "retransmits data segment after RTO", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Send data
+      assert Tricep.send(socket, "Hello") == :ok
+
+      # Should receive data segment
+      assert_receive {:dummy_link_packet, _link, data_packet1}, 1000
+
+      <<_ip_header::binary-size(40), data_segment1::binary>> = data_packet1
+      parsed1 = Tcp.parse_segment(data_segment1)
+      assert parsed1.payload == "Hello"
+
+      # Don't send ACK, wait for retransmission (RTO = 1000ms)
+      assert_receive {:dummy_link_packet, _link, data_packet2}, 1500
+
+      <<_ip_header::binary-size(40), data_segment2::binary>> = data_packet2
+      parsed2 = Tcp.parse_segment(data_segment2)
+      assert parsed2.payload == "Hello"
+      assert parsed2.seq == parsed1.seq
+    end
+
+    test "ACK prevents retransmission", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send data
+      assert Tricep.send(socket, "Hello") == :ok
+
+      # Should receive data segment
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+
+      <<_ip_header::binary-size(40), data_segment::binary>> = data_packet
+      parsed = Tcp.parse_segment(data_segment)
+
+      # Send ACK for the data
+      ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          parsed.seq + byte_size(parsed.payload),
+          [:ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+
+      # Wait past the RTO - should NOT receive retransmission
+      refute_receive {:dummy_link_packet, _link, _}, 1500
+    end
+
+    test "exponential backoff doubles RTO", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Send data
+      assert Tricep.send(socket, "Hello") == :ok
+
+      # First transmission
+      assert_receive {:dummy_link_packet, _link, _packet1}, 1000
+      t1 = System.monotonic_time(:millisecond)
+
+      # First retransmission (after ~1000ms)
+      assert_receive {:dummy_link_packet, _link, _packet2}, 1500
+      t2 = System.monotonic_time(:millisecond)
+
+      # Second retransmission (after ~2000ms more)
+      assert_receive {:dummy_link_packet, _link, _packet3}, 2500
+      t3 = System.monotonic_time(:millisecond)
+
+      # Check timing (with some tolerance)
+      delta1 = t2 - t1
+      delta2 = t3 - t2
+
+      # First retransmit after ~1000ms
+      assert delta1 >= 900 and delta1 <= 1500,
+             "First retransmit took #{delta1}ms, expected ~1000ms"
+
+      # Second retransmit after ~2000ms (doubled)
+      assert delta2 >= 1800 and delta2 <= 2500,
+             "Second retransmit took #{delta2}ms, expected ~2000ms"
+
+      # delta2 should be roughly 2x delta1
+      assert delta2 > delta1 * 1.5, "Expected exponential backoff"
+    end
+
+    @tag timeout: 120_000
+    test "connection closes after max data retries", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Send data
+      assert Tricep.send(socket, "Hello") == :ok
+
+      # Drain all retransmissions without ACKing
+      # Initial + 5 retransmissions with exponential backoff: 1+2+4+8+16+32 = 63s
+      assert_receive {:dummy_link_packet, _link, _p0}, 1000
+      assert_receive {:dummy_link_packet, _link, _p1}, 1500
+      assert_receive {:dummy_link_packet, _link, _p2}, 2500
+      assert_receive {:dummy_link_packet, _link, _p3}, 4500
+      assert_receive {:dummy_link_packet, _link, _p4}, 8500
+      assert_receive {:dummy_link_packet, _link, _p5}, 16500
+
+      # Wait for connection to fail (after 6th timeout at 32s)
+      Process.sleep(35_000)
+
+      # Socket should be closed now
+      {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "unacked_segments cleared after ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send data
+      assert Tricep.send(socket, "Hello") == :ok
+
+      # Should receive data segment
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+
+      <<_ip_header::binary-size(40), data_segment::binary>> = data_packet
+      parsed = Tcp.parse_segment(data_segment)
+
+      # Check that unacked_segments is not empty
+      {:established, state_before_ack} = :sys.get_state(socket)
+      assert length(state_before_ack.unacked_segments) == 1
+
+      # Send ACK for the data
+      ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          parsed.seq + byte_size(parsed.payload),
+          [:ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+      Process.sleep(50)
+
+      # Check that unacked_segments is now empty
+      {:established, state_after_ack} = :sys.get_state(socket)
+      assert state_after_ack.unacked_segments == []
+      assert state_after_ack.rto_timer_active == false
+    end
+
+    test "retransmission in CLOSE_WAIT state", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      # Get socket state
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      # Send FIN from peer to enter CLOSE_WAIT
+      fin_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, _} = :sys.get_state(socket)
+
+      # Drain ACK for FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      # Send data in CLOSE_WAIT
+      assert Tricep.send(socket, "Data") == :ok
+
+      # Should receive data segment
+      assert_receive {:dummy_link_packet, _link, data_packet1}, 1000
+
+      <<_ip_header::binary-size(40), data_segment1::binary>> = data_packet1
+      parsed1 = Tcp.parse_segment(data_segment1)
+      assert parsed1.payload == "Data"
+
+      # Don't ACK, wait for retransmission
+      assert_receive {:dummy_link_packet, _link, data_packet2}, 1500
+
+      <<_ip_header::binary-size(40), data_segment2::binary>> = data_packet2
+      parsed2 = Tcp.parse_segment(data_segment2)
+      assert parsed2.payload == "Data"
+      assert parsed2.seq == parsed1.seq
+    end
+  end
+
   # Helper to establish a connection and return the socket
   defp establish_connection(link, local_addr, remote_addr, opts \\ []) do
     {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
