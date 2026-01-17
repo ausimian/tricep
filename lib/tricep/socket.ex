@@ -177,10 +177,12 @@ defmodule Tricep.Socket do
         ref = make_ref()
         {caller_pid, _} = from
         new_state = %{base_state | connect_select: {caller_pid, ref}}
+
         actions = [
           {{:timeout, :rto}, @initial_rto_ms, :syn_timeout_nowait},
           {:reply, from, {:select, {:select_info, :connect, ref}}}
         ]
+
         {:next_state, {:syn_sent, :nowait}, new_state, actions}
 
       :infinity ->
@@ -194,12 +196,14 @@ defmodule Tricep.Socket do
           {{:timeout, :rto}, @initial_rto_ms, {:syn_timeout, from}},
           {{:timeout, :connect_timeout}, ms, {:connect_timeout, from}}
         ]
+
         {:next_state, {:syn_sent, from}, base_state, actions}
     end
   end
 
   # SYN-ACK handler for blocking connect (from is a gen_statem from tuple)
-  def handle_event(:info, segment, {:syn_sent, from}, %__MODULE__{} = state) when is_tuple(from) do
+  def handle_event(:info, segment, {:syn_sent, from}, %__MODULE__{} = state)
+      when is_tuple(from) do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, window: window, options: options} ->
         syn? = :syn in flags
@@ -209,11 +213,13 @@ defmodule Tricep.Socket do
         cond do
           rst? ->
             reset_state(state)
+
             actions = [
               {{:timeout, :rto}, :cancel},
               {{:timeout, :connect_timeout}, :cancel},
               {:reply, from, {:error, :econnrefused}}
             ]
+
             {:next_state, :closed, nil, actions}
 
           syn? and ack? and ack == state.iss + 1 ->
@@ -240,6 +246,7 @@ defmodule Tricep.Socket do
               {{:timeout, :connect_timeout}, :cancel},
               {:reply, from, :ok}
             ]
+
             {:next_state, :established, new_state, actions}
 
           ack? and ack != state.iss + 1 ->
@@ -382,7 +389,9 @@ defmodule Tricep.Socket do
       available > 0 ->
         # Window available, enqueue data and return immediately
         new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
-        {:keep_state, new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+
+        {:keep_state, new_state,
+         [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
 
       timeout == :nowait ->
         # Window exhausted, return select tuple
@@ -770,7 +779,9 @@ defmodule Tricep.Socket do
       available > 0 ->
         # Window available, enqueue data and return immediately
         new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
-        {:keep_state, new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+
+        {:keep_state, new_state,
+         [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
 
       timeout == :nowait ->
         # Window exhausted, return select tuple
@@ -1181,7 +1192,9 @@ defmodule Tricep.Socket do
           new_send_buffer = DataBuffer.append(state.send_buffer, data)
           new_state = %{state | send_waiters: rest, send_buffer: new_send_buffer}
           cancel_action = if timer_ref, do: [{{:timeout, timer_ref}, :cancel}], else: []
-          {new_state, [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}] ++ cancel_action}
+
+          {new_state,
+           [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}] ++ cancel_action}
       end
     else
       {state, []}
