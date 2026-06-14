@@ -61,6 +61,25 @@ defmodule Tricep.IpTest do
       assert next_header == 99
     end
 
+    test "accepts maximum integer protocol number" do
+      packet = Ip.wrap(@src_addr, @dst_addr, 255, <<>>)
+
+      <<_::binary-size(6), next_header::8, _::binary>> = packet
+      assert next_header == 255
+    end
+
+    test "rejects negative integer protocol number" do
+      assert_raise ArgumentError, ~r/IPv6 next header must be in 0\.\.255, got -1/, fn ->
+        Ip.wrap(@src_addr, @dst_addr, -1, <<>>)
+      end
+    end
+
+    test "rejects oversized integer protocol number" do
+      assert_raise ArgumentError, ~r/IPv6 next header must be in 0\.\.255, got 256/, fn ->
+        Ip.wrap(@src_addr, @dst_addr, 256, <<>>)
+      end
+    end
+
     test "handles empty payload" do
       packet = Ip.wrap(@src_addr, @dst_addr, :tcp, <<>>)
 
@@ -76,6 +95,25 @@ defmodule Tricep.IpTest do
       <<_::binary-size(4), payload_length::16, _::binary>> = packet
       assert payload_length == 1000
       assert byte_size(packet) == 40 + 1000
+    end
+
+    test "handles maximum non-jumbogram payload" do
+      payload = :binary.copy(<<0xFF>>, 65_535)
+      packet = Ip.wrap(@src_addr, @dst_addr, :tcp, payload)
+
+      <<_::binary-size(4), payload_length::16, _::binary>> = packet
+      assert payload_length == 65_535
+      assert byte_size(packet) == 40 + 65_535
+    end
+
+    test "rejects oversized payload" do
+      payload = :binary.copy(<<0xFF>>, 65_536)
+
+      assert_raise ArgumentError,
+                   ~r/IPv6 payload length 65536 exceeds 65535; jumbograms are not supported/,
+                   fn ->
+                     Ip.wrap(@src_addr, @dst_addr, :tcp, payload)
+                   end
     end
   end
 
