@@ -4,6 +4,8 @@ defmodule Tricep.Ip do
   @tcp 6
   @udp 17
   @icmpv6 58
+  @max_payload_length 65_535
+  @max_next_header 255
 
   @type parsed_packet :: %{
           version: 6,
@@ -23,7 +25,7 @@ defmodule Tricep.Ip do
     version = 6
     traffic_class = 0
     flow_label = 0
-    payload_length = byte_size(payload)
+    payload_length = payload |> byte_size() |> validate_payload_length()
     next_header = protocol_number(protocol)
     hop_limit = 64
 
@@ -43,7 +45,19 @@ defmodule Tricep.Ip do
   defp protocol_number(:tcp), do: @tcp
   defp protocol_number(:udp), do: @udp
   defp protocol_number(:icmpv6), do: @icmpv6
-  defp protocol_number(n) when is_integer(n), do: n
+
+  defp protocol_number(n) when is_integer(n) and n in 0..@max_next_header, do: n
+
+  defp protocol_number(n) when is_integer(n) do
+    raise ArgumentError, "IPv6 next header must be in 0..#{@max_next_header}, got #{n}"
+  end
+
+  defp validate_payload_length(length) when length <= @max_payload_length, do: length
+
+  defp validate_payload_length(length) do
+    raise ArgumentError,
+          "IPv6 payload length #{length} exceeds #{@max_payload_length}; jumbograms are not supported"
+  end
 
   @spec parse(binary()) :: {:ok, parsed_packet()} | {:error, atom()}
   def parse(
