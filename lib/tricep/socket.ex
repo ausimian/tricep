@@ -598,6 +598,9 @@ defmodule Tricep.Socket do
             actions = notify_waiters_error(state, :econnreset)
             {:next_state, :closed, nil, actions}
 
+          invalid_ack?(state, ack?, ack) ->
+            reject_invalid_ack(state)
+
           fin? and seq == state.rcv_nxt ->
             # FIN from peer - handle any data with it, then transition to CLOSE_WAIT
             data_len = byte_size(payload)
@@ -835,6 +838,9 @@ defmodule Tricep.Socket do
           rst? ->
             reset_state(state)
             {:next_state, :closed, nil}
+
+          invalid_ack?(state, ack?, ack) ->
+            reject_invalid_ack(state)
 
           fin? and seq == state.rcv_nxt ->
             # FIN from peer - ACK it and go to TIME_WAIT
@@ -1593,6 +1599,14 @@ defmodule Tricep.Socket do
   # Returns {new_state, timer_actions}
   defp process_ack_if_present(state, false, _ack, window), do: {%{state | snd_wnd: window}, []}
   defp process_ack_if_present(state, true, ack, window), do: process_ack(state, ack, window)
+
+  defp invalid_ack?(state, true, ack), do: seq_gt(ack, state.snd_nxt)
+  defp invalid_ack?(_state, false, _ack), do: false
+
+  defp reject_invalid_ack(state) do
+    send_ack(state.rcv_nxt, state)
+    {:keep_state, state, []}
+  end
 
   defp ack_unacceptable_segment(state, ack?, ack, window) do
     {new_state, actions} = process_ack_if_present(state, ack?, ack, window)

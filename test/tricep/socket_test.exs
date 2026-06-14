@@ -1337,6 +1337,45 @@ defmodule Tricep.SocketTest do
       assert Tricep.recv(socket, 0, 1000) == {:ok, "duplicate once"}
     end
 
+    test "rejects data when ACK is beyond snd_nxt", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      invalid_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          wrap_seq(state.snd_nxt + 1),
+          [:ack, :psh],
+          32768,
+          payload: "must not deliver"
+        )
+
+      DummyLink.inject_packet(link, invalid_ack_segment)
+
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert :ack in ack.flags
+      assert ack.seq == state.snd_nxt
+      assert ack.ack == state.rcv_nxt
+      assert Tricep.recv(socket, 0, 100) == {:error, :timeout}
+
+      {:established, new_state} = :sys.get_state(socket)
+      assert new_state.rcv_nxt == state.rcv_nxt
+      assert new_state.recv_buffer == <<>>
+    end
+
     test "ignores malformed segments in established state", %{
       link: link,
       local_addr: local_addr,
@@ -1547,7 +1586,7 @@ defmodule Tricep.SocketTest do
       assert Tricep.recv(socket, 0, 100) == {:ok, <<>>}
     end
 
-    test "passive close ignores ACK beyond snd_nxt", %{
+    test "passive close rejects ACK beyond snd_nxt before accepting FIN", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -1571,13 +1610,20 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, fin_segment)
 
-      {:close_wait, close_wait_state} = :sys.get_state(socket)
+      {:established, new_state} = :sys.get_state(socket)
 
-      assert close_wait_state.snd_una == state.snd_una
-      assert close_wait_state.snd_nxt == state.snd_nxt
+      assert new_state.snd_una == state.snd_una
+      assert new_state.snd_nxt == state.snd_nxt
+      assert new_state.rcv_nxt == state.rcv_nxt
+      assert new_state.fin_received == false
 
-      # Should still ACK the peer's FIN.
-      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert :ack in ack.flags
+      assert ack.seq == state.snd_nxt
+      assert ack.ack == state.rcv_nxt
     end
 
     test "recv returns buffered data then EOF after receiving FIN", %{
