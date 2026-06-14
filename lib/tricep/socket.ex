@@ -113,10 +113,10 @@ defmodule Tricep.Socket do
     field :rto_timer_active, boolean(), default: false
     # SYN retransmit count (for connection phase)
     field :syn_retransmit_count, non_neg_integer(), default: 0
-    # For :nowait connect readiness/completion - {caller_pid, ref}
-    field :connect_select, {pid(), reference()} | nil, default: nil
-    # For :nowait recv - {caller_pid, ref, length}
-    field :recv_select, {pid(), reference(), non_neg_integer()} | nil, default: nil
+    # For :nowait connect readiness/completion - [{caller_pid, ref}]
+    field :connect_selects, [{pid(), reference()}], default: []
+    # For :nowait recv - [{caller_pid, ref, length}]
+    field :recv_selects, [{pid(), reference(), non_neg_integer()}], default: []
     # For send backpressure - [{caller_pid, ref} | {from, ref, data, timer_ref}]
     field :send_waiters, list(), default: []
     # Track if read side has been shutdown
@@ -168,24 +168,50 @@ defmodule Tricep.Socket do
     end
   end
 
-  # Connect completion after :nowait readiness - consume exactly one retry
+  # Connect completion after :nowait readiness - consume one retry per registered selector
   def handle_event(
         {:call, {caller_pid, _} = from},
         {:connect, _address, _timeout},
         :established,
-        %__MODULE__{connect_select: {pending_pid, _ref}} = state
-      )
-      when caller_pid == pending_pid do
-    {:keep_state, %{state | connect_select: nil}, {:reply, from, :ok}}
+        %__MODULE__{} = state
+      ) do
+    case take_select_for_pid(state.connect_selects, caller_pid) do
+      {{^caller_pid, _ref}, remaining_selects} ->
+        {:keep_state, %{state | connect_selects: remaining_selects}, {:reply, from, :ok}}
+
+      nil ->
+        {:keep_state_and_data, {:reply, from, {:error, :eisconn}}}
+    end
   end
 
   def handle_event(
-        {:call, from},
+        {:call, {caller_pid, _} = from},
         {:connect, _address, _timeout},
-        {:connect_failed, _caller_pid, _ref, reason},
+        {:connect_failed, connect_selects, reason},
         nil
       ) do
-    {:next_state, :closed, nil, {:reply, from, {:error, reason}}}
+    case take_select_for_pid(connect_selects, caller_pid) do
+      {{^caller_pid, _ref}, []} ->
+        {:next_state, :closed, nil, {:reply, from, {:error, reason}}}
+
+      {{^caller_pid, _ref}, remaining_selects} ->
+        {:next_state, {:connect_failed, remaining_selects, reason}, nil,
+         {:reply, from, {:error, reason}}}
+
+      nil ->
+        {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
+    end
+  end
+
+  def handle_event(
+        {:call, {caller_pid, _} = from},
+        {:connect, _address, :nowait},
+        {:syn_sent, :nowait},
+        %__MODULE__{} = state
+      ) do
+    ref = make_ref()
+    new_state = %{state | connect_selects: state.connect_selects ++ [{caller_pid, ref}]}
+    {:keep_state, new_state, {:reply, from, {:select, {:select_info, :connect, ref}}}}
   end
 
   def handle_event({:call, from}, {:connect, _address, _timeout}, _, %__MODULE__{}) do
@@ -220,7 +246,7 @@ defmodule Tricep.Socket do
         # Return select tuple immediately, store caller info for notification
         ref = make_ref()
         {caller_pid, _} = from
-        new_state = %{base_state | connect_select: {caller_pid, ref}}
+        new_state = %{base_state | connect_selects: [{caller_pid, ref}]}
 
         actions = [
           {{:timeout, :rto}, @initial_rto_ms, :syn_timeout_nowait},
@@ -329,11 +355,8 @@ defmodule Tricep.Socket do
 
             snd_mss = Map.get(options, :mss, @default_mss)
 
-            # Notify the caller that connect can complete
-            case state.connect_select do
-              {caller_pid, ref} -> notify_select(caller_pid, ref)
-              nil -> :ok
-            end
+            # Notify callers that connect can complete
+            notify_selects(state.connect_selects)
 
             new_state = %{
               state
@@ -547,7 +570,12 @@ defmodule Tricep.Socket do
               # Return select tuple immediately, store caller info for notification
               ref = make_ref()
               {caller_pid, _} = from
-              new_state = %{state | recv_select: {caller_pid, ref, length}}
+
+              new_state = %{
+                state
+                | recv_selects: state.recv_selects ++ [{caller_pid, ref, length}]
+              }
+
               {:keep_state, new_state, {:reply, from, {:select, {:select_info, :recv, ref}}}}
 
             :infinity ->
@@ -1330,6 +1358,8 @@ defmodule Tricep.Socket do
   end
 
   defp notify_waiters_error(%__MODULE__{} = state, error) do
+    notify_selects(state.recv_selects)
+
     notify_recv_waiters_error(state.recv_waiters, error) ++
       notify_send_waiters_error(state.send_waiters, error)
   end
@@ -1405,13 +1435,13 @@ defmodule Tricep.Socket do
   defp nowait_connect_failure(%__MODULE__{} = state, reason) do
     reset_state(state)
 
-    case state.connect_select do
-      {caller_pid, ref} ->
-        notify_select(caller_pid, ref)
-        {{:connect_failed, caller_pid, ref, reason}, nil}
-
-      nil ->
+    case state.connect_selects do
+      [] ->
         {:closed, nil}
+
+      connect_selects ->
+        notify_selects(connect_selects)
+        {{:connect_failed, connect_selects, reason}, nil}
     end
   end
 
@@ -1637,18 +1667,14 @@ defmodule Tricep.Socket do
     {new_state, accepted_len}
   end
 
-  defp notify_recv_select(%__MODULE__{recv_select: {caller_pid, ref, _length}} = state, :eof) do
-    notify_select(caller_pid, ref)
-    %{state | recv_select: nil}
+  defp notify_recv_select(%__MODULE__{} = state, :eof) do
+    notify_selects(state.recv_selects)
+    %{state | recv_selects: []}
   end
 
-  defp notify_recv_select(
-         %__MODULE__{recv_select: {caller_pid, ref, _length}} = state,
-         accepted_len
-       )
-       when accepted_len > 0 do
-    notify_select(caller_pid, ref)
-    %{state | recv_select: nil}
+  defp notify_recv_select(%__MODULE__{} = state, accepted_len) when accepted_len > 0 do
+    notify_selects(state.recv_selects)
+    %{state | recv_selects: []}
   end
 
   defp notify_recv_select(%__MODULE__{} = state, _accepted_len), do: state
@@ -1662,6 +1688,13 @@ defmodule Tricep.Socket do
   # Send select notification to caller
   defp notify_select(caller_pid, ref) do
     send(caller_pid, {:"$socket", self(), :select, ref})
+  end
+
+  defp notify_selects(selects) do
+    Enum.each(selects, fn
+      {caller_pid, ref} -> notify_select(caller_pid, ref)
+      {caller_pid, ref, _length} -> notify_select(caller_pid, ref)
+    end)
   end
 
   # Process ACK and update retransmission queue
@@ -1756,36 +1789,49 @@ defmodule Tricep.Socket do
     end
   end
 
-  # Process send_waiters when window opens
-  defp process_send_waiters(%{send_waiters: []} = state) do
-    {state, []}
+  # Process send_waiters when window opens.
+  defp process_send_waiters(state) do
+    capacity = send_waiter_capacity(state)
+    process_send_waiters(state.send_waiters, %{state | send_waiters: []}, capacity, [])
   end
 
-  defp process_send_waiters(state) do
-    available = send_window_available(state)
+  defp process_send_waiters([], state, _capacity, actions) do
+    {state, actions}
+  end
 
-    if available > 0 do
-      case state.send_waiters do
-        [] ->
-          {state, []}
+  defp process_send_waiters(remaining_waiters, state, capacity, actions) when capacity <= 0 do
+    {%{state | send_waiters: remaining_waiters}, actions}
+  end
 
-        [{caller_pid, ref} | rest] when is_pid(caller_pid) ->
-          # :nowait waiter - notify readiness; caller must retry send to enqueue data.
-          notify_select(caller_pid, ref)
-          new_state = %{state | send_waiters: rest}
-          {new_state, []}
+  defp process_send_waiters([{caller_pid, ref} | rest], state, capacity, actions)
+       when is_pid(caller_pid) do
+    # :nowait waiter - notify readiness; caller must retry send to enqueue data.
+    notify_select(caller_pid, ref)
+    process_send_waiters(rest, state, capacity, actions)
+  end
 
-        [{from, _ref, data, timer_ref} | rest] when is_tuple(from) ->
-          # Blocking waiter - enqueue data and reply
-          new_send_buffer = DataBuffer.append(state.send_buffer, data)
-          new_state = %{state | send_waiters: rest, send_buffer: new_send_buffer}
-          cancel_action = if timer_ref, do: [{{:timeout, timer_ref}, :cancel}], else: []
+  defp process_send_waiters([{from, _ref, data, timer_ref} | rest], state, capacity, actions)
+       when is_tuple(from) do
+    # Blocking waiter - enqueue data and reply.
+    new_send_buffer = DataBuffer.append(state.send_buffer, data)
+    new_state = %{state | send_buffer: new_send_buffer}
+    cancel_actions = if timer_ref, do: [{{:timeout, timer_ref}, :cancel}], else: []
+    waiter_actions = cancel_actions ++ [{:reply, from, :ok}]
 
-          {new_state,
-           [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}] ++ cancel_action}
-      end
-    else
-      {state, []}
+    process_send_waiters(rest, new_state, capacity - byte_size(data), actions ++ waiter_actions)
+  end
+
+  defp send_waiter_capacity(state) do
+    max(0, send_window_available(state) - DataBuffer.size(state.send_buffer))
+  end
+
+  defp take_select_for_pid(selects, caller_pid) do
+    case Enum.split_while(selects, fn {select_pid, _ref} -> select_pid != caller_pid end) do
+      {_prefix, []} ->
+        nil
+
+      {prefix, [select | rest]} ->
+        {select, prefix ++ rest}
     end
   end
 

@@ -3993,6 +3993,59 @@ defmodule Tricep.SocketTest do
              ) ==
                {:error, :eisconn}
     end
+
+    test "multiple pending selectors are all notified", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      {:select, {:select_info, :connect, ref1}} =
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, :nowait)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn_parsed = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      {:select, {:select_info, :connect, ref2}} =
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, :nowait)
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert_receive {:"$socket", ^socket, :select, ^ref1}, 1000
+      assert_receive {:"$socket", ^socket, :select, ^ref2}, 1000
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.connect(
+               socket,
+               %{family: :inet6, addr: @local_addr_str, port: @port},
+               :nowait
+             ) == :ok
+
+      assert Tricep.connect(
+               socket,
+               %{family: :inet6, addr: @local_addr_str, port: @port},
+               :nowait
+             ) == :ok
+
+      assert Tricep.connect(
+               socket,
+               %{family: :inet6, addr: @local_addr_str, port: @port},
+               :nowait
+             ) == {:error, :eisconn}
+    end
   end
 
   describe "connect with timeout" do
@@ -4116,6 +4169,41 @@ defmodule Tricep.SocketTest do
       assert_receive {:dummy_link_packet, _link, _data_ack}, 1000
 
       # Now recv should return data
+      assert Tricep.recv(socket, 0, :nowait) == {:ok, "arriving data"}
+    end
+
+    test "multiple pending selectors are all notified when data arrives", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:select, {:select_info, :recv, ref1}} = Tricep.recv(socket, 0, :nowait)
+      {:select, {:select_info, :recv, ref2}} = Tricep.recv(socket, 0, :nowait)
+
+      src_port = get_socket_src_port(socket)
+
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5001,
+          wrap_seq(get_socket_snd_nxt(socket)),
+          [:ack],
+          32768,
+          payload: "arriving data"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      assert_receive {:"$socket", ^socket, :select, ^ref1}, 1000
+      assert_receive {:"$socket", ^socket, :select, ^ref2}, 1000
+
+      assert_receive {:dummy_link_packet, _link, _data_ack}, 1000
+
       assert Tricep.recv(socket, 0, :nowait) == {:ok, "arriving data"}
     end
   end
@@ -4325,6 +4413,46 @@ defmodule Tricep.SocketTest do
 
       # Send should complete
       assert Task.await(send_task, 1000) == :ok
+    end
+
+    test "multiple blocking sends proceed when one window update has enough space", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 0)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      send_task1 = Task.async(fn -> Tricep.send(socket, "aa", :infinity) end)
+      wait_for_send_waiters(socket)
+
+      send_task2 = Task.async(fn -> Tricep.send(socket, "bb", :infinity) end)
+      wait_for_send_waiters(socket, 2)
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      window_update =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack],
+          4
+        )
+
+      DummyLink.inject_packet(link, window_update)
+
+      assert Task.await(send_task1, 1000) == :ok
+      assert Task.await(send_task2, 1000) == :ok
+
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+      <<_ip_header::binary-size(40), data_segment::binary>> = data_packet
+      parsed = Tcp.parse_segment(data_segment)
+
+      assert parsed.payload == "aabb"
     end
   end
 
