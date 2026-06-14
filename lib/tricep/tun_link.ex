@@ -3,9 +3,14 @@ defmodule Tricep.TunLink do
 
   @behaviour :gen_statem
 
+  import Bitwise
+
   require Logger
 
   @read_tun_again {:keep_state_and_data, {:next_event, :internal, :read_tun}}
+  @fragment_timeout_ms 60_000
+  @max_fragment_buffers 64
+  @max_fragment_reassembly_size 65_535
 
   def child_spec(opts) do
     %{
@@ -27,6 +32,7 @@ defmodule Tricep.TunLink do
     field :tun, Tundra.tun_device()
     field :name, String.t()
     field :mtu, non_neg_integer() | nil, default: nil
+    field :fragment_buffers, map(), default: %{}
   end
 
   @impl true
@@ -92,9 +98,21 @@ defmodule Tricep.TunLink do
 
   @doc false
   def handle_ip_packet(packet, %__MODULE__{} = state) do
-    with {:ok, %{next_header: next_header, payload: payload, src: src, dst: dst}} <-
-           Tricep.Ip.parse(packet),
-         {:ok, protocol, data} <- unwrap_ipv6_payload(next_header, payload) do
+    case Tricep.Ip.parse(packet) do
+      {:ok, %{next_header: next_header, payload: payload, src: src, dst: dst}} ->
+        handle_ipv6_payload(next_header, payload, src, dst, state)
+
+      _ ->
+        @read_tun_again
+    end
+  end
+
+  defp handle_ipv6_payload(44, payload, src, dst, state) do
+    handle_fragment(payload, src, dst, state)
+  end
+
+  defp handle_ipv6_payload(next_header, payload, src, dst, state) do
+    with {:ok, protocol, data} <- unwrap_ipv6_payload(next_header, payload) do
       handle_ipv6_packet(protocol, data, src, dst, state)
     else
       _ -> @read_tun_again
@@ -139,6 +157,169 @@ defmodule Tricep.TunLink do
   end
 
   defp unwrap_ipv6_payload(_protocol, _payload), do: {:error, :unsupported_protocol}
+
+  defp handle_fragment(
+         <<next_header::8, _reserved::8, offset_flags::16, identification::32,
+           fragment_payload::binary>>,
+         src,
+         dst,
+         state
+       ) do
+    offset = (offset_flags >>> 3) * 8
+    more_fragments? = (offset_flags &&& 0x1) == 1
+
+    cond do
+      more_fragments? and rem(byte_size(fragment_payload), 8) != 0 ->
+        Logger.warning("Dropping malformed IPv6 fragment with non-8-byte payload")
+        read_tun_again(state)
+
+      offset + byte_size(fragment_payload) > @max_fragment_reassembly_size ->
+        Logger.warning("Dropping oversized IPv6 fragment reassembly")
+        read_tun_again(drop_fragment_buffer(state, {src, dst, identification, next_header}))
+
+      true ->
+        key = {src, dst, identification, next_header}
+
+        state =
+          state
+          |> prune_fragment_buffers()
+          |> put_fragment(key, offset, fragment_payload, more_fragments?)
+
+        case reassembled_fragment(state, key) do
+          {:complete, reassembled_payload, state} ->
+            handle_reassembled_fragment(next_header, reassembled_payload, src, dst, state)
+
+          {:error, reason, state} ->
+            Logger.warning("Dropping malformed IPv6 fragment set: #{reason}")
+            read_tun_again(state)
+
+          :pending ->
+            read_tun_again(state)
+        end
+    end
+  end
+
+  defp handle_fragment(_payload, _src, _dst, state) do
+    Logger.warning("Dropping truncated IPv6 fragment header")
+    read_tun_again(state)
+  end
+
+  defp put_fragment(state, key, offset, payload, more_fragments?) do
+    now = System.monotonic_time(:millisecond)
+
+    buffer =
+      Map.get(state.fragment_buffers, key, %{
+        fragments: %{},
+        total_length: nil,
+        updated_at: now
+      })
+
+    total_length =
+      if more_fragments? do
+        buffer.total_length
+      else
+        offset + byte_size(payload)
+      end
+
+    buffer = %{
+      buffer
+      | fragments: Map.put(buffer.fragments, offset, payload),
+        total_length: total_length,
+        updated_at: now
+    }
+
+    %{
+      state
+      | fragment_buffers: limit_fragment_buffers(Map.put(state.fragment_buffers, key, buffer))
+    }
+  end
+
+  defp reassembled_fragment(%__MODULE__{} = state, key) do
+    buffer = Map.fetch!(state.fragment_buffers, key)
+
+    case assemble_fragments(buffer) do
+      {:complete, payload} ->
+        {:complete, payload, drop_fragment_buffer(state, key)}
+
+      {:error, reason} ->
+        {:error, reason, drop_fragment_buffer(state, key)}
+
+      :pending ->
+        :pending
+    end
+  end
+
+  defp assemble_fragments(%{total_length: nil}), do: :pending
+
+  defp assemble_fragments(%{fragments: fragments, total_length: total_length}) do
+    fragments
+    |> Enum.sort_by(fn {offset, _payload} -> offset end)
+    |> assemble_fragments(0, total_length, [])
+  end
+
+  defp assemble_fragments([], expected, total_length, acc) when expected == total_length do
+    {:complete, acc |> Enum.reverse() |> IO.iodata_to_binary()}
+  end
+
+  defp assemble_fragments([], _expected, _total_length, _acc), do: :pending
+
+  defp assemble_fragments([{offset, payload} | rest], expected, total_length, acc) do
+    payload_end = offset + byte_size(payload)
+
+    cond do
+      offset > expected ->
+        :pending
+
+      offset < expected ->
+        {:error, :overlap}
+
+      payload_end > total_length ->
+        {:error, :exceeds_total_length}
+
+      true ->
+        assemble_fragments(rest, payload_end, total_length, [payload | acc])
+    end
+  end
+
+  defp handle_reassembled_fragment(next_header, payload, src, dst, state) do
+    with {:ok, protocol, data} <- unwrap_ipv6_payload(next_header, payload) do
+      handle_ipv6_packet(protocol, data, src, dst, state)
+      read_tun_again(state)
+    else
+      _ -> read_tun_again(state)
+    end
+  end
+
+  defp prune_fragment_buffers(%__MODULE__{} = state) do
+    now = System.monotonic_time(:millisecond)
+
+    fragment_buffers =
+      Map.reject(state.fragment_buffers, fn {_key, %{updated_at: updated_at}} ->
+        now - updated_at > @fragment_timeout_ms
+      end)
+
+    %{state | fragment_buffers: fragment_buffers}
+  end
+
+  defp limit_fragment_buffers(fragment_buffers)
+       when map_size(fragment_buffers) <= @max_fragment_buffers do
+    fragment_buffers
+  end
+
+  defp limit_fragment_buffers(fragment_buffers) do
+    {oldest_key, _oldest_buffer} =
+      Enum.min_by(fragment_buffers, fn {_key, %{updated_at: updated_at}} -> updated_at end)
+
+    Map.delete(fragment_buffers, oldest_key)
+  end
+
+  defp drop_fragment_buffer(%__MODULE__{} = state, key) do
+    %{state | fragment_buffers: Map.delete(state.fragment_buffers, key)}
+  end
+
+  defp read_tun_again(%__MODULE__{} = state) do
+    {:keep_state, state, {:next_event, :internal, :read_tun}}
+  end
 
   defp handle_tcp(data, src, dst, _state) do
     Tricep.Socket.handle_packet(src, dst, data)
