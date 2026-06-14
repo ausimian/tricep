@@ -83,7 +83,7 @@ defmodule Tricep.Application do
   end
 
   def register_bound_socket(addr, port) do
-    register_socket_key(bound_key(addr, port))
+    register_addr_port_key(:bound, addr, port)
   end
 
   def deregister_bound_socket(addr, port) do
@@ -91,7 +91,7 @@ defmodule Tricep.Application do
   end
 
   def register_listener(addr, port) do
-    register_socket_key(listener_key(addr, port))
+    register_addr_port_key(:listener, addr, port)
   end
 
   def deregister_listener(addr, port) do
@@ -148,6 +148,27 @@ defmodule Tricep.Application do
     end
   end
 
+  defp register_addr_port_key(kind, addr, port) do
+    case conflicting_addr_port_pid(kind, addr, port) do
+      nil -> register_socket_key(addr_port_key(kind, addr, port))
+      pid -> {:error, {:already_registered, pid}}
+    end
+  end
+
+  defp conflicting_addr_port_pid(kind, @any_addr, port) do
+    @socket_registry
+    |> Registry.select([{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
+    |> Enum.find_value(fn
+      {{^kind, _addr, ^port}, pid} -> pid
+      _entry -> nil
+    end)
+  end
+
+  defp conflicting_addr_port_pid(kind, addr, port) do
+    lookup_socket_key(addr_port_key(kind, addr, port)) ||
+      lookup_socket_key(addr_port_key(kind, @any_addr, port))
+  end
+
   defp lookup_socket_key(key) do
     case Registry.lookup(@socket_registry, key) do
       [{pid, nil}] -> pid
@@ -155,6 +176,8 @@ defmodule Tricep.Application do
     end
   end
 
+  defp addr_port_key(:bound, addr, port), do: bound_key(addr, port)
+  defp addr_port_key(:listener, addr, port), do: listener_key(addr, port)
   defp bound_key(addr, port), do: {:bound, addr, port}
   defp listener_key(addr, port), do: {:listener, addr, port}
 end

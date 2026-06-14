@@ -632,6 +632,34 @@ defmodule Tricep.SocketTest do
       assert Tricep.close(listener1) == :ok
     end
 
+    test "bind rejects specific address when wildcard address owns the port" do
+      {:ok, wildcard} = Tricep.open(:inet6, :stream, :tcp)
+      {:ok, specific} = Tricep.open(:inet6, :stream, :tcp)
+
+      port = @port + 2
+
+      assert Tricep.bind(wildcard, %{family: :inet6, addr: "::", port: port}) == :ok
+
+      assert Tricep.bind(specific, %{family: :inet6, addr: @remote_addr_str, port: port}) ==
+               {:error, :eaddrinuse}
+
+      assert Tricep.close(wildcard) == :ok
+    end
+
+    test "bind rejects wildcard address when a specific address owns the port" do
+      {:ok, specific} = Tricep.open(:inet6, :stream, :tcp)
+      {:ok, wildcard} = Tricep.open(:inet6, :stream, :tcp)
+
+      port = @port + 3
+
+      assert Tricep.bind(specific, %{family: :inet6, addr: @remote_addr_str, port: port}) == :ok
+
+      assert Tricep.bind(wildcard, %{family: :inet6, addr: "::", port: port}) ==
+               {:error, :eaddrinuse}
+
+      assert Tricep.close(specific) == :ok
+    end
+
     test "bind accepts a raw 16-byte IPv6 address binary", %{remote_addr: remote_addr} do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
 
