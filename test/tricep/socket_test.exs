@@ -1818,6 +1818,49 @@ defmodule Tricep.SocketTest do
       assert new_state.snd_wnd != initial_snd_wnd or initial_snd_wnd == new_window
     end
 
+    test "off-window pure ACK does not update send state", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "Hello") == :ok
+      assert_receive {:dummy_link_packet, _link, _data_packet}, 1000
+
+      {:established, state_before_ack} = :sys.get_state(socket)
+      {{_, src_port}, _} = state_before_ack.pair
+
+      off_window_ack =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(state_before_ack.rcv_nxt - 1),
+          state_before_ack.snd_nxt,
+          [:ack],
+          65_535
+        )
+
+      DummyLink.inject_packet(link, off_window_ack)
+
+      assert_receive {:dummy_link_packet, _link, challenge_packet}, 1000
+      <<_ip_header::binary-size(40), challenge_segment::binary>> = challenge_packet
+      challenge = Tcp.parse_segment(challenge_segment)
+
+      assert :ack in challenge.flags
+      assert challenge.seq == state_before_ack.snd_nxt
+      assert challenge.ack == state_before_ack.rcv_nxt
+
+      {:established, state_after_ack} = :sys.get_state(socket)
+
+      assert state_after_ack.snd_una == state_before_ack.snd_una
+      assert state_after_ack.snd_wnd == state_before_ack.snd_wnd
+      assert state_after_ack.unacked_segments == state_before_ack.unacked_segments
+      assert state_after_ack.rto_timer_active == state_before_ack.rto_timer_active
+    end
+
     test "ACKs out of order packets without delivery", %{
       link: link,
       local_addr: local_addr,
@@ -3452,6 +3495,67 @@ defmodule Tricep.SocketTest do
       {:close_wait, updated_state} = :sys.get_state(socket)
       assert updated_state.snd_una == close_wait_state.snd_nxt + 4
       assert updated_state.snd_wnd == 65535
+    end
+
+    test "off-window ACK in CLOSE_WAIT does not update send state", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      fin_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+
+      {:close_wait, _close_wait_state} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      assert Tricep.send(socket, "Test") == :ok
+      assert_receive {:dummy_link_packet, _link, _data_packet}, 1000
+
+      {:close_wait, state_before_ack} = :sys.get_state(socket)
+
+      off_window_ack =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(state_before_ack.rcv_nxt - 1),
+          state_before_ack.snd_nxt,
+          [:ack],
+          65_535
+        )
+
+      DummyLink.inject_packet(link, off_window_ack)
+
+      assert_receive {:dummy_link_packet, _link, challenge_packet}, 1000
+      <<_ip_header::binary-size(40), challenge_segment::binary>> = challenge_packet
+      challenge = Tcp.parse_segment(challenge_segment)
+
+      assert :ack in challenge.flags
+      assert challenge.seq == state_before_ack.snd_nxt
+      assert challenge.ack == state_before_ack.rcv_nxt
+
+      {:close_wait, state_after_ack} = :sys.get_state(socket)
+
+      assert state_after_ack.snd_una == state_before_ack.snd_una
+      assert state_after_ack.snd_wnd == state_before_ack.snd_wnd
+      assert state_after_ack.unacked_segments == state_before_ack.unacked_segments
+      assert state_after_ack.rto_timer_active == state_before_ack.rto_timer_active
     end
 
     test "ignores malformed segment in CLOSE_WAIT", %{
