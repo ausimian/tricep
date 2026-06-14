@@ -48,9 +48,39 @@ defmodule Tricep.TunLink do
          {:ok, dstaddr_bin} <- Tricep.Address.from(dstaddr),
          {:ok, {tun, name}} <- Tundra.create(ifaddr, ifopts),
          {:ok, mtu} <- Tricep.Nifs.get_mtu(name),
-         :ok <- Tricep.Application.register_link(dstaddr_bin, {ifaddr_bin, mtu}) do
+         :ok <- Tricep.Application.register_link(dstaddr_bin, {ifaddr_bin, mtu}),
+         :ok <- register_prefix_route(dstaddr_bin, ifaddr_bin, mtu, opts) do
       state = %__MODULE__{tun: tun, mtu: mtu, name: name}
       {:ok, :ready, state, {:next_event, :internal, :read_tun}}
+    end
+  end
+
+  defp register_prefix_route(srcaddr, dstaddr, mtu, opts) do
+    case route_prefix_len(Keyword.get(opts, :netmask)) do
+      128 -> :ok
+      prefix_len -> Tricep.Application.register_route(srcaddr, dstaddr, prefix_len, mtu)
+    end
+  end
+
+  defp route_prefix_len(nil), do: 128
+
+  defp route_prefix_len(netmask) do
+    with {:ok, mask} <- Tricep.Address.from(netmask),
+         {:ok, prefix_len} <- contiguous_prefix_len(mask) do
+      prefix_len
+    else
+      _ -> 128
+    end
+  end
+
+  defp contiguous_prefix_len(mask) do
+    bits = for <<bit::1 <- mask>>, do: bit
+    {ones, rest} = Enum.split_while(bits, &(&1 == 1))
+
+    if Enum.all?(rest, &(&1 == 0)) do
+      {:ok, length(ones)}
+    else
+      {:error, :noncontiguous_netmask}
     end
   end
 

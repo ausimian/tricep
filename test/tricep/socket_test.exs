@@ -82,6 +82,57 @@ defmodule Tricep.SocketTest do
       refute_receive {:dummy_link_packet, _link, _packet}, 100
     end
 
+    test "connect uses longest-prefix route when exact link is absent", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, routed_addr} = Tricep.Address.from("fd00::abcd")
+
+      on_exit(fn ->
+        Tricep.Application.deregister_route(local_addr, 64)
+      end)
+
+      :ok = Tricep.Application.register_route(remote_addr, local_addr, 64, 1500)
+
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: "fd00::abcd", port: @port})
+        end)
+
+      assert_receive {:send, packet}, 1000
+
+      <<6::4, _::4, _::24, _payload_len::16, 6::8, _hop::8, pkt_src::binary-size(16),
+        pkt_dst::binary-size(16), tcp_segment::binary>> = packet
+
+      assert pkt_src == remote_addr
+      assert pkt_dst == routed_addr
+      assert :syn in Tcp.parse_segment(tcp_segment).flags
+
+      Task.shutdown(task, :brutal_kill)
+    end
+
+    test "lookup_link prefers the longest matching route prefix", %{
+      local_addr: local_addr
+    } do
+      {:ok, source_48} = Tricep.Address.from("fd00:0:0:1::1")
+      {:ok, source_64} = Tricep.Address.from("fd00:0:0:2::1")
+      {:ok, prefix_48} = Tricep.Address.from("fd00::")
+      {:ok, destination} = Tricep.Address.from("fd00::beef")
+
+      on_exit(fn ->
+        Tricep.Application.deregister_route(prefix_48, 48)
+        Tricep.Application.deregister_route(local_addr, 64)
+      end)
+
+      :ok = Tricep.Application.register_route(source_48, prefix_48, 48, 1400)
+      :ok = Tricep.Application.register_route(source_64, local_addr, 64, 1500)
+
+      self = self()
+      assert {^self, {^source_64, 1500}} = Tricep.Application.lookup_link(destination)
+    end
+
     test "advertises configured receive buffer size in SYN" do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 4096})
 
