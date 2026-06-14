@@ -5,6 +5,7 @@ defmodule Tricep.TcpTest do
 
   @src_addr <<0xFE, 0x80, 0::104, 0x01>>
   @dst_addr <<0xFE, 0x80, 0::104, 0x02>>
+  @other_addr <<0xFE, 0x80, 0::104, 0x03>>
 
   describe "encode_flags/1" do
     test "encodes single SYN flag" do
@@ -229,6 +230,36 @@ defmodule Tricep.TcpTest do
       recalculated = Tcp.checksum(@src_addr, @dst_addr, segment_zero_checksum)
 
       assert recalculated == original_checksum
+    end
+  end
+
+  describe "valid_checksum?/3" do
+    test "accepts a segment with a valid checksum" do
+      segment =
+        Tcp.build_segment({{@src_addr, 12345}, {@dst_addr, 80}}, 1000, 0, [:syn], 65535)
+
+      assert Tcp.valid_checksum?(@src_addr, @dst_addr, segment)
+    end
+
+    test "rejects a segment with a corrupted checksum" do
+      segment =
+        Tcp.build_segment({{@src_addr, 12345}, {@dst_addr, 80}}, 1000, 0, [:syn], 65535)
+
+      <<prefix::binary-size(16), checksum::16, suffix::binary>> = segment
+      corrupted = prefix <> <<Bitwise.bxor(checksum, 0x0001)::16>> <> suffix
+
+      refute Tcp.valid_checksum?(@src_addr, @dst_addr, corrupted)
+    end
+
+    test "rejects a segment validated against the wrong addresses" do
+      segment =
+        Tcp.build_segment({{@src_addr, 12345}, {@dst_addr, 80}}, 1000, 0, [:syn], 65535)
+
+      refute Tcp.valid_checksum?(@src_addr, @other_addr, segment)
+    end
+
+    test "rejects a malformed segment" do
+      refute Tcp.valid_checksum?(@src_addr, @dst_addr, <<1, 2, 3>>)
     end
   end
 

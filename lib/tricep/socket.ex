@@ -41,10 +41,12 @@ defmodule Tricep.Socket do
   end
 
   def handle_packet(src_addr, dst_addr, <<src_port::16, dst_port::16, _::binary>> = segment) do
-    pair = {{dst_addr, dst_port}, {src_addr, src_port}}
+    if Tcp.valid_checksum?(src_addr, dst_addr, segment) do
+      pair = {{dst_addr, dst_port}, {src_addr, src_port}}
 
-    if pid = Application.lookup_socket_pair(pair) do
-      send(pid, segment)
+      if pid = Application.lookup_socket_pair(pair) do
+        send(pid, segment)
+      end
     end
 
     :ok

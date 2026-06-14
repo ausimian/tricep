@@ -237,4 +237,34 @@ defmodule Tricep.Tcp do
       segment
     ])
   end
+
+  @doc """
+  Validates a TCP segment checksum using the IPv6 pseudo-header.
+  """
+  @spec valid_checksum?(binary(), binary(), binary()) :: boolean()
+  def valid_checksum?(src_addr, dst_addr, segment)
+      when byte_size(src_addr) == 16 and byte_size(dst_addr) == 16 and is_binary(segment) do
+    valid_header?(segment) and checksum(src_addr, dst_addr, segment) == 0
+  end
+
+  def valid_checksum?(_src_addr, _dst_addr, _segment), do: false
+
+  defp valid_header?(<<
+         _src_port::16,
+         _dst_port::16,
+         _seq::32,
+         _ack::32,
+         data_offset::4,
+         _reserved::4,
+         _flags::8,
+         _window::16,
+         _checksum::16,
+         _urgent::16,
+         rest::binary
+       >>) do
+    header_bytes = data_offset * 4
+    data_offset >= 5 and header_bytes <= byte_size(rest) + 20
+  end
+
+  defp valid_header?(_segment), do: false
 end
