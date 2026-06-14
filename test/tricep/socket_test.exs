@@ -246,6 +246,53 @@ defmodule Tricep.SocketTest do
       assert ack_parsed.ack == server_seq + 1
     end
 
+    test "accepts SYN-ACK that acknowledges wrapped active-open ISS", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      <<src_port::16, _::binary>> = syn_segment
+
+      :sys.replace_state(socket, fn
+        {{:syn_sent, from}, state} when is_tuple(from) ->
+          {{:syn_sent, from}, %{state | iss: 0xFFFFFFFF, snd_una: 0xFFFFFFFF, snd_nxt: 0}}
+      end)
+
+      server_seq = 5000
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          server_seq,
+          0,
+          [:syn, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert Task.await(task, 1000) == :ok
+      assert {:established, %{snd_una: 0, snd_nxt: 0, rcv_nxt: 5001}} = :sys.get_state(socket)
+
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert :ack in ack.flags
+      assert ack.seq == 0
+      assert ack.ack == server_seq + 1
+    end
+
     test "returns error on RST response", %{
       link: link,
       local_addr: local_addr,
@@ -4608,6 +4655,52 @@ defmodule Tricep.SocketTest do
 
       # Drain ACK
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+    end
+
+    test "nowait connect accepts SYN-ACK that acknowledges wrapped active-open ISS", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      {:select, {:select_info, :connect, ref}} =
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, :nowait)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      <<src_port::16, _::binary>> = syn_segment
+
+      :sys.replace_state(socket, fn
+        {{:syn_sent, :nowait}, state} ->
+          {{:syn_sent, :nowait}, %{state | iss: 0xFFFFFFFF, snd_una: 0xFFFFFFFF, snd_nxt: 0}}
+      end)
+
+      server_seq = 5000
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          server_seq,
+          0,
+          [:syn, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+      assert Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}) == :ok
+
+      assert {:established, %{snd_una: 0, snd_nxt: 0, rcv_nxt: 5001}} = :sys.get_state(socket)
+
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert :ack in ack.flags
+      assert ack.seq == 0
+      assert ack.ack == server_seq + 1
     end
 
     test "subsequent connect returns :ok after notification", %{
