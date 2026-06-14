@@ -136,6 +136,68 @@ defmodule Tricep.TunLinkTest do
       assert Task.await(recv_task, 1000) == {:error, :enetunreach}
       assert {:closed, nil} = :sys.get_state(socket)
     end
+
+    test "reassembles fragmented TCP packets before dispatch", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn_parsed = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
+        )
+
+      <<fragment1::binary-size(16), fragment2::binary>> = syn_ack_segment
+      identification = 1234
+      state = tun_state()
+
+      state =
+        state
+        |> handle_fragment_packet(local_addr, remote_addr, identification, 0, true, fragment1)
+
+      refute Task.yield(task, 100)
+      assert map_size(state.fragment_buffers) == 1
+
+      state =
+        state
+        |> handle_fragment_packet(local_addr, remote_addr, identification, 16, false, fragment2)
+
+      assert state.fragment_buffers == %{}
+      assert Task.await(task, 1000) == :ok
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+    end
+
+    test "rejects malformed non-final fragment payload length", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      packet = fragment_packet(local_addr, remote_addr, 6, 1234, 0, true, "not-8")
+
+      log =
+        capture_log(fn ->
+          assert {:keep_state, state, {:next_event, :internal, :read_tun}} =
+                   TunLink.handle_ip_packet(packet, tun_state())
+
+          assert state.fragment_buffers == %{}
+        end)
+
+      assert log =~ "Dropping malformed IPv6 fragment"
+    end
   end
 
   defp establish_connection(local_addr, remote_addr) do
@@ -183,6 +245,26 @@ defmodule Tricep.TunLinkTest do
       )
 
     {Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment), state}
+  end
+
+  defp handle_fragment_packet(state, src, dst, identification, offset, more_fragments?, payload) do
+    packet = fragment_packet(src, dst, 6, identification, offset, more_fragments?, payload)
+
+    assert {:keep_state, new_state, {:next_event, :internal, :read_tun}} =
+             TunLink.handle_ip_packet(packet, state)
+
+    new_state
+  end
+
+  defp fragment_packet(src, dst, next_header, identification, offset, more_fragments?, payload) do
+    offset_units = div(offset, 8)
+    more_flag = if more_fragments?, do: 1, else: 0
+    offset_flags = offset_units |> Bitwise.bsl(3) |> Bitwise.bor(more_flag)
+
+    fragment_header =
+      <<next_header::8, 0::8, offset_flags::16, identification::32, payload::binary>>
+
+    Ip.wrap(src, dst, 44, fragment_header)
   end
 
   defp tun_state do
