@@ -366,6 +366,141 @@ defmodule Tricep.SocketTest do
     end
   end
 
+  describe "receive checksum validation" do
+    test "drops invalid checksum SYN-ACK without completing connect", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn_parsed = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, corrupt_checksum(syn_ack_segment))
+
+      refute Task.yield(task, 100)
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert Task.await(task, 1000) == :ok
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+    end
+
+    test "drops invalid checksum data without buffering or ACKing it", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.rcv_nxt,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
+          payload: "corrupt data"
+        )
+
+      DummyLink.inject_packet(link, corrupt_checksum(data_segment))
+
+      Process.sleep(50)
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+      assert Tricep.recv(socket, 0, 20) == {:error, :timeout}
+
+      {:established, after_state} = :sys.get_state(socket)
+      assert after_state.rcv_nxt == state.rcv_nxt
+      assert after_state.recv_buffer == <<>>
+    end
+
+    test "drops invalid checksum ACK without advancing send state", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+      assert Tricep.send(socket, "abc") == :ok
+      assert_receive {:dummy_link_packet, _link, _data_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+      assert state.unacked_segments != []
+
+      ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.rcv_nxt,
+          state.snd_nxt,
+          [:ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, corrupt_checksum(ack_segment))
+
+      Process.sleep(50)
+
+      {:established, after_state} = :sys.get_state(socket)
+      assert after_state.snd_una == state.snd_una
+      assert after_state.unacked_segments == state.unacked_segments
+    end
+
+    test "drops invalid checksum RST without closing the socket", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          0,
+          0,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, corrupt_checksum(rst_segment))
+
+      Process.sleep(50)
+
+      {:established, after_state} = :sys.get_state(socket)
+      assert after_state == state
+    end
+  end
+
   describe "MSS option" do
     test "SYN packet includes MSS option" do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
@@ -3323,6 +3458,11 @@ defmodule Tricep.SocketTest do
   end
 
   defp wrap_seq(n), do: Bitwise.band(n, 0xFFFFFFFF)
+
+  defp corrupt_checksum(segment) do
+    <<prefix::binary-size(16), checksum::16, suffix::binary>> = segment
+    prefix <> <<Bitwise.bxor(checksum, 0x0001)::16>> <> suffix
+  end
 
   defp drain_packets(0), do: :ok
 
