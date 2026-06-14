@@ -12,8 +12,13 @@ defmodule Tricep.MixProject do
       make_targets: ["all"],
       make_clean: ["clean"],
       deps: deps(),
-      test_coverage: [tool: ExCoveralls, ignore_modules: ignored_coverage_modules()],
-      preferred_cli_env: [
+      test_coverage: [tool: ExCoveralls, ignore_modules: ignored_coverage_modules()]
+    ]
+  end
+
+  def cli do
+    [
+      preferred_envs: [
         coveralls: :test,
         "coveralls.detail": :test,
         "coveralls.post": :test,
