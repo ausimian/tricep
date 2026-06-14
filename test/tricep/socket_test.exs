@@ -2116,6 +2116,43 @@ defmodule Tricep.SocketTest do
   end
 
   describe "FIN_WAIT_2 state" do
+    test "times out and closes if peer FIN never arrives", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(
+          link,
+          local_addr,
+          remote_addr,
+          open_opts: %{fin_wait_2_timeout_ms: 50}
+        )
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+
+      {:fin_wait_2, _} = :sys.get_state(socket)
+      wait_for_state_name(socket, :closed, 1000)
+    end
+
     test "RST in FIN_WAIT_2 closes connection", %{
       link: link,
       local_addr: local_addr,

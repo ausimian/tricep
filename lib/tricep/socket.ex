@@ -75,6 +75,7 @@ defmodule Tricep.Socket do
   @default_mss 1220
   @default_recv_buffer_size 65_535
   @max_tcp_window 65_535
+  @default_fin_wait_2_timeout_ms 60_000
 
   # Retransmission timeout constants
   @initial_rto_ms 1_000
@@ -122,6 +123,8 @@ defmodule Tricep.Socket do
     field :read_shutdown, boolean(), default: false
     # Track if write side has been shutdown while queued data drains
     field :write_shutdown, boolean(), default: false
+    # How long to wait in FIN_WAIT_2 for the peer FIN
+    field :fin_wait_2_timeout_ms, pos_integer(), default: @default_fin_wait_2_timeout_ms
   end
 
   # TIME_WAIT duration (2*MSL - using short value for TUN-based stack)
@@ -150,7 +153,8 @@ defmodule Tricep.Socket do
               link: pid,
               rcv_mss: mtu - 60,
               recv_buffer_size: recv_buffer_size,
-              rcv_wnd: recv_buffer_size
+              rcv_wnd: recv_buffer_size,
+              fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(closed_data)
             }
 
             {:next_state, :closed, state, send_syn}
@@ -817,7 +821,11 @@ defmodule Tricep.Socket do
 
           ack_of_fin? ->
             # ACK of our FIN - move to FIN_WAIT_2
-            {:next_state, :fin_wait_2, ack_state, ack_actions}
+            {:next_state, :fin_wait_2, ack_state,
+             ack_actions ++
+               [
+                 {{:timeout, :fin_wait_2}, ack_state.fin_wait_2_timeout_ms, :fin_wait_2_expired}
+               ]}
 
           ack? ->
             {:keep_state, ack_state, ack_actions}
@@ -833,6 +841,16 @@ defmodule Tricep.Socket do
 
   # --- FIN_WAIT_2 state ---
 
+  def handle_event(
+        {:timeout, :fin_wait_2},
+        :fin_wait_2_expired,
+        :fin_wait_2,
+        %__MODULE__{} = state
+      ) do
+    reset_state(state)
+    {:next_state, :closed, nil}
+  end
+
   def handle_event(:info, segment, :fin_wait_2, %__MODULE__{} = state) do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, payload: payload, window: window} ->
@@ -843,7 +861,7 @@ defmodule Tricep.Socket do
         cond do
           rst? and acceptable_rst?(state, seq) ->
             reset_state(state)
-            {:next_state, :closed, nil}
+            {:next_state, :closed, nil, {{:timeout, :fin_wait_2}, :cancel}}
 
           rst? ->
             reject_unacceptable_rst(state)
@@ -867,7 +885,10 @@ defmodule Tricep.Socket do
               send_ack(new_state.rcv_nxt, new_state)
 
               {:next_state, :time_wait, new_state,
-               {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+               [
+                 {{:timeout, :fin_wait_2}, :cancel},
+                 {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}
+               ]}
             else
               send_ack(receive_state.rcv_nxt, receive_state)
               {:keep_state, receive_state}
@@ -1540,6 +1561,9 @@ defmodule Tricep.Socket do
   defp recv_buffer_size(%{socket_opts: opts}), do: configured_recv_buffer_size(opts)
   defp recv_buffer_size(_closed_data), do: @default_recv_buffer_size
 
+  defp fin_wait_2_timeout_ms(%{socket_opts: opts}), do: configured_fin_wait_2_timeout_ms(opts)
+  defp fin_wait_2_timeout_ms(_closed_data), do: @default_fin_wait_2_timeout_ms
+
   defp configured_recv_buffer_size(opts) when is_map(opts) do
     opts
     |> Map.get(:recv_buffer_size, Map.get(opts, :rcvbuf, @default_recv_buffer_size))
@@ -1554,11 +1578,32 @@ defmodule Tricep.Socket do
 
   defp configured_recv_buffer_size(_opts), do: @default_recv_buffer_size
 
+  defp configured_fin_wait_2_timeout_ms(opts) when is_map(opts) do
+    opts
+    |> Map.get(:fin_wait_2_timeout_ms, @default_fin_wait_2_timeout_ms)
+    |> normalize_fin_wait_2_timeout_ms()
+  end
+
+  defp configured_fin_wait_2_timeout_ms(opts) when is_list(opts) do
+    opts
+    |> Keyword.get(:fin_wait_2_timeout_ms, @default_fin_wait_2_timeout_ms)
+    |> normalize_fin_wait_2_timeout_ms()
+  end
+
+  defp configured_fin_wait_2_timeout_ms(_opts), do: @default_fin_wait_2_timeout_ms
+
   defp normalize_recv_buffer_size(size) when is_integer(size) and size > 0 do
     min(size, @max_tcp_window)
   end
 
   defp normalize_recv_buffer_size(_size), do: @default_recv_buffer_size
+
+  defp normalize_fin_wait_2_timeout_ms(timeout_ms)
+       when is_integer(timeout_ms) and timeout_ms > 0 do
+    timeout_ms
+  end
+
+  defp normalize_fin_wait_2_timeout_ms(_timeout_ms), do: @default_fin_wait_2_timeout_ms
 
   defp receive_window(%__MODULE__{} = state) do
     state.recv_buffer
