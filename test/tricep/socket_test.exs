@@ -1129,6 +1129,72 @@ defmodule Tricep.SocketTest do
       assert Task.await(recv_task, 1000) == {:error, :econnreset}
     end
 
+    test "RST with old sequence is rejected with challenge ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(state.rcv_nxt - 1),
+          state.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert :ack in ack.flags
+      assert ack.ack == state.rcv_nxt
+      {:established, _state} = :sys.get_state(socket)
+    end
+
+    test "RST outside future receive window is rejected with challenge ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(state.rcv_nxt + state.rcv_wnd + 1),
+          state.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert :ack in ack.flags
+      assert ack.ack == state.rcv_nxt
+      {:established, _state} = :sys.get_state(socket)
+    end
+
     test "RST notifies blocking send waiters", %{
       link: link,
       local_addr: local_addr,

@@ -593,10 +593,13 @@ defmodule Tricep.Socket do
         fin? = :fin in flags
 
         cond do
-          rst? ->
+          rst? and acceptable_rst?(state, seq) ->
             reset_state(state)
             actions = notify_waiters_error(state, :econnreset)
             {:next_state, :closed, nil, actions}
+
+          rst? ->
+            reject_unacceptable_rst(state)
 
           invalid_ack?(state, ack?, ack) ->
             reject_invalid_ack(state)
@@ -789,9 +792,12 @@ defmodule Tricep.Socket do
           if rst?, do: {state, []}, else: process_ack_if_present(state, ack?, ack, window)
 
         cond do
-          rst? ->
+          rst? and acceptable_rst?(state, seq) ->
             reset_state(state)
             {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
+
+          rst? ->
+            reject_unacceptable_rst(state)
 
           fin? and ack_of_fin? ->
             # FIN+ACK of our FIN - go directly to TIME_WAIT
@@ -835,9 +841,12 @@ defmodule Tricep.Socket do
         rst? = :rst in flags
 
         cond do
-          rst? ->
+          rst? and acceptable_rst?(state, seq) ->
             reset_state(state)
             {:next_state, :closed, nil}
+
+          rst? ->
+            reject_unacceptable_rst(state)
 
           invalid_ack?(state, ack?, ack) ->
             reject_invalid_ack(state)
@@ -909,7 +918,7 @@ defmodule Tricep.Socket do
 
   def handle_event(:info, segment, :closing, %__MODULE__{} = state) do
     case Tcp.parse_segment(segment) do
-      %{flags: flags, ack: ack, window: window} ->
+      %{flags: flags, seq: seq, ack: ack, window: window} ->
         ack? = :ack in flags
         rst? = :rst in flags
         ack_of_fin? = ack? and ack == state.snd_nxt
@@ -918,9 +927,12 @@ defmodule Tricep.Socket do
           if rst?, do: {state, []}, else: process_ack_if_present(state, ack?, ack, window)
 
         cond do
-          rst? ->
+          rst? and acceptable_rst?(state, seq) ->
             reset_state(state)
             {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
+
+          rst? ->
+            reject_unacceptable_rst(state)
 
           ack_of_fin? ->
             # ACK of our FIN - go to TIME_WAIT
@@ -1087,19 +1099,26 @@ defmodule Tricep.Socket do
   def handle_event(:info, segment, :close_wait, %__MODULE__{} = state) do
     # Handle ACKs for data we sent
     case Tcp.parse_segment(segment) do
-      %{flags: flags, ack: ack, window: window} ->
-        if :rst in flags do
-          reset_state(state)
-          actions = notify_waiters_error(state, :econnreset)
-          {:next_state, :closed, nil, actions}
-        else
-          if :ack in flags do
+      %{flags: flags, seq: seq, ack: ack, window: window} ->
+        rst? = :rst in flags
+        ack? = :ack in flags
+
+        cond do
+          rst? and acceptable_rst?(state, seq) ->
+            reset_state(state)
+            actions = notify_waiters_error(state, :econnreset)
+            {:next_state, :closed, nil, actions}
+
+          rst? ->
+            reject_unacceptable_rst(state)
+
+          ack? ->
             # Process ACK and update retransmission queue
             {new_state, timer_actions} = process_ack(state, ack, window)
             {:keep_state, new_state, timer_actions}
-          else
+
+          true ->
             :keep_state_and_data
-          end
         end
 
       _ ->
@@ -1111,7 +1130,7 @@ defmodule Tricep.Socket do
 
   def handle_event(:info, segment, :last_ack, %__MODULE__{} = state) do
     case Tcp.parse_segment(segment) do
-      %{flags: flags, ack: ack, window: window} ->
+      %{flags: flags, seq: seq, ack: ack, window: window} ->
         rst? = :rst in flags
         ack? = :ack in flags
         ack_of_fin? = ack? and ack == state.snd_nxt
@@ -1120,9 +1139,12 @@ defmodule Tricep.Socket do
           if rst?, do: {state, []}, else: process_ack_if_present(state, ack?, ack, window)
 
         cond do
-          rst? ->
+          rst? and acceptable_rst?(state, seq) ->
             reset_state(state)
             {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
+
+          rst? ->
+            reject_unacceptable_rst(state)
 
           ack_of_fin? ->
             # ACK of our FIN - connection fully closed
@@ -1508,6 +1530,8 @@ defmodule Tricep.Socket do
 
   # Returns true if a <= b in sequence space
   defp seq_leq(a, b), do: not seq_gt(a, b)
+  defp seq_lt(a, b), do: seq_gt(b, a)
+  defp seq_geq(a, b), do: a == b or seq_gt(a, b)
 
   defp socket_opts(opts) when is_list(opts), do: Keyword.get(opts, :opts, %{})
   defp socket_opts(opts) when is_map(opts), do: opts
@@ -1603,7 +1627,23 @@ defmodule Tricep.Socket do
   defp invalid_ack?(state, true, ack), do: seq_gt(ack, state.snd_nxt)
   defp invalid_ack?(_state, false, _ack), do: false
 
+  defp acceptable_rst?(state, seq) do
+    seq_in_receive_window?(seq, state.rcv_nxt, receive_window(state))
+  end
+
+  defp seq_in_receive_window?(seq, rcv_nxt, 0), do: seq == rcv_nxt
+
+  defp seq_in_receive_window?(seq, rcv_nxt, window) do
+    window_end = wrap_seq(rcv_nxt + window)
+    seq_geq(seq, rcv_nxt) and seq_lt(seq, window_end)
+  end
+
   defp reject_invalid_ack(state) do
+    send_ack(state.rcv_nxt, state)
+    {:keep_state, state, []}
+  end
+
+  defp reject_unacceptable_rst(state) do
     send_ack(state.rcv_nxt, state)
     {:keep_state, state, []}
   end
