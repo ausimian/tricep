@@ -59,6 +59,8 @@ defmodule Tricep do
     * `protocol` - The protocol (`:tcp`, `:default`, or a map of options)
       * `:recv_buffer_size` - Maximum buffered receive bytes and advertised receive window
         before TCP window scaling (default: 65535, capped at 65535)
+      * `:fin_wait_2_timeout_ms` - Milliseconds to wait in `FIN_WAIT_2` for the peer FIN
+        before closing locally (default: 60000)
 
   ## Returns
 
@@ -99,6 +101,8 @@ defmodule Tricep do
     * `opts` - A map of socket options:
       * `:recv_buffer_size` - Maximum buffered receive bytes and advertised receive window
         before TCP window scaling (default: 65535, capped at 65535)
+      * `:fin_wait_2_timeout_ms` - Milliseconds to wait in `FIN_WAIT_2` for the peer FIN
+        before closing locally (default: 60000)
 
   ## Returns
 
