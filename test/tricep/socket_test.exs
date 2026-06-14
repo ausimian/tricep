@@ -522,6 +522,85 @@ defmodule Tricep.SocketTest do
       assert parsed2.payload == "ld!"
     end
 
+    test "limits sent data to the peer receive window and resumes after ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, mss: 10, window: 1)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "abc") == :ok
+
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+      <<_::binary-size(40), seg1::binary>> = packet1
+      parsed1 = Tcp.parse_segment(seg1)
+
+      assert parsed1.payload == "a"
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+      assert Tricep.DataBuffer.size(state.send_buffer) == 2
+
+      ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          wrap_seq(parsed1.seq + byte_size(parsed1.payload)),
+          [:ack],
+          2
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+
+      assert_receive {:dummy_link_packet, _link, packet2}, 1000
+      <<_::binary-size(40), seg2::binary>> = packet2
+      parsed2 = Tcp.parse_segment(seg2)
+
+      assert parsed2.payload == "bc"
+
+      {:established, state} = :sys.get_state(socket)
+      assert Tricep.DataBuffer.empty?(state.send_buffer)
+    end
+
+    test "nowait send waits when the peer receive window is zero", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 0)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert {:select, {:select_info, :send, ref}} = Tricep.send(socket, "abc", :nowait)
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      window_update =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack],
+          3
+        )
+
+      DummyLink.inject_packet(link, window_update)
+
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+      assert_receive {:dummy_link_packet, _link, packet}, 1000
+
+      <<_::binary-size(40), segment::binary>> = packet
+      parsed = Tcp.parse_segment(segment)
+      assert parsed.payload == "abc"
+    end
+
     test "returns error when not connected" do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
       assert Tricep.send(socket, "Hello") == {:error, :enotconn}
@@ -2813,9 +2892,10 @@ defmodule Tricep.SocketTest do
     syn_parsed = Tcp.parse_segment(syn_segment)
     <<src_port::16, _::binary>> = syn_segment
 
-    # Build SYN-ACK with optional MSS
+    # Build SYN-ACK with optional MSS/window
     server_seq = 5000
     mss = Keyword.get(opts, :mss)
+    window = Keyword.get(opts, :window, 32768)
 
     segment_opts = if mss, do: [mss: mss], else: []
 
@@ -2825,7 +2905,7 @@ defmodule Tricep.SocketTest do
         server_seq,
         syn_parsed.seq + 1,
         [:syn, :ack],
-        32768,
+        window,
         segment_opts
       )
 
