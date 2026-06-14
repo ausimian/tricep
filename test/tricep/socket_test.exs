@@ -219,9 +219,6 @@ defmodule Tricep.SocketTest do
       # Inject a malformed/truncated segment (too short to parse)
       DummyLink.inject_packet(link, <<1, 2, 3>>)
 
-      # Give it time to process
-      Process.sleep(50)
-
       # Socket should still be waiting - send proper SYN-ACK
       syn_ack_segment =
         Tcp.build_segment(
@@ -310,9 +307,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, syn_only)
-
-      # Give it time to process
-      Process.sleep(50)
 
       # Socket should still be waiting - send proper SYN-ACK
       syn_ack_segment =
@@ -426,8 +420,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, corrupt_checksum(data_segment))
-
-      Process.sleep(50)
       refute_receive {:dummy_link_packet, _link, _packet}, 100
       assert Tricep.recv(socket, 0, 20) == {:error, :timeout}
 
@@ -462,8 +454,6 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, corrupt_checksum(ack_segment))
 
-      Process.sleep(50)
-
       {:established, after_state} = :sys.get_state(socket)
       assert after_state.snd_una == state.snd_una
       assert after_state.unacked_segments == state.unacked_segments
@@ -491,8 +481,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, corrupt_checksum(rst_segment))
-
-      Process.sleep(50)
 
       {:established, after_state} = :sys.get_state(socket)
       assert after_state == state
@@ -926,9 +914,6 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, data_segment)
 
-      # Wait for it to be processed
-      Process.sleep(50)
-
       # Drain the ACK
       assert_receive {:dummy_link_packet, _link, _ack}, 1000
 
@@ -1047,9 +1032,6 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, ack_segment)
 
-      # Give time to process
-      Process.sleep(50)
-
       # Check window was updated
       {:established, new_state} = :sys.get_state(socket)
       assert new_state.snd_wnd == new_window
@@ -1083,9 +1065,6 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, wrong_seq_segment)
 
-      # Give time to process
-      Process.sleep(50)
-
       # Recv should timeout since data was ignored
       result = Tricep.recv(socket, 0, 100)
       assert result == {:error, :timeout}
@@ -1111,9 +1090,6 @@ defmodule Tricep.SocketTest do
 
       # Inject malformed segment (too short to parse)
       DummyLink.inject_packet(link, <<1, 2, 3>>)
-
-      # Give time to process
-      Process.sleep(50)
 
       # Socket should still be in established state and usable
       {:established, new_state} = :sys.get_state(socket)
@@ -1193,7 +1169,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, ack_segment)
-      Process.sleep(50)
 
       # Should be in FIN_WAIT_2
       {:fin_wait_2, _} = :sys.get_state(socket)
@@ -1209,7 +1184,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       # Should be in TIME_WAIT
       {:time_wait, _} = :sys.get_state(socket)
@@ -1246,7 +1220,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       # Should be in CLOSE_WAIT
       {:close_wait, _} = :sys.get_state(socket)
@@ -1281,7 +1254,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, close_wait_state} = :sys.get_state(socket)
 
@@ -1318,7 +1290,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       # First recv gets the data
       assert Tricep.recv(socket, 0, 100) == {:ok, "Final data"}
@@ -1424,7 +1395,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, rst_segment)
-      Process.sleep(50)
 
       # Should be closed
       {:closed, nil} = :sys.get_state(socket)
@@ -1463,7 +1433,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_ack_segment)
-      Process.sleep(50)
 
       # Should go directly to TIME_WAIT (skipping FIN_WAIT_2)
       {:time_wait, _} = :sys.get_state(socket)
@@ -1507,7 +1476,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       # Should go to CLOSING (simultaneous close)
       {:closing, _} = :sys.get_state(socket)
@@ -1540,7 +1508,6 @@ defmodule Tricep.SocketTest do
 
       # Inject malformed segment
       DummyLink.inject_packet(link, <<1, 2, 3>>)
-      Process.sleep(50)
 
       # Should still be in FIN_WAIT_1
       {:fin_wait_1, _} = :sys.get_state(socket)
@@ -1556,7 +1523,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, ack_segment)
-      Process.sleep(50)
 
       # Should transition to FIN_WAIT_2
       {:fin_wait_2, _} = :sys.get_state(socket)
@@ -1593,7 +1559,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, wrong_ack)
-      Process.sleep(50)
 
       # Should still be in FIN_WAIT_1 (wrong ACK ignored)
       {:fin_wait_1, _} = :sys.get_state(socket)
@@ -1630,7 +1595,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, ack_segment)
-      Process.sleep(50)
 
       {:fin_wait_2, _} = :sys.get_state(socket)
 
@@ -1645,7 +1609,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, rst_segment)
-      Process.sleep(50)
 
       {:closed, nil} = :sys.get_state(socket)
     end
@@ -1679,7 +1642,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, ack_segment)
-      Process.sleep(50)
 
       {:fin_wait_2, _} = :sys.get_state(socket)
 
@@ -1695,7 +1657,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, data_segment)
-      Process.sleep(50)
 
       # Data should be buffered
       {:fin_wait_2, fin_wait_2_state} = :sys.get_state(socket)
@@ -1733,13 +1694,11 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, ack_segment)
-      Process.sleep(50)
 
       {:fin_wait_2, _} = :sys.get_state(socket)
 
       # Inject malformed segment
       DummyLink.inject_packet(link, <<1, 2, 3>>)
-      Process.sleep(50)
 
       # Should still be in FIN_WAIT_2
       {:fin_wait_2, _} = :sys.get_state(socket)
@@ -1773,7 +1732,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, ack_segment)
-      Process.sleep(50)
 
       {:fin_wait_2, _} = :sys.get_state(socket)
 
@@ -1789,7 +1747,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, wrong_seq)
-      Process.sleep(50)
 
       # Should still be in FIN_WAIT_2 with empty buffer
       {:fin_wait_2, fin_wait_2_state} = :sys.get_state(socket)
@@ -1827,7 +1784,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, ack_segment)
-      Process.sleep(50)
 
       {:fin_wait_2, _} = :sys.get_state(socket)
 
@@ -1842,7 +1798,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:time_wait, _} = :sys.get_state(socket)
 
@@ -1884,7 +1839,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, ack_segment)
-      Process.sleep(50)
 
       # Send FIN from peer
       fin_segment =
@@ -1897,7 +1851,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:time_wait, _} = :sys.get_state(socket)
 
@@ -1906,7 +1859,6 @@ defmodule Tricep.SocketTest do
 
       # Send FIN again (simulating retransmit because peer didn't get our ACK)
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       # Should re-ACK
       assert_receive {:dummy_link_packet, _link, re_ack_packet}, 1000
@@ -1945,7 +1897,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, ack_segment)
-      Process.sleep(50)
 
       fin_segment =
         Tcp.build_segment(
@@ -1957,7 +1908,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:time_wait, _} = :sys.get_state(socket)
 
@@ -1975,7 +1925,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, just_ack)
-      Process.sleep(50)
 
       # Should not send any response (no new packet)
       refute_receive {:dummy_link_packet, _link, _}, 100
@@ -2017,7 +1966,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:closing, _} = :sys.get_state(socket)
 
@@ -2035,7 +1983,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, rst_segment)
-      Process.sleep(50)
 
       {:closed, nil} = :sys.get_state(socket)
     end
@@ -2071,7 +2018,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:closing, _} = :sys.get_state(socket)
 
@@ -2089,7 +2035,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, our_fin_ack)
-      Process.sleep(50)
 
       {:time_wait, _} = :sys.get_state(socket)
     end
@@ -2123,7 +2068,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:closing, _} = :sys.get_state(socket)
 
@@ -2132,7 +2076,6 @@ defmodule Tricep.SocketTest do
 
       # Inject malformed segment
       DummyLink.inject_packet(link, <<1, 2, 3>>)
-      Process.sleep(50)
 
       # Should still be in CLOSING
       {:closing, _} = :sys.get_state(socket)
@@ -2167,7 +2110,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:closing, _} = :sys.get_state(socket)
 
@@ -2185,7 +2127,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, wrong_ack)
-      Process.sleep(50)
 
       # Should still be in CLOSING (wrong ACK ignored)
       {:closing, _} = :sys.get_state(socket)
@@ -2218,7 +2159,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, _} = :sys.get_state(socket)
 
@@ -2260,7 +2200,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, _} = :sys.get_state(socket)
 
@@ -2309,7 +2248,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, _} = :sys.get_state(socket)
 
@@ -2354,7 +2292,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, _} = :sys.get_state(socket)
 
@@ -2372,7 +2309,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, rst_segment)
-      Process.sleep(50)
 
       {:closed, nil} = :sys.get_state(socket)
     end
@@ -2402,7 +2338,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, close_wait_state} = :sys.get_state(socket)
 
@@ -2424,7 +2359,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, data_ack)
-      Process.sleep(50)
 
       # snd_una should be updated
       {:close_wait, updated_state} = :sys.get_state(socket)
@@ -2457,7 +2391,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, _} = :sys.get_state(socket)
 
@@ -2466,7 +2399,6 @@ defmodule Tricep.SocketTest do
 
       # Inject malformed segment
       DummyLink.inject_packet(link, <<1, 2, 3>>)
-      Process.sleep(50)
 
       # Should still be in CLOSE_WAIT
       {:close_wait, _} = :sys.get_state(socket)
@@ -2499,7 +2431,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, _} = :sys.get_state(socket)
 
@@ -2523,7 +2454,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, rst_segment)
-      Process.sleep(50)
 
       {:closed, nil} = :sys.get_state(socket)
     end
@@ -2553,7 +2483,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, _close_wait_state} = :sys.get_state(socket)
 
@@ -2577,7 +2506,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, our_fin_ack)
-      Process.sleep(50)
 
       {:closed, nil} = :sys.get_state(socket)
     end
@@ -2607,7 +2535,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, _} = :sys.get_state(socket)
 
@@ -2622,7 +2549,6 @@ defmodule Tricep.SocketTest do
 
       # Inject malformed segment
       DummyLink.inject_packet(link, <<1, 2, 3>>)
-      Process.sleep(50)
 
       # Should still be in LAST_ACK
       {:last_ack, _} = :sys.get_state(socket)
@@ -2653,7 +2579,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, _} = :sys.get_state(socket)
 
@@ -2677,7 +2602,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, wrong_ack)
-      Process.sleep(50)
 
       # Should still be in LAST_ACK (wrong ACK ignored)
       {:last_ack, _} = :sys.get_state(socket)
@@ -3165,7 +3089,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, ack_segment)
-      Process.sleep(50)
 
       # Check that unacked_segments is now empty
       {:established, state_after_ack} = :sys.get_state(socket)
@@ -3198,7 +3121,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       {:close_wait, _} = :sys.get_state(socket)
 
@@ -3474,9 +3396,6 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, data_segment)
 
-      # Give time for data to be processed
-      Process.sleep(50)
-
       # Drain data ACK
       assert_receive {:dummy_link_packet, _link, _data_ack}, 1000
 
@@ -3590,9 +3509,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, rst_segment)
-
-      # Give time for RST to be processed
-      Process.sleep(50)
 
       # Socket should be back in closed state
       {:closed, nil} = :sys.get_state(socket)
@@ -3891,7 +3807,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, data_segment)
-      Process.sleep(50)
 
       # Drain the ACK for the data
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
@@ -3950,7 +3865,6 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, fin_segment)
-      Process.sleep(50)
 
       # Should be in close_wait
       {:close_wait, _} = :sys.get_state(socket)
