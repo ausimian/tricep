@@ -737,11 +737,15 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, window_update)
 
       assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      assert Tricep.send(socket, "abc", :nowait) == :ok
       assert_receive {:dummy_link_packet, _link, packet}, 1000
 
       <<_::binary-size(40), segment::binary>> = packet
       parsed = Tcp.parse_segment(segment)
       assert parsed.payload == "abc"
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
     end
 
     test "returns error when not connected" do

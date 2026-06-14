@@ -113,7 +113,7 @@ defmodule Tricep.Socket do
     field :connect_select, {pid(), reference()} | nil, default: nil
     # For :nowait recv - {caller_pid, ref, length}
     field :recv_select, {pid(), reference(), non_neg_integer()} | nil, default: nil
-    # For send backpressure - [{caller_pid, ref, data} | {from, ref, data, timer_ref}]
+    # For send backpressure - [{caller_pid, ref} | {from, ref, data, timer_ref}]
     field :send_waiters, list(), default: []
     # Track if read side has been shutdown
     field :read_shutdown, boolean(), default: false
@@ -440,7 +440,7 @@ defmodule Tricep.Socket do
         # Window exhausted, return select tuple
         ref = make_ref()
         {caller_pid, _} = from
-        waiter = {caller_pid, ref, data}
+        waiter = {caller_pid, ref}
         new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
         {:keep_state, new_state, {:reply, from, {:select, {:select_info, :send, ref}}}}
 
@@ -855,7 +855,7 @@ defmodule Tricep.Socket do
         # Window exhausted, return select tuple
         ref = make_ref()
         {caller_pid, _} = from
-        waiter = {caller_pid, ref, data}
+        waiter = {caller_pid, ref}
         new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
         {:keep_state, new_state, {:reply, from, {:select, {:select_info, :send, ref}}}}
 
@@ -1099,7 +1099,7 @@ defmodule Tricep.Socket do
           actions
         end
 
-      {caller_pid, ref, _data} when is_pid(caller_pid) ->
+      {caller_pid, ref} when is_pid(caller_pid) ->
         notify_select(caller_pid, ref)
         []
     end)
@@ -1351,13 +1351,11 @@ defmodule Tricep.Socket do
         [] ->
           {state, []}
 
-        [{caller_pid, ref, data} | rest] when is_pid(caller_pid) ->
-          # :nowait waiter - notify and enqueue data
+        [{caller_pid, ref} | rest] when is_pid(caller_pid) ->
+          # :nowait waiter - notify readiness; caller must retry send to enqueue data.
           notify_select(caller_pid, ref)
-          new_send_buffer = DataBuffer.append(state.send_buffer, data)
-          new_state = %{state | send_waiters: rest, send_buffer: new_send_buffer}
-          # Return flush action so data gets sent
-          {new_state, [{:next_event, :internal, :flush_send_buffer}]}
+          new_state = %{state | send_waiters: rest}
+          {new_state, []}
 
         [{from, _ref, data, timer_ref} | rest] when is_tuple(from) ->
           # Blocking waiter - enqueue data and reply
