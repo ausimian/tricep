@@ -2114,6 +2114,55 @@ defmodule Tricep.SocketTest do
       assert :ack in parsed.flags
     end
 
+    test "active close releases blocking recv waiters", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, :infinity) end)
+      wait_for_recv_waiters(socket)
+
+      assert Tricep.close(socket) == :ok
+      assert Task.await(recv_task, 1000) == {:ok, <<>>}
+
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      {:fin_wait_1, state} = :sys.get_state(socket)
+      assert state.recv_waiters == []
+      assert state.recv_selects == []
+    end
+
+    test "active close releases blocking send waiters", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 0)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      send_task = Task.async(fn -> Tricep.send(socket, "blocked", 5_000) end)
+      wait_for_send_waiters(socket)
+
+      {:established, state} = :sys.get_state(socket)
+      assert state.persist_timer_active
+
+      assert Tricep.close(socket) == :ok
+      assert Task.await(send_task, 1000) == {:error, :epipe}
+
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      {:fin_wait_1, state} = :sys.get_state(socket)
+      assert state.send_waiters == []
+      refute state.persist_timer_active
+    end
+
     test "active close drains queued send buffer before FIN", %{
       link: link,
       local_addr: local_addr,
@@ -5473,6 +5522,32 @@ defmodule Tricep.SocketTest do
 
       # Should be in FIN_WAIT_1
       {:fin_wait_1, _} = :sys.get_state(socket)
+    end
+
+    test "shutdown(:write) releases blocking send waiters", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 0)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      send_task = Task.async(fn -> Tricep.send(socket, "blocked", :infinity) end)
+      wait_for_send_waiters(socket)
+
+      {:established, state} = :sys.get_state(socket)
+      assert state.persist_timer_active
+
+      assert Tricep.shutdown(socket, :write) == :ok
+      assert Task.await(send_task, 1000) == {:error, :epipe}
+
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      {:fin_wait_1, state} = :sys.get_state(socket)
+      assert state.send_waiters == []
+      refute state.persist_timer_active
     end
 
     test "shutdown(:write) drains queued send buffer before FIN", %{
