@@ -586,6 +586,15 @@ defmodule Tricep.SocketTest do
 
       assert Tricep.close(listener1) == :ok
     end
+
+    test "bind accepts a raw 16-byte IPv6 address binary", %{remote_addr: remote_addr} do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(socket, %{family: :inet6, addr: remote_addr, port: @port + 1}) == :ok
+      assert Process.alive?(socket)
+
+      assert Tricep.close(socket) == :ok
+    end
   end
 
   describe "receive checksum validation" do

@@ -62,12 +62,31 @@ defmodule Tricep.AddressTest do
       assert result == expected
     end
 
+    test "parses valid textual address before treating a 16-byte binary as raw" do
+      {:ok, result} = Address.from("abcd:ef01:2345::")
+      expected = <<0xABCD::16, 0xEF01::16, 0x2345::16, 0::80>>
+
+      assert result == expected
+    end
+
     test "returns error for invalid address" do
       assert {:error, :einval} = Address.from("not-an-address")
     end
 
     test "returns error for IPv4 address" do
       assert {:error, :einval} = Address.from("192.168.1.1")
+    end
+  end
+
+  describe "from/1 with raw binary" do
+    test "accepts 16-byte IPv6 address binaries" do
+      addr = <<0xFD00::16, 0::96, 1::16>>
+
+      assert Address.from(addr) == {:ok, addr}
+    end
+
+    test "returns error for non-text binaries that are not 16 bytes" do
+      assert Address.from(<<0xFF, 0xFE>>) == {:error, :einval}
     end
   end
 
