@@ -1,6 +1,8 @@
 defmodule Tricep.TunLinkTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Tricep.DummyLink
   alias Tricep.Ip
   alias Tricep.Tcp
@@ -84,10 +86,128 @@ defmodule Tricep.TunLinkTest do
       assert Task.await(task, 1000) == :ok
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
     end
+
+    test "Packet Too Big lowers TCP send MSS and is logged", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(local_addr, remote_addr)
+      {quoted_packet, _state} = quoted_tcp_packet(socket)
+
+      icmp = <<2, 0, 0::16, 1200::32, quoted_packet::binary>>
+      packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
+
+      log =
+        capture_log(fn ->
+          assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
+        end)
+
+      assert log =~ "ICMPv6 Packet Too Big mtu=1200"
+
+      wait_for_socket(socket, fn
+        {:established, %{snd_mss: 1140}} -> true
+        _state -> false
+      end)
+    end
+
+    test "Destination Unreachable closes affected TCP socket and notifies waiters", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(local_addr, remote_addr)
+
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, :infinity) end)
+
+      wait_for_socket(socket, fn
+        {:established, %{recv_waiters: waiters}} -> length(waiters) == 1
+        _state -> false
+      end)
+
+      {quoted_packet, _state} = quoted_tcp_packet(socket)
+      icmp = <<1, 0, 0::16, 0::32, quoted_packet::binary>>
+      packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
+
+      log =
+        capture_log(fn ->
+          assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
+        end)
+
+      assert log =~ "ICMPv6 enetunreach"
+      assert Task.await(recv_task, 1000) == {:error, :enetunreach}
+      assert {:closed, nil} = :sys.get_state(socket)
+    end
+  end
+
+  defp establish_connection(local_addr, remote_addr) do
+    {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+    task =
+      Task.async(fn ->
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+      end)
+
+    assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+    <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+    syn_parsed = Tcp.parse_segment(syn_segment)
+    <<src_port::16, _::binary>> = syn_segment
+
+    syn_ack_segment =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        5000,
+        syn_parsed.seq + 1,
+        [:syn, :ack],
+        32768
+      )
+
+    packet = Ip.wrap(local_addr, remote_addr, :tcp, syn_ack_segment)
+
+    assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
+    assert Task.await(task, 1000) == :ok
+    assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+    socket
+  end
+
+  defp quoted_tcp_packet(socket) do
+    {:established, state} = :sys.get_state(socket)
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
+
+    tcp_segment =
+      Tcp.build_segment(
+        state.pair,
+        state.snd_nxt,
+        state.rcv_nxt,
+        [:ack],
+        32768
+      )
+
+    {Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment), state}
   end
 
   defp tun_state do
     %TunLink{tun: self(), name: "testtun0", mtu: 1500}
+  end
+
+  defp wait_for_socket(socket, predicate, timeout \\ 1_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    wait_for_socket(socket, predicate, deadline, nil)
+  end
+
+  defp wait_for_socket(socket, predicate, deadline, last_state) do
+    state = :sys.get_state(socket)
+
+    cond do
+      predicate.(state) ->
+        state
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("socket did not reach expected state; last state: #{inspect(last_state || state)}")
+
+      true ->
+        Process.sleep(1)
+        wait_for_socket(socket, predicate, deadline, state)
+    end
   end
 
   defp corrupt_checksum(segment) do

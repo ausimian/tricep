@@ -55,6 +55,23 @@ defmodule Tricep.Socket do
   # Ignore malformed packets that are too short to parse
   def handle_packet(_src_addr, _dst_addr, _segment), do: :ok
 
+  def handle_icmpv6_error(
+        src_addr,
+        dst_addr,
+        <<src_port::16, dst_port::16, _::binary>>,
+        event
+      ) do
+    pair = {{src_addr, src_port}, {dst_addr, dst_port}}
+
+    if pid = Application.lookup_socket_pair(pair) do
+      send(pid, {:icmpv6_error, event})
+    end
+
+    :ok
+  end
+
+  def handle_icmpv6_error(_src_addr, _dst_addr, _segment, _event), do: :ok
+
   def child_spec(opts) do
     %{
       id: __MODULE__,
@@ -278,7 +295,7 @@ defmodule Tricep.Socket do
 
   # SYN-ACK handler for blocking connect (from is a gen_statem from tuple)
   def handle_event(:info, segment, {:syn_sent, from}, %__MODULE__{} = state)
-      when is_tuple(from) do
+      when is_tuple(from) and is_binary(segment) do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, window: window, options: options} ->
         syn? = :syn in flags
@@ -340,7 +357,8 @@ defmodule Tricep.Socket do
   end
 
   # SYN-ACK handler for :nowait connect
-  def handle_event(:info, segment, {:syn_sent, :nowait}, %__MODULE__{} = state) do
+  def handle_event(:info, segment, {:syn_sent, :nowait}, %__MODULE__{} = state)
+      when is_binary(segment) do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, window: window, options: options} ->
         syn? = :syn in flags
@@ -629,7 +647,7 @@ defmodule Tricep.Socket do
 
   # --- Established state: incoming data ---
 
-  def handle_event(:info, segment, :established, %__MODULE__{} = state) do
+  def handle_event(:info, segment, :established, %__MODULE__{} = state) when is_binary(segment) do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, payload: payload, window: window} ->
         rst? = :rst in flags
@@ -793,6 +811,75 @@ defmodule Tricep.Socket do
     :keep_state_and_data
   end
 
+  def handle_event(
+        :info,
+        {:icmpv6_error, {:packet_too_big, mtu}},
+        state_name,
+        %__MODULE__{} = state
+      )
+      when state_name in [:established, :close_wait] do
+    {new_state, actions} = apply_path_mtu(state, mtu)
+    {:keep_state, new_state, actions}
+  end
+
+  def handle_event(
+        :info,
+        {:icmpv6_error, {:packet_too_big, mtu}},
+        state_name,
+        %__MODULE__{} = state
+      )
+      when state_name in [:fin_wait_1, :fin_wait_2, :closing, :last_ack] do
+    {new_state, _actions} = apply_path_mtu(state, mtu)
+    {:keep_state, new_state}
+  end
+
+  def handle_event(
+        :info,
+        {:icmpv6_error, {:hard, reason}},
+        {:syn_sent, from},
+        %__MODULE__{} = state
+      )
+      when is_tuple(from) do
+    reset_state(state)
+
+    actions = [
+      {{:timeout, :rto}, :cancel},
+      {{:timeout, :connect_timeout}, :cancel},
+      {:reply, from, {:error, reason}}
+    ]
+
+    {:next_state, :closed, nil, actions}
+  end
+
+  def handle_event(
+        :info,
+        {:icmpv6_error, {:hard, reason}},
+        {:syn_sent, :nowait},
+        %__MODULE__{} = state
+      ) do
+    {state_name, state_data} = nowait_connect_failure(state, reason)
+    {:next_state, state_name, state_data, {{:timeout, :rto}, :cancel}}
+  end
+
+  def handle_event(
+        :info,
+        {:icmpv6_error, {:hard, reason}},
+        state_name,
+        %__MODULE__{} = state
+      )
+      when state_name in [
+             :established,
+             :close_wait,
+             :fin_wait_1,
+             :fin_wait_2,
+             :closing,
+             :last_ack
+           ] do
+    reset_state(state)
+    actions = notify_waiters_error(state, reason)
+    {:next_state, :closed, nil, actions}
+  end
+
   # --- Active close from established ---
 
   def handle_event(
@@ -849,7 +936,7 @@ defmodule Tricep.Socket do
 
   # --- FIN_WAIT_1 state ---
 
-  def handle_event(:info, segment, :fin_wait_1, %__MODULE__{} = state) do
+  def handle_event(:info, segment, :fin_wait_1, %__MODULE__{} = state) when is_binary(segment) do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, window: window} ->
         fin? = :fin in flags
@@ -916,7 +1003,7 @@ defmodule Tricep.Socket do
     {:next_state, :closed, nil}
   end
 
-  def handle_event(:info, segment, :fin_wait_2, %__MODULE__{} = state) do
+  def handle_event(:info, segment, :fin_wait_2, %__MODULE__{} = state) when is_binary(segment) do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, payload: payload, window: window} ->
         fin? = :fin in flags
@@ -985,7 +1072,7 @@ defmodule Tricep.Socket do
     {:next_state, :closed, nil}
   end
 
-  def handle_event(:info, segment, :time_wait, %__MODULE__{} = state) do
+  def handle_event(:info, segment, :time_wait, %__MODULE__{} = state) when is_binary(segment) do
     # Re-ACK any FIN received (peer may have missed our ACK)
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: _seq} ->
@@ -1002,7 +1089,7 @@ defmodule Tricep.Socket do
 
   # --- CLOSING state (simultaneous close) ---
 
-  def handle_event(:info, segment, :closing, %__MODULE__{} = state) do
+  def handle_event(:info, segment, :closing, %__MODULE__{} = state) when is_binary(segment) do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, window: window} ->
         ack? = :ack in flags
@@ -1189,7 +1276,7 @@ defmodule Tricep.Socket do
     |> close_or_drain_send_buffer(from, :last_ack)
   end
 
-  def handle_event(:info, segment, :close_wait, %__MODULE__{} = state) do
+  def handle_event(:info, segment, :close_wait, %__MODULE__{} = state) when is_binary(segment) do
     # Handle ACKs for data we sent
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, window: window} ->
@@ -1221,7 +1308,7 @@ defmodule Tricep.Socket do
 
   # --- LAST_ACK state ---
 
-  def handle_event(:info, segment, :last_ack, %__MODULE__{} = state) do
+  def handle_event(:info, segment, :last_ack, %__MODULE__{} = state) when is_binary(segment) do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: seq, ack: ack, window: window} ->
         rst? = :rst in flags
@@ -1814,6 +1901,21 @@ defmodule Tricep.Socket do
         nil
     end)
   end
+
+  defp apply_path_mtu(%__MODULE__{} = state, mtu) when is_integer(mtu) and mtu > 0 do
+    new_mss = max(1, mtu - 60)
+    current_mss = state.snd_mss || @default_mss
+
+    if new_mss < current_mss do
+      new_state = %{state | snd_mss: new_mss}
+      actions = schedule_flush_send_buffer(new_state, [])
+      {new_state, actions}
+    else
+      {state, []}
+    end
+  end
+
+  defp apply_path_mtu(%__MODULE__{} = state, _mtu), do: {state, []}
 
   # Calculate available send window (for backpressure detection)
   defp send_window_available(state) do
