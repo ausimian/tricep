@@ -201,6 +201,8 @@ defmodule Tricep.Tcp do
     flags = if (bits &&& 0x08) != 0, do: [:psh | flags], else: flags
     flags = if (bits &&& 0x10) != 0, do: [:ack | flags], else: flags
     flags = if (bits &&& 0x20) != 0, do: [:urg | flags], else: flags
+    flags = if (bits &&& 0x40) != 0, do: [:ece | flags], else: flags
+    flags = if (bits &&& 0x80) != 0, do: [:cwr | flags], else: flags
     flags
   end
 

@@ -60,21 +60,29 @@ defmodule Tricep.TcpTest do
       assert Tcp.decode_flags(0) == []
     end
 
-    test "decodes all common flags" do
-      # FIN=1, SYN=2, RST=4, PSH=8, ACK=16, URG=32 = 0x3F
-      flags = Tcp.decode_flags(0x3F)
+    test "decodes all declared flags" do
+      flags = Tcp.decode_flags(0xFF)
       assert :fin in flags
       assert :syn in flags
       assert :rst in flags
       assert :psh in flags
       assert :ack in flags
       assert :urg in flags
+      assert :ece in flags
+      assert :cwr in flags
+    end
+
+    test "decodes ECN flags" do
+      flags = Tcp.decode_flags(0xC0)
+
+      assert :ece in flags
+      assert :cwr in flags
     end
   end
 
   describe "encode_flags/1 and decode_flags/1 roundtrip" do
-    test "roundtrip preserves flags" do
-      original = [:syn, :ack]
+    test "roundtrip preserves every declared flag" do
+      original = [:fin, :syn, :rst, :psh, :ack, :urg, :ece, :cwr]
       encoded = Tcp.encode_flags(original)
       decoded = Tcp.decode_flags(encoded)
 
