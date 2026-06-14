@@ -3139,7 +3139,15 @@ defmodule Tricep.SocketTest do
       # Drain ACK
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
 
-      # Now connect should return :eisconn (already connected)
+      # Retrying connect completes the :nowait operation
+      assert Tricep.connect(
+               socket,
+               %{family: :inet6, addr: @local_addr_str, port: @port},
+               :nowait
+             ) ==
+               :ok
+
+      # Further connect attempts should still report that the socket is connected
       assert Tricep.connect(
                socket,
                %{family: :inet6, addr: @local_addr_str, port: @port},
