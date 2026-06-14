@@ -5,9 +5,16 @@ defmodule Tricep.Address do
     <<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>
   end
 
-  def from(addr_str) when is_binary(addr_str) do
-    with {:ok, addr_tuple} <- :inet.parse_ipv6strict_address(to_charlist(addr_str)) do
-      from(addr_tuple)
+  def from(addr) when is_binary(addr) do
+    case parse_ipv6_string(addr) do
+      {:ok, addr_tuple} ->
+        from(addr_tuple)
+
+      {:error, :einval} when byte_size(addr) == 16 ->
+        {:ok, addr}
+
+      {:error, :einval} ->
+        {:error, :einval}
     end
   end
 
@@ -18,4 +25,18 @@ defmodule Tricep.Address do
   end
 
   def from({_a, _b, _c, _d, _e, _f, _g, _h}), do: {:error, :einval}
+
+  defp parse_ipv6_string(addr) do
+    if String.valid?(addr) do
+      case :inet.parse_ipv6strict_address(String.to_charlist(addr)) do
+        {:ok, addr_tuple} -> {:ok, addr_tuple}
+        {:error, _reason} -> {:error, :einval}
+      end
+    else
+      {:error, :einval}
+    end
+  rescue
+    ArgumentError -> {:error, :einval}
+    UnicodeConversionError -> {:error, :einval}
+  end
 end
