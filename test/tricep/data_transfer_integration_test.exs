@@ -115,12 +115,8 @@ defmodule Tricep.DataTransferIntegrationTest do
       :ok = :socket.send(client_sock, "Second")
       :ok = :socket.send(client_sock, "Third")
 
-      # Give time for segments to arrive
-      Process.sleep(100)
-
-      # Receive all data (TCP is a stream, so data may be coalesced)
-      {:ok, data} = Tricep.recv(socket, 0, 5000)
-      assert data == "FirstSecondThird"
+      assert Tricep.recv(socket, byte_size("FirstSecondThird"), 5000) ==
+               {:ok, "FirstSecondThird"}
     end
 
     test "times out when no data arrives", ctx do
@@ -172,8 +168,7 @@ defmodule Tricep.DataTransferIntegrationTest do
       # Send data
       :ok = :socket.send(client_sock, "Buffered data")
 
-      # Wait for data to arrive
-      Process.sleep(100)
+      wait_for_recv_buffer(socket, byte_size("Buffered data"))
 
       # Recv should return immediately
       start_time = System.monotonic_time(:millisecond)
@@ -277,9 +272,6 @@ defmodule Tricep.DataTransferIntegrationTest do
       assert Tricep.close(socket) == :ok
 
       # Kernel socket should receive EOF (recv returns 0 bytes or closed)
-      # Give time for FIN to be processed
-      Process.sleep(100)
-
       result = :socket.recv(client_sock, 0, 1000)
       # Kernel recv returns {:ok, <<>>} on FIN or {:error, :closed}
       assert result in [{:ok, <<>>}, {:error, :closed}]
@@ -364,7 +356,6 @@ defmodule Tricep.DataTransferIntegrationTest do
       assert Tricep.close(socket) == :ok
 
       # Kernel should see EOF
-      Process.sleep(100)
       result = :socket.recv(client_sock, 0, 1000)
       assert result in [{:ok, <<>>}, {:error, :closed}]
 
@@ -391,8 +382,7 @@ defmodule Tricep.DataTransferIntegrationTest do
       # Start recv in background (will block waiting for data)
       recv_task = Task.async(fn -> Tricep.recv(socket, 0, 10_000) end)
 
-      # Give it time to block
-      Process.sleep(100)
+      wait_for_recv_waiters(socket)
 
       # Close kernel socket (sends FIN)
       :socket.close(client_sock)

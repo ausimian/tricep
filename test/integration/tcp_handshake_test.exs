@@ -24,9 +24,6 @@ defmodule Tricep.Integration.TcpHandshakeTest do
           accept_connection(listen_sock, 10_000)
         end)
 
-      # Give listener time to start
-      Process.sleep(50)
-
       # Open a Tricep socket and connect
       {:ok, sock} = Tricep.open(:inet6, :stream, :tcp)
       address = %{family: :inet6, addr: ctx.ifaddr, port: port}
@@ -75,8 +72,6 @@ defmodule Tricep.Integration.TcpHandshakeTest do
       # Start accept tasks
       accept1 = Task.async(fn -> accept_connection(listen_sock1, 10_000) end)
       accept2 = Task.async(fn -> accept_connection(listen_sock2, 10_000) end)
-
-      Process.sleep(50)
 
       # Open two Tricep sockets and connect
       {:ok, sock1} = Tricep.open(:inet6, :stream, :tcp)

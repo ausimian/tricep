@@ -65,7 +65,7 @@ defmodule Tricep.DummyLink do
   """
   @spec inject_packet(pid(), binary()) :: :ok
   def inject_packet(pid, tcp_segment) do
-    GenServer.cast(pid, {:inject_packet, tcp_segment})
+    GenServer.call(pid, {:inject_packet, tcp_segment})
   end
 
   # Server callbacks
@@ -111,12 +111,16 @@ defmodule Tricep.DummyLink do
     end
   end
 
-  @impl true
-  def handle_cast({:inject_packet, tcp_segment}, state) do
+  def handle_call({:inject_packet, tcp_segment}, _from, state) do
     # The packet comes "from" local_addr "to" remote_addr (Socket's source)
     # Socket registered pair as {{remote_addr, src_port}, {local_addr, dst_port}}
+    socket = target_socket(state, tcp_segment)
     Tricep.Socket.handle_packet(state.local_addr, state.remote_addr, tcp_segment)
-    {:noreply, state}
+
+    # The barrier must come from this process so it queues behind the injected segment.
+    if socket, do: :sys.get_state(socket)
+
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -166,4 +170,13 @@ defmodule Tricep.DummyLink do
     {:ok, bin} = Tricep.Address.from(addr)
     bin
   end
+
+  defp target_socket(state, <<src_port::16, dst_port::16, _::binary>> = segment) do
+    if Tricep.Tcp.valid_checksum?(state.local_addr, state.remote_addr, segment) do
+      pair = {{state.remote_addr, dst_port}, {state.local_addr, src_port}}
+      Tricep.Application.lookup_socket_pair(pair)
+    end
+  end
+
+  defp target_socket(_state, _segment), do: nil
 end
