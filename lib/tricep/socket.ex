@@ -161,6 +161,15 @@ defmodule Tricep.Socket do
     {:keep_state, %{state | connect_select: nil}, {:reply, from, :ok}}
   end
 
+  def handle_event(
+        {:call, from},
+        {:connect, _address, _timeout},
+        {:connect_failed, _caller_pid, _ref, reason},
+        nil
+      ) do
+    {:next_state, :closed, nil, {:reply, from, {:error, reason}}}
+  end
+
   def handle_event({:call, from}, {:connect, _address, _timeout}, _, %__MODULE__{}) do
     {:keep_state_and_data, {:reply, from, {:error, :eisconn}}}
   end
@@ -291,10 +300,10 @@ defmodule Tricep.Socket do
 
         cond do
           rst? ->
-            # Connection refused - no notification, caller will get error on next connect call
-            reset_state(state)
+            # Connection refused - notify caller so a retry can complete with the stored error.
             actions = [{{:timeout, :rto}, :cancel}]
-            {:next_state, :closed, nil, actions}
+            {state_name, state_data} = nowait_connect_failure(state, :econnrefused)
+            {:next_state, state_name, state_data, actions}
 
           syn? and ack? and ack == state.iss + 1 ->
             # Valid SYN-ACK: send ACK, notify caller, transition to ESTABLISHED
@@ -362,9 +371,9 @@ defmodule Tricep.Socket do
         %__MODULE__{} = state
       ) do
     if state.syn_retransmit_count >= @max_retransmit_count do
-      # Max retries exceeded - no notification, caller will get error on next connect call
-      reset_state(state)
-      {:next_state, :closed, nil}
+      # Max retries exceeded - notify caller so a retry can complete with the stored error.
+      {state_name, state_data} = nowait_connect_failure(state, :etimedout)
+      {:next_state, state_name, state_data}
     else
       retransmit_syn(state, :syn_timeout_nowait)
     end
@@ -1149,6 +1158,19 @@ defmodule Tricep.Socket do
 
   defp reset_state(%__MODULE__{} = state) do
     Application.deregister_socket_pair(state.pair)
+  end
+
+  defp nowait_connect_failure(%__MODULE__{} = state, reason) do
+    reset_state(state)
+
+    case state.connect_select do
+      {caller_pid, ref} ->
+        notify_select(caller_pid, ref)
+        {{:connect_failed, caller_pid, ref, reason}, nil}
+
+      nil ->
+        {:closed, nil}
+    end
   end
 
   defp send_ack(ack_num, %__MODULE__{} = state) do
