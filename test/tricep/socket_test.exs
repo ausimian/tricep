@@ -47,11 +47,39 @@ defmodule Tricep.SocketTest do
 
       # Parse TCP segment
       parsed = Tcp.parse_segment(tcp_segment)
+      <<src_port::16, _::binary>> = tcp_segment
+
+      assert src_port in 49_152..65_535
       assert :syn in parsed.flags
       refute :ack in parsed.flags
       assert parsed.ack == 0
 
       Task.shutdown(task, :brutal_kill)
+    end
+
+    test "returns eaddrnotavail when all ephemeral ports are exhausted", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      pairs =
+        for port <- 49_152..65_535 do
+          {{remote_addr, port}, {local_addr, @port}}
+        end
+
+      on_exit(fn ->
+        Enum.each(pairs, &Tricep.Application.deregister_socket_pair/1)
+      end)
+
+      Enum.each(pairs, fn pair ->
+        assert Tricep.Application.register_socket_pair(pair) == :ok
+      end)
+
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}) ==
+               {:error, :eaddrnotavail}
+
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
     end
 
     test "advertises configured receive buffer size in SYN" do

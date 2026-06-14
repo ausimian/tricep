@@ -93,6 +93,9 @@ defmodule Tricep.Socket do
   @default_recv_buffer_size 65_535
   @max_tcp_window 65_535
   @default_fin_wait_2_timeout_ms 60_000
+  @ephemeral_port_first 49_152
+  @ephemeral_port_last 65_535
+  @ephemeral_port_count @ephemeral_port_last - @ephemeral_port_first + 1
 
   # Retransmission timeout constants
   @initial_rto_ms 1_000
@@ -166,20 +169,25 @@ defmodule Tricep.Socket do
       {:ok, dstaddr_bin, dst_port} ->
         case Application.lookup_link(dstaddr_bin) do
           {pid, {srcaddr_bin, mtu}} ->
-            pair = allocate_port(srcaddr_bin, {dstaddr_bin, dst_port})
-            send_syn = {:next_event, :internal, {:send_syn, from, timeout}}
-            recv_buffer_size = recv_buffer_size(closed_data)
+            case allocate_port(srcaddr_bin, {dstaddr_bin, dst_port}) do
+              {:ok, pair} ->
+                send_syn = {:next_event, :internal, {:send_syn, from, timeout}}
+                recv_buffer_size = recv_buffer_size(closed_data)
 
-            state = %__MODULE__{
-              pair: pair,
-              link: pid,
-              rcv_mss: mtu - 60,
-              recv_buffer_size: recv_buffer_size,
-              rcv_wnd: recv_buffer_size,
-              fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(closed_data)
-            }
+                state = %__MODULE__{
+                  pair: pair,
+                  link: pid,
+                  rcv_mss: mtu - 60,
+                  recv_buffer_size: recv_buffer_size,
+                  rcv_wnd: recv_buffer_size,
+                  fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(closed_data)
+                }
 
-            {:next_state, :closed, state, send_syn}
+                {:next_state, :closed, state, send_syn}
+
+              {:error, reason} ->
+                {:keep_state_and_data, {:reply, from, {:error, reason}}}
+            end
 
           nil ->
             {:keep_state_and_data, {:reply, from, {:error, :enetunreach}}}
@@ -1665,21 +1673,25 @@ defmodule Tricep.Socket do
   end
 
   defp allocate_port(srcaddr_bin, dst) do
-    state = :rand.seed_s(:default)
-    allocate_port(srcaddr_bin, dst, state)
+    start_offset = System.unique_integer([:positive, :monotonic]) |> rem(@ephemeral_port_count)
+    allocate_port(srcaddr_bin, dst, start_offset, 0)
   end
 
-  defp allocate_port(srcaddr_bin, dst, state) do
-    {rand, state} = :rand.uniform_s(16384, state)
-    port = 49151 + rand
+  defp allocate_port(_srcaddr_bin, _dst, _start_offset, attempts)
+       when attempts >= @ephemeral_port_count do
+    {:error, :eaddrnotavail}
+  end
+
+  defp allocate_port(srcaddr_bin, dst, start_offset, attempts) do
+    port = @ephemeral_port_first + rem(start_offset + attempts, @ephemeral_port_count)
     pair = {{srcaddr_bin, port}, dst}
 
     case Application.register_socket_pair(pair) do
       :ok ->
-        pair
+        {:ok, pair}
 
       _ ->
-        allocate_port(srcaddr_bin, dst, state)
+        allocate_port(srcaddr_bin, dst, start_offset, attempts + 1)
     end
   end
 
