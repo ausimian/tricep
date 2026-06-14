@@ -1056,58 +1056,64 @@ defmodule Tricep.Socket do
   end
 
   defp do_flush_send_buffer(%__MODULE__{} = state) do
-    # Take up to snd_mss bytes from buffer
-    mss = state.snd_mss || @default_mss
-    {payload_iodata, new_send_buffer} = DataBuffer.take(state.send_buffer, mss)
-    payload = IO.iodata_to_binary(payload_iodata)
+    available = send_window_available(state)
 
-    seq_start = state.snd_nxt
-    seq_end = wrap_seq(seq_start + byte_size(payload))
+    cond do
+      DataBuffer.empty?(state.send_buffer) ->
+        :keep_state_and_data
 
-    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
+      available <= 0 ->
+        :keep_state_and_data
 
-    tcp_segment =
-      Tcp.build_segment(
-        state.pair,
-        seq_start,
-        state.rcv_nxt,
-        [:ack, :psh],
-        state.rcv_wnd,
-        payload: payload
-      )
+      true ->
+        # Take only bytes the peer's advertised receive window currently permits.
+        mss = state.snd_mss || @default_mss
+        send_len = min(mss, available)
+        {payload_iodata, new_send_buffer} = DataBuffer.take(state.send_buffer, send_len)
+        payload = IO.iodata_to_binary(payload_iodata)
 
-    packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
-    Tricep.Link.send(state.link, packet)
+        seq_start = state.snd_nxt
+        seq_end = wrap_seq(seq_start + byte_size(payload))
 
-    # Track segment for retransmission: {seq_start, seq_end, payload, retransmit_count}
-    unacked_entry = {seq_start, seq_end, payload, 0}
-    new_unacked = state.unacked_segments ++ [unacked_entry]
+        {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
-    new_state = %{
-      state
-      | send_buffer: new_send_buffer,
-        snd_nxt: seq_end,
-        unacked_segments: new_unacked
-    }
+        tcp_segment =
+          Tcp.build_segment(
+            state.pair,
+            seq_start,
+            state.rcv_nxt,
+            [:ack, :psh],
+            state.rcv_wnd,
+            payload: payload
+          )
 
-    # Build actions: continue flushing if more data, start RTO timer if not active
-    actions = []
+        packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
+        Tricep.Link.send(state.link, packet)
 
-    actions =
-      if not DataBuffer.empty?(new_send_buffer),
-        do: [{:next_event, :internal, :flush_send_buffer} | actions],
-        else: actions
+        # Track segment for retransmission: {seq_start, seq_end, payload, retransmit_count}
+        unacked_entry = {seq_start, seq_end, payload, 0}
+        new_unacked = state.unacked_segments ++ [unacked_entry]
 
-    # Start RTO timer if not already running
-    {new_state, actions} =
-      if not state.rto_timer_active do
-        {%{new_state | rto_timer_active: true},
-         [{{:timeout, :rto}, state.rto_ms, :retransmit} | actions]}
-      else
-        {new_state, actions}
-      end
+        new_state = %{
+          state
+          | send_buffer: new_send_buffer,
+            snd_nxt: seq_end,
+            unacked_segments: new_unacked
+        }
 
-    {:keep_state, new_state, actions}
+        actions = schedule_flush_send_buffer(new_state, [])
+
+        # Start RTO timer if not already running
+        {new_state, actions} =
+          if not state.rto_timer_active do
+            {%{new_state | rto_timer_active: true},
+             [{{:timeout, :rto}, state.rto_ms, :retransmit} | actions]}
+          else
+            {new_state, actions}
+          end
+
+        {:keep_state, new_state, actions}
+    end
   end
 
   defp reset_state(%__MODULE__{} = state) do
@@ -1207,6 +1213,7 @@ defmodule Tricep.Socket do
 
       # Check if window opened and we have send_waiters
       {new_state, send_waiter_actions} = process_send_waiters(base_state)
+      send_waiter_actions = schedule_flush_send_buffer(new_state, send_waiter_actions)
 
       # Manage RTO timer based on remaining unacked segments
       timer_actions =
@@ -1223,7 +1230,19 @@ defmodule Tricep.Socket do
       # Duplicate or old ACK - just update window (but still check send waiters)
       base_state = %{state | snd_wnd: window}
       {new_state, send_waiter_actions} = process_send_waiters(base_state)
+      send_waiter_actions = schedule_flush_send_buffer(new_state, send_waiter_actions)
       {new_state, send_waiter_actions}
+    end
+  end
+
+  defp schedule_flush_send_buffer(state, actions) do
+    flush_action = {:next_event, :internal, :flush_send_buffer}
+
+    if not DataBuffer.empty?(state.send_buffer) and send_window_available(state) > 0 and
+         flush_action not in actions do
+      actions ++ [flush_action]
+    else
+      actions
     end
   end
 
