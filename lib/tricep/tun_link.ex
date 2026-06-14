@@ -362,18 +362,36 @@ defmodule Tricep.TunLink do
   end
 
   defp handle_icmpv6(data, src, dst, state) do
-    case parse_icmpv6_error(data) do
-      {:ok, event, quoted_packet} ->
-        handle_icmpv6_error(event, quoted_packet, src, dst, state)
+    if valid_icmpv6_checksum?(src, dst, data) do
+      case parse_icmpv6_error(data) do
+        {:ok, event, quoted_packet} ->
+          handle_icmpv6_error(event, quoted_packet, src, dst, state)
 
-      :ignore ->
-        @read_tun_again
+        :ignore ->
+          @read_tun_again
 
-      {:error, reason} ->
-        Logger.warning("Ignoring malformed ICMPv6 packet: #{reason}")
-        @read_tun_again
+        {:error, reason} ->
+          Logger.warning("Ignoring malformed ICMPv6 packet: #{reason}")
+          @read_tun_again
+      end
+    else
+      Logger.warning("Ignoring ICMPv6 packet with invalid checksum")
+      @read_tun_again
     end
   end
+
+  defp valid_icmpv6_checksum?(src, dst, data)
+       when byte_size(src) == 16 and byte_size(dst) == 16 and is_binary(data) and
+              byte_size(data) >= 4 do
+    Tricep.Nifs.checksum([
+      src,
+      dst,
+      <<byte_size(data)::32, 0::24, 58::8>>,
+      data
+    ]) == 0
+  end
+
+  defp valid_icmpv6_checksum?(_src, _dst, _data), do: false
 
   defp parse_icmpv6_error(<<1, code, _checksum::16, _unused::32, quoted_packet::binary>>) do
     {:ok, {:hard, destination_unreachable_reason(code)}, quoted_packet}

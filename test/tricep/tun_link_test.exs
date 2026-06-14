@@ -94,7 +94,7 @@ defmodule Tricep.TunLinkTest do
       socket = establish_connection(local_addr, remote_addr)
       {quoted_packet, _state} = quoted_tcp_packet(socket)
 
-      icmp = <<2, 0, 0::16, 1200::32, quoted_packet::binary>>
+      icmp = icmpv6_error(local_addr, remote_addr, 2, 0, 1200, quoted_packet)
       packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
 
       log =
@@ -108,6 +108,33 @@ defmodule Tricep.TunLinkTest do
         {:established, %{snd_mss: 1220}} -> true
         _state -> false
       end)
+    end
+
+    test "drops ICMPv6 error with invalid checksum without applying it", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(local_addr, remote_addr)
+
+      :sys.replace_state(socket, fn
+        {:established, state} -> {:established, %{state | snd_mss: 1460}}
+      end)
+
+      {quoted_packet, _state} = quoted_tcp_packet(socket)
+
+      icmp =
+        icmpv6_error(local_addr, remote_addr, 2, 0, 1300, quoted_packet)
+        |> corrupt_icmpv6_checksum()
+
+      packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
+
+      log =
+        capture_log(fn ->
+          assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
+        end)
+
+      assert log =~ "Ignoring ICMPv6 packet with invalid checksum"
+      assert {:established, %{snd_mss: 1460}} = :sys.get_state(socket)
     end
 
     test "Destination Unreachable closes affected TCP socket and notifies waiters", %{
@@ -124,7 +151,7 @@ defmodule Tricep.TunLinkTest do
       end)
 
       {quoted_packet, _state} = quoted_tcp_packet(socket)
-      icmp = <<1, 0, 0::16, 0::32, quoted_packet::binary>>
+      icmp = icmpv6_error(local_addr, remote_addr, 1, 0, 0, quoted_packet)
       packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
 
       log =
@@ -290,6 +317,26 @@ defmodule Tricep.TunLinkTest do
         Process.sleep(1)
         wait_for_socket(socket, predicate, deadline, state)
     end
+  end
+
+  defp icmpv6_error(src, dst, type, code, word, quoted_packet) do
+    without_checksum = <<type, code, 0::16, word::32, quoted_packet::binary>>
+    checksum = icmpv6_checksum(src, dst, without_checksum)
+
+    <<type, code, checksum::16, word::32, quoted_packet::binary>>
+  end
+
+  defp icmpv6_checksum(src, dst, payload) do
+    Tricep.Nifs.checksum([
+      src,
+      dst,
+      <<byte_size(payload)::32, 0::24, 58::8>>,
+      payload
+    ])
+  end
+
+  defp corrupt_icmpv6_checksum(<<type, code, checksum::16, rest::binary>>) do
+    <<type, code, Bitwise.bxor(checksum, 0x0001)::16, rest::binary>>
   end
 
   defp corrupt_checksum(segment) do
