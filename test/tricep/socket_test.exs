@@ -521,6 +521,88 @@ defmodule Tricep.SocketTest do
 
       assert Task.await(task, 1000) == :ok
     end
+
+    test "sends RST+ACK for SYN to closed port", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      client_port = 40_030
+      client_seq = 1234
+
+      syn =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          client_seq,
+          0,
+          [:syn],
+          32768
+        )
+
+      DummyLink.inject_packet(link, syn)
+
+      assert_receive {:dummy_link_packet, _link, packet}, 1000
+
+      <<6::4, _::4, _::24, _payload_len::16, 6::8, _hop::8, pkt_src::binary-size(16),
+        pkt_dst::binary-size(16), rst_segment::binary>> = packet
+
+      rst = Tcp.parse_segment(rst_segment)
+
+      assert pkt_src == remote_addr
+      assert pkt_dst == local_addr
+      assert :rst in rst.flags
+      assert :ack in rst.flags
+      assert rst.seq == 0
+      assert rst.ack == client_seq + 1
+    end
+
+    test "sends bare RST for ACK to closed port", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      client_port = 40_031
+      peer_ack = 9000
+
+      ack =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          1234,
+          peer_ack,
+          [:ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, ack)
+
+      assert_receive {:dummy_link_packet, _link, packet}, 1000
+      <<_ip_header::binary-size(40), rst_segment::binary>> = packet
+      rst = Tcp.parse_segment(rst_segment)
+
+      assert :rst in rst.flags
+      refute :ack in rst.flags
+      assert rst.seq == peer_ack
+      assert rst.ack == 0
+    end
+
+    test "does not send RST in response to RST for closed port", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      rst =
+        Tcp.build_segment(
+          {{local_addr, 40_032}, {remote_addr, @port}},
+          1234,
+          0,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst)
+
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+    end
   end
 
   describe "listen/2 and accept/2" do
