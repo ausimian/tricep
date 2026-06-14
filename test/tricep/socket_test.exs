@@ -1352,6 +1352,59 @@ defmodule Tricep.SocketTest do
       assert :ack in parsed.flags
     end
 
+    test "active close drains queued send buffer before FIN", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, mss: 10, window: 1)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "abc") == :ok
+
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+      <<_ip_header::binary-size(40), segment1::binary>> = packet1
+      parsed1 = Tcp.parse_segment(segment1)
+      assert parsed1.payload == "a"
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+      assert Tricep.DataBuffer.size(state.send_buffer) == 2
+
+      assert Tricep.close(socket) == :ok
+      assert Tricep.send(socket, "after close") == {:error, :epipe}
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          wrap_seq(parsed1.seq + byte_size(parsed1.payload)),
+          [:ack],
+          2
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+
+      assert_receive {:dummy_link_packet, _link, packet2}, 1000
+      <<_ip_header::binary-size(40), segment2::binary>> = packet2
+      parsed2 = Tcp.parse_segment(segment2)
+      assert parsed2.payload == "bc"
+
+      assert_receive {:dummy_link_packet, _link, fin_packet}, 1000
+      <<_ip_header::binary-size(40), fin_segment::binary>> = fin_packet
+      fin = Tcp.parse_segment(fin_segment)
+
+      assert :fin in fin.flags
+      assert fin.seq == wrap_seq(parsed2.seq + byte_size(parsed2.payload))
+      assert fin.payload == <<>>
+
+      {:fin_wait_1, fin_wait_state} = :sys.get_state(socket)
+      assert Tricep.DataBuffer.empty?(fin_wait_state.send_buffer)
+    end
+
     test "active close transitions through FIN_WAIT states", %{
       link: link,
       local_addr: local_addr,
@@ -4195,6 +4248,56 @@ defmodule Tricep.SocketTest do
 
       # Should be in FIN_WAIT_1
       {:fin_wait_1, _} = :sys.get_state(socket)
+    end
+
+    test "shutdown(:write) drains queued send buffer before FIN", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, mss: 10, window: 1)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "xyz") == :ok
+
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+      <<_ip_header::binary-size(40), segment1::binary>> = packet1
+      parsed1 = Tcp.parse_segment(segment1)
+      assert parsed1.payload == "x"
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      assert Tricep.shutdown(socket, :write) == :ok
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          wrap_seq(parsed1.seq + byte_size(parsed1.payload)),
+          [:ack],
+          2
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+
+      assert_receive {:dummy_link_packet, _link, packet2}, 1000
+      <<_ip_header::binary-size(40), segment2::binary>> = packet2
+      parsed2 = Tcp.parse_segment(segment2)
+      assert parsed2.payload == "yz"
+
+      assert_receive {:dummy_link_packet, _link, fin_packet}, 1000
+      <<_ip_header::binary-size(40), fin_segment::binary>> = fin_packet
+      fin = Tcp.parse_segment(fin_segment)
+
+      assert :fin in fin.flags
+      assert fin.seq == wrap_seq(parsed2.seq + byte_size(parsed2.payload))
+      assert fin.payload == <<>>
+
+      {:fin_wait_1, _state} = :sys.get_state(socket)
     end
 
     test "shutdown(:read) marks read as shutdown and stays in established", %{
