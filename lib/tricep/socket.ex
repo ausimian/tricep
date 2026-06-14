@@ -580,7 +580,7 @@ defmodule Tricep.Socket do
       state
       | iss: iss,
         snd_una: iss,
-        snd_nxt: iss + 1,
+        snd_nxt: wrap_seq(iss + 1),
         snd_wnd: 0,
         rcv_wnd: rcv_wnd,
         syn_retransmit_count: 0,
@@ -625,6 +625,7 @@ defmodule Tricep.Socket do
         syn? = :syn in flags
         ack? = :ack in flags
         rst? = :rst in flags
+        expected_ack = state.snd_nxt
 
         cond do
           rst? ->
@@ -638,9 +639,9 @@ defmodule Tricep.Socket do
 
             {:next_state, :closed, nil, actions}
 
-          syn? and ack? and ack == state.iss + 1 ->
+          syn? and ack? and ack == expected_ack ->
             # Valid SYN-ACK: send ACK and transition to ESTABLISHED
-            send_ack(seq + 1, state)
+            send_ack(wrap_seq(seq + 1), state)
 
             # Extract peer's MSS from options, default to 1220 (IPv6 min MTU 1280 - 60) if not present
             snd_mss = Map.get(options, :mss, @default_mss)
@@ -649,7 +650,7 @@ defmodule Tricep.Socket do
             new_state = %{
               state
               | irs: seq,
-                rcv_nxt: seq + 1,
+                rcv_nxt: wrap_seq(seq + 1),
                 snd_una: ack,
                 snd_wnd: scale_window(window, snd_wnd_scale),
                 snd_mss: snd_mss,
@@ -669,7 +670,7 @@ defmodule Tricep.Socket do
 
             {:next_state, :established, new_state, actions}
 
-          ack? and ack != state.iss + 1 ->
+          ack? and ack != expected_ack ->
             # Bad ACK: send RST
             send_rst(ack, state)
             :keep_state_and_data
@@ -692,6 +693,7 @@ defmodule Tricep.Socket do
         syn? = :syn in flags
         ack? = :ack in flags
         rst? = :rst in flags
+        expected_ack = state.snd_nxt
 
         cond do
           rst? ->
@@ -700,9 +702,9 @@ defmodule Tricep.Socket do
             {state_name, state_data} = nowait_connect_failure(state, :econnrefused)
             {:next_state, state_name, state_data, actions}
 
-          syn? and ack? and ack == state.iss + 1 ->
+          syn? and ack? and ack == expected_ack ->
             # Valid SYN-ACK: send ACK, notify caller, transition to ESTABLISHED
-            send_ack(seq + 1, state)
+            send_ack(wrap_seq(seq + 1), state)
 
             snd_mss = Map.get(options, :mss, @default_mss)
             snd_wnd_scale = peer_window_scale(options)
@@ -713,7 +715,7 @@ defmodule Tricep.Socket do
             new_state = %{
               state
               | irs: seq,
-                rcv_nxt: seq + 1,
+                rcv_nxt: wrap_seq(seq + 1),
                 snd_una: ack,
                 snd_wnd: scale_window(window, snd_wnd_scale),
                 snd_mss: snd_mss,
@@ -727,7 +729,7 @@ defmodule Tricep.Socket do
             actions = [{{:timeout, :rto}, :cancel}]
             {:next_state, :established, new_state, actions}
 
-          ack? and ack != state.iss + 1 ->
+          ack? and ack != expected_ack ->
             send_rst(ack, state)
             :keep_state_and_data
 
