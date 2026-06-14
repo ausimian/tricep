@@ -28,7 +28,7 @@ defmodule Tricep do
 
   ## Timeout Options
 
-  The `connect/3`, `send/3`, and `recv/3` functions accept a timeout parameter:
+  The `connect/3`, `accept/2`, `send/3`, and `recv/3` functions accept a timeout parameter:
 
     * Integer (milliseconds) - Block up to the specified time, returns `{:error, :timeout}` if exceeded
     * `:infinity` (default) - Block indefinitely until the operation completes
@@ -136,11 +136,11 @@ defmodule Tricep do
   @typedoc """
   Select info returned when an operation would block with `:nowait` timeout.
 
-  The tuple contains the operation type (`:connect`, `:recv`, or `:send`) and
+  The tuple contains the operation type (`:accept`, `:connect`, `:recv`, or `:send`) and
   a unique reference. When the operation can proceed, the caller receives
   `{:"$socket", socket_pid, :select, ref}`.
   """
-  @type select_info :: {:select_info, :connect | :recv | :send, reference()}
+  @type select_info :: {:select_info, :accept | :connect | :recv | :send, reference()}
 
   @doc """
   Connects a socket to a remote address.
@@ -188,6 +188,58 @@ defmodule Tricep do
 
   def connect(socket, address, timeout) when is_pid(socket) do
     Tricep.Socket.connect(socket, address, timeout)
+  end
+
+  @doc """
+  Binds a socket to a local IPv6 address and TCP port.
+
+  ## Arguments
+
+    * `socket` - The socket pid returned by `open/3`
+    * `address` - The local address as a sockaddr_in6 map with keys:
+      * `:family` - Must be `:inet6`
+      * `:addr` - IPv6 address as an 8-tuple, binary, or string
+      * `:port` - Local TCP port
+
+  ## Returns
+
+    * `:ok` - Socket bound successfully
+    * `{:error, :eaddrinuse}` - The address/port is already bound
+    * `{:error, :einval}` - Invalid address or socket state
+  """
+  @spec bind(pid(), :socket.sockaddr_in6()) :: :ok | {:error, atom()}
+  def bind(socket, address) when is_pid(socket) do
+    Tricep.Socket.bind(socket, address)
+  end
+
+  @doc """
+  Marks a bound socket as a TCP listener.
+
+  Incoming SYNs for the bound local address and port are answered with SYN-ACKs,
+  and completed connections are returned by `accept/2`.
+  """
+  @spec listen(pid(), pos_integer()) :: :ok | {:error, atom()}
+  def listen(socket, backlog \\ 5)
+
+  def listen(socket, backlog) when is_pid(socket) do
+    Tricep.Socket.listen(socket, backlog)
+  end
+
+  @doc """
+  Accepts an established inbound TCP connection from a listening socket.
+
+  ## Returns
+
+    * `{:ok, socket}` - A connected child socket
+    * `{:error, :timeout}` - Timed out waiting for a connection
+    * `{:select, select_info}` - No connection is ready with `:nowait`
+  """
+  @spec accept(pid(), socket_timeout()) ::
+          {:ok, pid()} | {:error, atom()} | {:select, select_info()}
+  def accept(socket, timeout \\ :infinity)
+
+  def accept(socket, timeout) when is_pid(socket) do
+    Tricep.Socket.accept(socket, timeout)
   end
 
   @doc """

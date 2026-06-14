@@ -12,7 +12,7 @@ Tricep connects to TUN devices (or other transports) via a Link abstraction and 
 ## Features
 
 - IPv6 support
-- TCP client connections (handshake, data transfer)
+- TCP client and server connections (handshake, data transfer)
 - TUN device integration via [Tundra](https://hex.pm/packages/tundra)
 - Pluggable link layer abstraction
 
@@ -36,5 +36,10 @@ Tricep connects to TUN devices (or other transports) via a Link abstraction and 
 # Open a TCP socket and connect
 {:ok, sock} = Tricep.open(:inet6, :stream, :tcp)
 :ok = Tricep.connect(sock, %{family: :inet6, addr: {0xfd00, 0, 0, 0, 0, 0, 0, 1}, port: 8080})
-```
 
+# Or listen for inbound TCP connections
+{:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+:ok = Tricep.bind(listener, %{family: :inet6, addr: "fd00::2", port: 8080})
+:ok = Tricep.listen(listener)
+{:ok, client} = Tricep.accept(listener)
+```

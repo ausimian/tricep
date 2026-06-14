@@ -8,6 +8,7 @@ defmodule Tricep.Application do
   @link_supervisor Tricep.LinkSupervisor
   @link_registry Tricep.LinkRegistry
   @socket_registry Tricep.SocketRegistry
+  @any_addr <<0::128>>
 
   @impl true
   def start(_type, _args) do
@@ -66,9 +67,7 @@ defmodule Tricep.Application do
 
   @spec register_socket_pair(any()) :: :ok | {:error, {:already_registered, pid()}}
   def register_socket_pair(pair) do
-    with {:ok, _pid} <- Registry.register(@socket_registry, pair, nil) do
-      :ok
-    end
+    register_socket_key(pair)
   end
 
   def deregister_socket_pair(pair) do
@@ -81,6 +80,27 @@ defmodule Tricep.Application do
       [{pid, nil}] -> pid
       [] -> nil
     end
+  end
+
+  def register_bound_socket(addr, port) do
+    register_socket_key(bound_key(addr, port))
+  end
+
+  def deregister_bound_socket(addr, port) do
+    Registry.unregister(@socket_registry, bound_key(addr, port))
+  end
+
+  def register_listener(addr, port) do
+    register_socket_key(listener_key(addr, port))
+  end
+
+  def deregister_listener(addr, port) do
+    Registry.unregister(@socket_registry, listener_key(addr, port))
+  end
+
+  def lookup_listener(dst_addr, dst_port) do
+    lookup_socket_key(listener_key(dst_addr, dst_port)) ||
+      lookup_socket_key(listener_key(@any_addr, dst_port))
   end
 
   defp lookup_route(dstaddr) do
@@ -121,4 +141,20 @@ defmodule Tricep.Application do
     <<prefix::bitstring-size(prefix_len), _suffix::bitstring-size(suffix_len)>> = addr
     <<prefix::bitstring, 0::size(suffix_len)>>
   end
+
+  defp register_socket_key(key) do
+    with {:ok, _pid} <- Registry.register(@socket_registry, key, nil) do
+      :ok
+    end
+  end
+
+  defp lookup_socket_key(key) do
+    case Registry.lookup(@socket_registry, key) do
+      [{pid, nil}] -> pid
+      [] -> nil
+    end
+  end
+
+  defp bound_key(addr, port), do: {:bound, addr, port}
+  defp listener_key(addr, port), do: {:listener, addr, port}
 end
