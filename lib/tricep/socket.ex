@@ -684,8 +684,10 @@ defmodule Tricep.Socket do
             {new_state, timer_actions} = process_ack(state, ack, window)
             {:keep_state, new_state, timer_actions}
 
+          byte_size(payload) > 0 or fin? ->
+            ack_unacceptable_segment(state, ack?, ack, window)
+
           true ->
-            # Out of order or unexpected - ignore for now
             :keep_state_and_data
         end
 
@@ -824,7 +826,7 @@ defmodule Tricep.Socket do
 
   def handle_event(:info, segment, :fin_wait_2, %__MODULE__{} = state) do
     case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: _ack, payload: payload, window: window} ->
+      %{flags: flags, seq: seq, ack: ack, payload: payload, window: window} ->
         fin? = :fin in flags
         ack? = :ack in flags
         rst? = :rst in flags
@@ -862,6 +864,9 @@ defmodule Tricep.Socket do
             send_ack(new_state.rcv_nxt, new_state)
 
             {:keep_state, new_state}
+
+          byte_size(payload) > 0 or fin? ->
+            ack_unacceptable_segment(state, ack?, ack, window)
 
           true ->
             :keep_state_and_data
@@ -1588,6 +1593,12 @@ defmodule Tricep.Socket do
   # Returns {new_state, timer_actions}
   defp process_ack_if_present(state, false, _ack, window), do: {%{state | snd_wnd: window}, []}
   defp process_ack_if_present(state, true, ack, window), do: process_ack(state, ack, window)
+
+  defp ack_unacceptable_segment(state, ack?, ack, window) do
+    {new_state, actions} = process_ack_if_present(state, ack?, ack, window)
+    send_ack(new_state.rcv_nxt, new_state)
+    {:keep_state, new_state, actions}
+  end
 
   defp process_ack(state, ack, window) do
     cond do
