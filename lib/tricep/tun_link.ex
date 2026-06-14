@@ -5,6 +5,8 @@ defmodule Tricep.TunLink do
 
   require Logger
 
+  @read_tun_again {:keep_state_and_data, {:next_event, :internal, :read_tun}}
+
   def child_spec(opts) do
     %{
       id: __MODULE__,
@@ -88,14 +90,18 @@ defmodule Tricep.TunLink do
     {:stop, reason, state}
   end
 
-  defp handle_ip_packet(packet, %__MODULE__{} = state) do
-    <<6::4, _::28, len::16, nh::8, _::8, src::binary-size(16), dst::binary-size(16),
-      rest::binary>> = packet
-
-    handle_ipv6_packet(nh, len, rest, src, dst, state)
+  @doc false
+  def handle_ip_packet(packet, %__MODULE__{} = state) do
+    with {:ok, %{next_header: next_header, payload: payload, src: src, dst: dst}} <-
+           Tricep.Ip.parse(packet),
+         {:ok, protocol, data} <- unwrap_ipv6_payload(next_header, payload) do
+      handle_ipv6_packet(protocol, data, src, dst, state)
+    else
+      _ -> @read_tun_again
+    end
   end
 
-  defp handle_ipv6_packet(prot, len, data, src, dst, state) do
+  defp handle_ipv6_packet(prot, data, src, dst, state) do
     case prot do
       6 ->
         handle_tcp(data, src, dst, state)
@@ -107,27 +113,44 @@ defmodule Tricep.TunLink do
         handle_icmpv6(data, src, dst, state)
 
       59 ->
-        {:keep_state_and_data, {:next_event, :internal, :read_tun}}
+        @read_tun_again
 
       _ ->
-        <<nh::8, hlen::8, _::binary-size(6 + 8 * hlen), rest::binary>> = data
-        handle_ipv6_packet(nh, len - (8 + 8 * hlen), rest, src, dst, state)
+        @read_tun_again
     end
-
-    {:keep_state_and_data, {:next_event, :internal, :read_tun}}
   end
+
+  defp unwrap_ipv6_payload(protocol, payload) when protocol in [6, 17, 58, 59] do
+    {:ok, protocol, payload}
+  end
+
+  # Hop-by-Hop Options, Routing, and Destination Options share the same length format.
+  defp unwrap_ipv6_payload(protocol, <<next_header::8, header_len::8, rest::binary>>)
+       when protocol in [0, 43, 60] do
+    extension_len = 6 + header_len * 8
+
+    case rest do
+      <<_extension_body::binary-size(extension_len), payload::binary>> ->
+        unwrap_ipv6_payload(next_header, payload)
+
+      _ ->
+        {:error, :malformed_extension_header}
+    end
+  end
+
+  defp unwrap_ipv6_payload(_protocol, _payload), do: {:error, :unsupported_protocol}
 
   defp handle_tcp(data, src, dst, _state) do
     Tricep.Socket.handle_packet(src, dst, data)
-    {:keep_state_and_data, {:next_event, :internal, :read_tun}}
+    @read_tun_again
   end
 
   defp handle_udp(data, _src, _dst, _state) do
     Logger.warning("Ignoring UDP packet (#{byte_size(data)} bytes)")
-    {:keep_state_and_data, {:next_event, :internal, :read_tun}}
+    @read_tun_again
   end
 
   defp handle_icmpv6(_data, _src, _dst, _state) do
-    {:keep_state_and_data, {:next_event, :internal, :read_tun}}
+    @read_tun_again
   end
 end
