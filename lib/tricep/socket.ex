@@ -73,7 +73,7 @@ defmodule Tricep.Socket do
           send(listener, {:passive_syn, src_addr, dst_addr, src_port, dst_port, segment})
 
         true ->
-          :ok
+          send_closed_reset(src_addr, dst_addr, src_port, dst_port, segment)
       end
     end
 
@@ -1820,6 +1820,36 @@ defmodule Tricep.Socket do
       _ -> nil
     end
   end
+
+  defp send_closed_reset(src_addr, dst_addr, src_port, dst_port, segment) do
+    with %{flags: flags} = parsed <- Tcp.parse_segment(segment),
+         false <- :rst in flags,
+         {link, {^dst_addr, _mtu}} <- Application.lookup_link(src_addr) do
+      pair = {{dst_addr, dst_port}, {src_addr, src_port}}
+      {seq, ack, rst_flags} = reset_fields(parsed)
+
+      tcp_segment = Tcp.build_segment(pair, seq, ack, rst_flags, 0)
+      packet = Tricep.Ip.wrap(dst_addr, src_addr, :tcp, tcp_segment)
+
+      Tricep.Link.send(link, packet)
+    else
+      _ -> :ok
+    end
+  end
+
+  defp reset_fields(%{flags: flags, ack: ack, seq: seq} = parsed) do
+    if :ack in flags do
+      {ack, 0, [:rst]}
+    else
+      {0, wrap_seq(seq + segment_sequence_length(parsed)), [:rst, :ack]}
+    end
+  end
+
+  defp segment_sequence_length(%{flags: flags, payload: payload}) do
+    byte_size(payload) + flag_sequence_length(flags, :syn) + flag_sequence_length(flags, :fin)
+  end
+
+  defp flag_sequence_length(flags, flag), do: if(flag in flags, do: 1, else: 0)
 
   defp passive_connection_state(opts) do
     %{
