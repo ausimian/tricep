@@ -3265,6 +3265,45 @@ defmodule Tricep.SocketTest do
     socket
   end
 
+  defp start_pending_blocking_connect do
+    {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+    task =
+      Task.async(fn ->
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+      end)
+
+    assert_receive {:dummy_link_packet, _link, _syn_packet}, 1000
+    assert {{:syn_sent, _}, _state} = :sys.get_state(socket)
+
+    {socket, task}
+  end
+
+  defp start_pending_nowait_connect do
+    {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+    assert {:select, {:select_info, :connect, ref}} =
+             Tricep.connect(
+               socket,
+               %{family: :inet6, addr: @local_addr_str, port: @port},
+               :nowait
+             )
+
+    assert is_reference(ref)
+    assert_receive {:dummy_link_packet, _link, _syn_packet}, 1000
+    assert {{:syn_sent, :nowait}, _state} = :sys.get_state(socket)
+
+    socket
+  end
+
+  defp assert_pending_connect_operations_return_enotconn(socket) do
+    assert Tricep.send(socket, "x", :nowait) == {:error, :enotconn}
+    assert Tricep.recv(socket, 0, :nowait) == {:error, :enotconn}
+    assert Tricep.close(socket) == {:error, :enotconn}
+    assert Tricep.shutdown(socket, :write) == {:error, :enotconn}
+    assert Process.alive?(socket)
+  end
+
   # --- Timeout and :nowait tests ---
 
   describe "connect with :nowait" do
@@ -3387,6 +3426,24 @@ defmodule Tricep.SocketTest do
       assert result == {:error, :timeout}
       # Should have waited approximately 200ms (allow some variance)
       assert elapsed >= 180 and elapsed < 400
+    end
+  end
+
+  describe "operations during pending connect" do
+    test "send, recv, close, and shutdown return errors during blocking connect" do
+      {socket, connect_task} = start_pending_blocking_connect()
+
+      assert_pending_connect_operations_return_enotconn(socket)
+      assert {{:syn_sent, _}, _state} = :sys.get_state(socket)
+
+      Task.shutdown(connect_task, :brutal_kill)
+    end
+
+    test "send, recv, close, and shutdown return errors during :nowait connect" do
+      socket = start_pending_nowait_connect()
+
+      assert_pending_connect_operations_return_enotconn(socket)
+      assert {{:syn_sent, :nowait}, _state} = :sys.get_state(socket)
     end
   end
 
