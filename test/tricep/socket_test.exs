@@ -4039,6 +4039,72 @@ defmodule Tricep.SocketTest do
       refute_receive {:dummy_link_packet, _link, _}, 1500
     end
 
+    test "Packet Too Big resegments unacked data before retransmission", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, mss: 1460)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      :sys.replace_state(socket, fn
+        {:established, state} -> {:established, %{state | rto_ms: 100}}
+      end)
+
+      data = :binary.copy("x", 1400)
+      assert Tricep.send(socket, data) == :ok
+
+      assert_receive {:dummy_link_packet, _link, data_packet1}, 1000
+
+      <<_ip_header::binary-size(40), data_segment1::binary>> = data_packet1
+      parsed1 = Tcp.parse_segment(data_segment1)
+
+      assert parsed1.payload == data
+
+      send(socket, {:icmpv6_error, {:packet_too_big, 1300}})
+
+      wait_for_socket(socket, fn
+        {:established, %{snd_mss: 1240, unacked_segments: segments}} ->
+          Enum.map(segments, fn {seq_start, seq_end, payload, _count} ->
+            {seq_start, seq_end, byte_size(payload)}
+          end) == [
+            {parsed1.seq, wrap_seq(parsed1.seq + 1240), 1240},
+            {wrap_seq(parsed1.seq + 1240), wrap_seq(parsed1.seq + 1400), 160}
+          ]
+
+        _state ->
+          false
+      end)
+
+      assert_receive {:dummy_link_packet, _link, data_packet2}, 1000
+
+      <<_ip_header::binary-size(40), data_segment2::binary>> = data_packet2
+      parsed2 = Tcp.parse_segment(data_segment2)
+
+      assert parsed2.seq == parsed1.seq
+      assert parsed2.payload == binary_part(data, 0, 1240)
+    end
+
+    test "Packet Too Big below IPv6 minimum does not reduce MSS below floor", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, mss: 1460)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      send(socket, {:icmpv6_error, {:packet_too_big, 1200}})
+
+      wait_for_socket(socket, fn
+        {:established, %{snd_mss: 1220}} -> true
+        _state -> false
+      end)
+    end
+
     @tag :slow
     test "exponential backoff doubles RTO", %{
       link: link,

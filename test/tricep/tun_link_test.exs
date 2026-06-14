@@ -87,7 +87,7 @@ defmodule Tricep.TunLinkTest do
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
     end
 
-    test "Packet Too Big lowers TCP send MSS and is logged", %{
+    test "Packet Too Big below IPv6 minimum is logged and clamps TCP send MSS", %{
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
@@ -105,7 +105,7 @@ defmodule Tricep.TunLinkTest do
       assert log =~ "ICMPv6 Packet Too Big mtu=1200"
 
       wait_for_socket(socket, fn
-        {:established, %{snd_mss: 1140}} -> true
+        {:established, %{snd_mss: 1220}} -> true
         _state -> false
       end)
     end

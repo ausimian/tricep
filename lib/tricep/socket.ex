@@ -121,8 +121,10 @@ defmodule Tricep.Socket do
 
   use TypedStruct
 
+  @ipv6_min_mtu 1280
+  @tcp_ipv6_header_size 60
   # Default MSS for IPv6 (1280 min MTU - 40 IPv6 header - 20 TCP header)
-  @default_mss 1220
+  @default_mss @ipv6_min_mtu - @tcp_ipv6_header_size
   @default_recv_buffer_size 65_535
   @max_tcp_window 65_535
   @max_window_scale 14
@@ -2692,11 +2694,16 @@ defmodule Tricep.Socket do
   end
 
   defp apply_path_mtu(%__MODULE__{} = state, mtu) when is_integer(mtu) and mtu > 0 do
-    new_mss = max(1, mtu - 60)
+    new_mss = path_mtu_mss(mtu)
     current_mss = state.snd_mss || @default_mss
 
     if new_mss < current_mss do
-      new_state = %{state | snd_mss: new_mss}
+      new_state = %{
+        state
+        | snd_mss: new_mss,
+          unacked_segments: resegment_unacked_segments(state.unacked_segments, new_mss)
+      }
+
       actions = schedule_flush_send_buffer(new_state, [])
       {new_state, actions}
     else
@@ -2705,6 +2712,31 @@ defmodule Tricep.Socket do
   end
 
   defp apply_path_mtu(%__MODULE__{} = state, _mtu), do: {state, []}
+
+  defp path_mtu_mss(mtu), do: max(@default_mss, mtu - @tcp_ipv6_header_size)
+
+  defp resegment_unacked_segments(unacked_segments, mss) do
+    Enum.flat_map(unacked_segments, fn
+      {seq, _seq_end, payload, count} when is_binary(payload) ->
+        resegment_payload(seq, payload, count, mss)
+
+      segment ->
+        [segment]
+    end)
+  end
+
+  defp resegment_payload(_seq, <<>>, _count, _mss), do: []
+
+  defp resegment_payload(seq, payload, count, mss) when byte_size(payload) <= mss do
+    [{seq, wrap_seq(seq + byte_size(payload)), payload, count}]
+  end
+
+  defp resegment_payload(seq, payload, count, mss) do
+    {chunk, rest} = split_binary(payload, mss)
+    next_seq = wrap_seq(seq + byte_size(chunk))
+
+    [{seq, next_seq, chunk, count} | resegment_payload(next_seq, rest, count, mss)]
+  end
 
   # Calculate available send window (for backpressure detection)
   defp send_window_available(state) do
