@@ -308,6 +308,46 @@ defmodule Tricep.TcpTest do
 
       assert parsed.options.mss == 1460
     end
+
+    test "roundtrip preserves extended TCP options" do
+      segment =
+        Tcp.build_segment(
+          {{@src_addr, 54321}, {@dst_addr, 443}},
+          1000,
+          0,
+          [:syn],
+          65535,
+          mss: 1460,
+          window_scale: 7,
+          sack_permitted: true,
+          timestamp: {123_456, 654_321}
+        )
+
+      parsed = Tcp.parse_segment(segment)
+
+      assert parsed.options.mss == 1460
+      assert parsed.options.window_scale == 7
+      assert parsed.options.sack_permitted == true
+      assert parsed.options.timestamp == {123_456, 654_321}
+    end
+
+    test "roundtrip preserves SACK blocks" do
+      blocks = [{1000, 2000}, {3000, 4000}]
+
+      segment =
+        Tcp.build_segment(
+          {{@src_addr, 54321}, {@dst_addr, 443}},
+          1000,
+          0,
+          [:ack],
+          65535,
+          sack_blocks: blocks
+        )
+
+      parsed = Tcp.parse_segment(segment)
+
+      assert parsed.options.sack_blocks == blocks
+    end
   end
 
   describe "MSS option" do
@@ -407,6 +447,26 @@ defmodule Tricep.TcpTest do
       options = <<42, 4, 0xFF, 0xFF, 2, 4, 0x04, 0xC4>>
       parsed = Tcp.parse_options(options)
       assert parsed.mss == 1220
+    end
+
+    test "parse_options extracts window scale" do
+      parsed = Tcp.parse_options(<<3, 3, 9, 0>>)
+      assert parsed.window_scale == 9
+    end
+
+    test "parse_options extracts SACK permitted" do
+      parsed = Tcp.parse_options(<<4, 2, 0, 0>>)
+      assert parsed.sack_permitted == true
+    end
+
+    test "parse_options extracts SACK blocks" do
+      parsed = Tcp.parse_options(<<5, 18, 1000::32, 2000::32, 3000::32, 4000::32>>)
+      assert parsed.sack_blocks == [{1000, 2000}, {3000, 4000}]
+    end
+
+    test "parse_options extracts timestamps" do
+      parsed = Tcp.parse_options(<<8, 10, 123_456::32, 654_321::32, 0, 0>>)
+      assert parsed.timestamp == {123_456, 654_321}
     end
   end
 end

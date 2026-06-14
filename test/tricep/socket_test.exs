@@ -819,6 +819,118 @@ defmodule Tricep.SocketTest do
       {:established, state} = :sys.get_state(socket)
       assert state.snd_mss == 1220
     end
+
+    test "SYN advertises window scale for large receive buffers" do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 1_000_000})
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, packet}, 1000
+
+      <<_ip_header::binary-size(40), tcp_segment::binary>> = packet
+      parsed = Tcp.parse_segment(tcp_segment)
+
+      assert parsed.options.window_scale == 4
+      assert parsed.window == 62_500
+
+      Task.shutdown(task, :brutal_kill)
+    end
+
+    test "stores peer window scale and metadata from SYN-ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn_parsed = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          10,
+          window_scale: 4,
+          sack_permitted: true,
+          timestamp: {123, 456}
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert Task.await(task, 1000) == :ok
+
+      {:established, state} = :sys.get_state(socket)
+
+      assert state.snd_wnd_scale == 4
+      assert state.snd_wnd == 160
+      assert state.peer_sack_permitted == true
+      assert state.peer_timestamp == {123, 456}
+    end
+
+    test "passive open advertises and stores negotiated window scale", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 1_000_000})
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      client_port = 40_010
+      client_seq = 9000
+
+      syn =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          client_seq,
+          0,
+          [:syn],
+          10,
+          mss: 1000,
+          window_scale: 3,
+          sack_permitted: true,
+          timestamp: {321, 654}
+        )
+
+      DummyLink.inject_packet(link, syn)
+
+      assert_receive {:dummy_link_packet, _link, syn_ack_packet}, 1000
+
+      <<_ip_header::binary-size(40), syn_ack_segment::binary>> = syn_ack_packet
+      syn_ack = Tcp.parse_segment(syn_ack_segment)
+
+      assert syn_ack.options.window_scale == 4
+      assert syn_ack.window == 62_500
+
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      assert {:ok, accepted} = Tricep.accept(listener, 1000)
+      on_exit(fn -> stop_socket(accepted) end)
+
+      {:established, state} = :sys.get_state(accepted)
+
+      assert state.snd_wnd_scale == 3
+      assert state.snd_wnd == 262_144
+      assert state.peer_sack_permitted == true
+      assert state.peer_timestamp == {321, 654}
+
+      assert Tricep.close(listener) == :ok
+    end
   end
 
   describe "send/2" do
@@ -4823,6 +4935,8 @@ defmodule Tricep.SocketTest do
   catch
     :exit, :noproc -> :ok
     :exit, {:noproc, _} -> :ok
+    :exit, :shutdown -> :ok
+    :exit, {:shutdown, _} -> :ok
   end
 
   defp stop_link(link) do
