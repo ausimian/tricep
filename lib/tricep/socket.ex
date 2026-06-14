@@ -23,6 +23,11 @@ defmodule Tricep.Socket do
     :gen_statem.call(pid, {:bind, address})
   end
 
+  @spec sockname(pid()) :: {:ok, :socket.sockaddr_in6()} | {:error, atom()}
+  def sockname(pid) when is_pid(pid) do
+    :gen_statem.call(pid, :sockname)
+  end
+
   @spec listen(pid(), pos_integer()) :: :ok | {:error, atom()}
   def listen(pid, backlog \\ 5) when is_pid(pid) do
     :gen_statem.call(pid, {:listen, backlog})
@@ -217,10 +222,10 @@ defmodule Tricep.Socket do
 
   @impl true
   def handle_event({:call, from}, {:bind, address}, :closed, closed_data) do
-    case validate_sockaddr_in6(address) do
+    case validate_sockaddr_in6(address, 0..65_535) do
       {:ok, local_addr, local_port} ->
-        case Application.register_bound_socket(local_addr, local_port) do
-          :ok ->
+        case bind_local_socket(local_addr, local_port) do
+          {:ok, local_port} ->
             data =
               closed_data
               |> Map.put(:local_addr, local_addr)
@@ -228,8 +233,11 @@ defmodule Tricep.Socket do
 
             {:next_state, :bound, data, {:reply, from, :ok}}
 
-          {:error, {:already_registered, _pid}} ->
+          {:error, :eaddrinuse} ->
             {:keep_state_and_data, {:reply, from, {:error, :eaddrinuse}}}
+
+          {:error, :eaddrnotavail} ->
+            {:keep_state_and_data, {:reply, from, {:error, :eaddrnotavail}}}
         end
 
       {:error, reason} ->
@@ -483,6 +491,22 @@ defmodule Tricep.Socket do
       {:error, reason} ->
         {:keep_state_and_data, {:reply, from, {:error, reason}}}
     end
+  end
+
+  def handle_event({:call, from}, :sockname, _state_name, %{
+        local_addr: local_addr,
+        local_port: local_port
+      }) do
+    {:keep_state_and_data, {:reply, from, {:ok, sockaddr_in6(local_addr, local_port)}}}
+  end
+
+  def handle_event(
+        {:call, from},
+        :sockname,
+        _state_name,
+        %__MODULE__{pair: {{local_addr, local_port}, _remote}}
+      ) do
+    {:keep_state_and_data, {:reply, from, {:ok, sockaddr_in6(local_addr, local_port)}}}
   end
 
   # Connect completion after :nowait readiness - consume one retry per registered selector
@@ -1760,6 +1784,10 @@ defmodule Tricep.Socket do
     {:keep_state_and_data, {:reply, from, {:error, :einval}}}
   end
 
+  def handle_event({:call, from}, :sockname, _state, _state_data) do
+    {:keep_state_and_data, {:reply, from, {:error, :einval}}}
+  end
+
   def handle_event({:call, from}, {:connect, _address, _timeout}, _state, _state_data) do
     {:keep_state_and_data, {:reply, from, {:error, :einval}}}
   end
@@ -2291,6 +2319,37 @@ defmodule Tricep.Socket do
   defp bound_connect_source(addr, addr), do: {:ok, addr}
   defp bound_connect_source(_bound_addr, _route_srcaddr), do: {:error, :eaddrnotavail}
 
+  defp bind_local_socket(local_addr, 0), do: allocate_bound_port(local_addr)
+
+  defp bind_local_socket(local_addr, local_port) do
+    case Application.register_bound_socket(local_addr, local_port) do
+      :ok -> {:ok, local_port}
+      {:error, {:already_registered, _pid}} -> {:error, :eaddrinuse}
+    end
+  end
+
+  defp allocate_bound_port(local_addr) do
+    start_offset = System.unique_integer([:positive, :monotonic]) |> rem(@ephemeral_port_count)
+    allocate_bound_port(local_addr, start_offset, 0)
+  end
+
+  defp allocate_bound_port(_local_addr, _start_offset, attempts)
+       when attempts >= @ephemeral_port_count do
+    {:error, :eaddrnotavail}
+  end
+
+  defp allocate_bound_port(local_addr, start_offset, attempts) do
+    port = @ephemeral_port_first + rem(start_offset + attempts, @ephemeral_port_count)
+
+    case Application.register_bound_socket(local_addr, port) do
+      :ok ->
+        {:ok, port}
+
+      {:error, {:already_registered, _pid}} ->
+        allocate_bound_port(local_addr, start_offset, attempts + 1)
+    end
+  end
+
   defp allocate_port(srcaddr_bin, dst) do
     start_offset = System.unique_integer([:positive, :monotonic]) |> rem(@ephemeral_port_count)
     allocate_port(srcaddr_bin, dst, start_offset, 0)
@@ -2316,8 +2375,10 @@ defmodule Tricep.Socket do
 
   # --- Helper functions ---
 
-  defp validate_sockaddr_in6(%{family: :inet6, addr: addr, port: port}) do
-    with true <- is_integer(port) and port in 1..65_535,
+  defp validate_sockaddr_in6(address), do: validate_sockaddr_in6(address, 1..65_535)
+
+  defp validate_sockaddr_in6(%{family: :inet6, addr: addr, port: port}, port_range) do
+    with true <- is_integer(port) and port in port_range,
          {:ok, dstaddr_bin} <- valid_ipv6_address(addr) do
       {:ok, dstaddr_bin, port}
     else
@@ -2325,7 +2386,15 @@ defmodule Tricep.Socket do
     end
   end
 
-  defp validate_sockaddr_in6(_address), do: {:error, :einval}
+  defp validate_sockaddr_in6(_address, _port_range), do: {:error, :einval}
+
+  defp sockaddr_in6(addr, port) do
+    %{family: :inet6, addr: ipv6_tuple(addr), port: port}
+  end
+
+  defp ipv6_tuple(<<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>) do
+    {a, b, c, d, e, f, g, h}
+  end
 
   defp valid_ipv6_address(addr) do
     Tricep.Address.from(addr)
