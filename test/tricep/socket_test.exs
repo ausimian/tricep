@@ -3481,14 +3481,14 @@ defmodule Tricep.SocketTest do
   end
 
   describe "connect with :nowait edge cases" do
-    test "RST during :nowait connect resets socket to closed", %{
+    test "RST during :nowait connect notifies and returns econnrefused on retry", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
 
-      {:select, {:select_info, :connect, _ref}} =
+      {:select, {:select_info, :connect, ref}} =
         Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, :nowait)
 
       # Wait for SYN
@@ -3508,11 +3508,39 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, rst_segment)
 
-      # Socket should be back in closed state
-      {:closed, nil} = :sys.get_state(socket)
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
 
-      # A new connect attempt will start fresh (not return econnrefused since state was reset)
-      # This is expected behavior - the caller never received notification, so they'd retry
+      assert Tricep.connect(
+               socket,
+               %{family: :inet6, addr: @local_addr_str, port: @port},
+               :nowait
+             ) == {:error, :econnrefused}
+
+      {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "SYN retry exhaustion during :nowait connect notifies and returns etimedout" do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      {:select, {:select_info, :connect, ref}} =
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, :nowait)
+
+      assert_receive {:dummy_link_packet, _link, _syn_packet}, 1000
+
+      :sys.replace_state(socket, fn
+        {{:syn_sent, :nowait}, state} ->
+          {{:syn_sent, :nowait}, %{state | syn_retransmit_count: 5}}
+      end)
+
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1500
+
+      assert Tricep.connect(
+               socket,
+               %{family: :inet6, addr: @local_addr_str, port: @port},
+               :nowait
+             ) == {:error, :etimedout}
+
+      {:closed, nil} = :sys.get_state(socket)
     end
 
     test "bad ACK during :nowait connect sends RST", %{
