@@ -1779,6 +1779,129 @@ defmodule Tricep.SocketTest do
       # Should still be in FIN_WAIT_1 (wrong ACK ignored)
       {:fin_wait_1, _} = :sys.get_state(socket)
     end
+
+    test "retransmits lost FIN in FIN_WAIT_1", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.close(socket) == :ok
+
+      assert_receive {:dummy_link_packet, _link, fin_packet1}, 1000
+      <<_ip_header::binary-size(40), fin_segment1::binary>> = fin_packet1
+      parsed1 = Tcp.parse_segment(fin_segment1)
+      fin_seq = parsed1.seq
+
+      assert :fin in parsed1.flags
+      assert parsed1.payload == <<>>
+
+      assert_receive {:dummy_link_packet, _link, fin_packet2}, 1500
+      <<_ip_header::binary-size(40), fin_segment2::binary>> = fin_packet2
+      parsed2 = Tcp.parse_segment(fin_segment2)
+
+      assert :fin in parsed2.flags
+      assert :ack in parsed2.flags
+      assert parsed2.seq == parsed1.seq
+      assert parsed2.payload == <<>>
+
+      {:fin_wait_1, state} = :sys.get_state(socket)
+      assert [{^fin_seq, _seq_end, :fin, 1}] = state.unacked_segments
+    end
+
+    test "ACK of data after close keeps FIN pending in FIN_WAIT_1", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      assert Tricep.send(socket, "data") == :ok
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+
+      <<_ip_header::binary-size(40), data_segment::binary>> = data_packet
+      data = Tcp.parse_segment(data_segment)
+
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, fin_packet}, 1000
+
+      <<_ip_header::binary-size(40), fin_segment::binary>> = fin_packet
+      fin = Tcp.parse_segment(fin_segment)
+
+      {:fin_wait_1, close_state} = :sys.get_state(socket)
+      assert length(close_state.unacked_segments) == 2
+
+      data_ack = wrap_seq(data.seq + byte_size(data.payload))
+
+      ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          data_ack,
+          [:ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, ack_segment)
+
+      {:fin_wait_1, acked_state} = :sys.get_state(socket)
+      assert acked_state.snd_una == data_ack
+      assert [{fin_seq, fin_end, :fin, _count}] = acked_state.unacked_segments
+      assert fin_seq == fin.seq
+      assert fin_end == wrap_seq(fin.seq + 1)
+      assert acked_state.rto_timer_active == true
+
+      fin_ack =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          acked_state.snd_nxt,
+          [:ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, fin_ack)
+
+      {:fin_wait_2, fin_acked_state} = :sys.get_state(socket)
+      assert fin_acked_state.unacked_segments == []
+      assert fin_acked_state.rto_timer_active == false
+    end
+
+    test "FIN retry exhaustion closes FIN_WAIT_1", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      :sys.replace_state(socket, fn
+        {:fin_wait_1, state} ->
+          unacked_segments =
+            Enum.map(state.unacked_segments, fn {seq_start, seq_end, payload, _count} ->
+              {seq_start, seq_end, payload, 5}
+            end)
+
+          {:fin_wait_1, %{state | unacked_segments: unacked_segments}}
+      end)
+
+      wait_for_state_name(socket, :closed, 1500)
+    end
   end
 
   describe "FIN_WAIT_2 state" do
@@ -2721,6 +2844,57 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, our_fin_ack)
 
       {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "retransmits lost FIN in LAST_ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      fin_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:fin, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+
+      {:close_wait, _close_wait_state} = :sys.get_state(socket)
+
+      # Drain ACK for their FIN
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      assert Tricep.close(socket) == :ok
+
+      assert_receive {:dummy_link_packet, _link, fin_packet1}, 1000
+      <<_ip_header::binary-size(40), fin_segment1::binary>> = fin_packet1
+      parsed1 = Tcp.parse_segment(fin_segment1)
+
+      assert :fin in parsed1.flags
+      assert parsed1.payload == <<>>
+
+      assert_receive {:dummy_link_packet, _link, fin_packet2}, 1500
+      <<_ip_header::binary-size(40), fin_segment2::binary>> = fin_packet2
+      parsed2 = Tcp.parse_segment(fin_segment2)
+
+      assert :fin in parsed2.flags
+      assert :ack in parsed2.flags
+      assert parsed2.seq == parsed1.seq
+      assert parsed2.payload == <<>>
+
+      {:last_ack, state} = :sys.get_state(socket)
+      assert [{_seq, _seq_end, :fin, 1}] = state.unacked_segments
     end
 
     test "ignores malformed segment in LAST_ACK", %{

@@ -104,7 +104,7 @@ defmodule Tricep.Socket do
     field :recv_waiters, list(), default: []
     # Track if peer has sent FIN (EOF)
     field :fin_received, boolean(), default: false
-    # Retransmission support: list of {seq_start, seq_end, payload, retransmit_count}
+    # Retransmission support: list of {seq_start, seq_end, payload | :fin, retransmit_count}
     field :unacked_segments, list(), default: []
     # Current RTO in milliseconds
     field :rto_ms, non_neg_integer(), default: 1_000
@@ -684,21 +684,31 @@ defmodule Tricep.Socket do
     do_retransmit(state)
   end
 
+  def handle_event({:timeout, :rto}, :retransmit, :fin_wait_1, %__MODULE__{} = state) do
+    do_retransmit(state)
+  end
+
+  def handle_event({:timeout, :rto}, :retransmit, :closing, %__MODULE__{} = state) do
+    do_retransmit(state)
+  end
+
+  def handle_event({:timeout, :rto}, :retransmit, :last_ack, %__MODULE__{} = state) do
+    do_retransmit(state)
+  end
+
   # --- Active close from established ---
 
   def handle_event({:call, from}, :close, :established, %__MODULE__{} = state) do
-    send_fin(state)
-    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1)}
-    {:next_state, :fin_wait_1, new_state, {:reply, from, :ok}}
+    {new_state, actions} = send_fin_and_track(state)
+    {:next_state, :fin_wait_1, new_state, [{:reply, from, :ok} | actions]}
   end
 
   # --- Shutdown from established ---
 
   # shutdown(:write) - send FIN, transition to fin_wait_1
   def handle_event({:call, from}, {:shutdown, :write}, :established, %__MODULE__{} = state) do
-    send_fin(state)
-    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1)}
-    {:next_state, :fin_wait_1, new_state, {:reply, from, :ok}}
+    {new_state, actions} = send_fin_and_track(state)
+    {:next_state, :fin_wait_1, new_state, [{:reply, from, :ok} | actions]}
   end
 
   # shutdown(:read) - just mark read as shutdown, stay in established
@@ -709,9 +719,8 @@ defmodule Tricep.Socket do
 
   # shutdown(:read_write) - same as close
   def handle_event({:call, from}, {:shutdown, :read_write}, :established, %__MODULE__{} = state) do
-    send_fin(state)
-    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1), read_shutdown: true}
-    {:next_state, :fin_wait_1, new_state, {:reply, from, :ok}}
+    {new_state, actions} = send_fin_and_track(%{state | read_shutdown: true})
+    {:next_state, :fin_wait_1, new_state, [{:reply, from, :ok} | actions]}
   end
 
   # --- FIN_WAIT_1 state ---
@@ -724,29 +733,36 @@ defmodule Tricep.Socket do
         rst? = :rst in flags
         ack_of_fin? = ack? and ack == state.snd_nxt
 
+        {ack_state, ack_actions} =
+          if rst?, do: {state, []}, else: process_ack_if_present(state, ack?, ack, window)
+
         cond do
           rst? ->
             reset_state(state)
-            {:next_state, :closed, nil}
+            {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
 
           fin? and ack_of_fin? ->
             # FIN+ACK of our FIN - go directly to TIME_WAIT
-            send_ack(seq + 1, %{state | rcv_nxt: seq + 1})
-            new_state = %{state | rcv_nxt: wrap_seq(seq + 1), snd_wnd: window, fin_received: true}
+            new_rcv_nxt = wrap_seq(seq + 1)
+            new_state = %{ack_state | rcv_nxt: new_rcv_nxt, fin_received: true}
+            send_ack(new_rcv_nxt, new_state)
 
             {:next_state, :time_wait, new_state,
-             {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+             ack_actions ++ [{{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}]}
 
           fin? ->
             # FIN but not ACK of our FIN - simultaneous close
-            send_ack(seq + 1, %{state | rcv_nxt: seq + 1})
-            new_state = %{state | rcv_nxt: wrap_seq(seq + 1), snd_wnd: window, fin_received: true}
-            {:next_state, :closing, new_state}
+            new_rcv_nxt = wrap_seq(seq + 1)
+            new_state = %{ack_state | rcv_nxt: new_rcv_nxt, fin_received: true}
+            send_ack(new_rcv_nxt, new_state)
+            {:next_state, :closing, new_state, ack_actions}
 
           ack_of_fin? ->
             # ACK of our FIN - move to FIN_WAIT_2
-            new_state = %{state | snd_wnd: window}
-            {:next_state, :fin_wait_2, new_state}
+            {:next_state, :fin_wait_2, ack_state, ack_actions}
+
+          ack? ->
+            {:keep_state, ack_state, ack_actions}
 
           true ->
             :keep_state_and_data
@@ -840,17 +856,21 @@ defmodule Tricep.Socket do
         rst? = :rst in flags
         ack_of_fin? = ack? and ack == state.snd_nxt
 
+        {ack_state, ack_actions} =
+          if rst?, do: {state, []}, else: process_ack_if_present(state, ack?, ack, window)
+
         cond do
           rst? ->
             reset_state(state)
-            {:next_state, :closed, nil}
+            {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
 
           ack_of_fin? ->
             # ACK of our FIN - go to TIME_WAIT
-            new_state = %{state | snd_wnd: window}
+            {:next_state, :time_wait, ack_state,
+             ack_actions ++ [{{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}]}
 
-            {:next_state, :time_wait, new_state,
-             {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+          ack? ->
+            {:keep_state, ack_state, ack_actions}
 
           true ->
             :keep_state_and_data
@@ -944,16 +964,14 @@ defmodule Tricep.Socket do
   end
 
   def handle_event({:call, from}, :close, :close_wait, %__MODULE__{} = state) do
-    send_fin(state)
-    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1)}
-    {:next_state, :last_ack, new_state, {:reply, from, :ok}}
+    {new_state, actions} = send_fin_and_track(state)
+    {:next_state, :last_ack, new_state, [{:reply, from, :ok} | actions]}
   end
 
   # shutdown(:write) in close_wait - send FIN, go to last_ack
   def handle_event({:call, from}, {:shutdown, :write}, :close_wait, %__MODULE__{} = state) do
-    send_fin(state)
-    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1)}
-    {:next_state, :last_ack, new_state, {:reply, from, :ok}}
+    {new_state, actions} = send_fin_and_track(state)
+    {:next_state, :last_ack, new_state, [{:reply, from, :ok} | actions]}
   end
 
   # shutdown(:read) in close_wait - already received FIN, just mark it
@@ -964,9 +982,8 @@ defmodule Tricep.Socket do
 
   # shutdown(:read_write) in close_wait - send FIN, go to last_ack
   def handle_event({:call, from}, {:shutdown, :read_write}, :close_wait, %__MODULE__{} = state) do
-    send_fin(state)
-    new_state = %{state | snd_nxt: wrap_seq(state.snd_nxt + 1), read_shutdown: true}
-    {:next_state, :last_ack, new_state, {:reply, from, :ok}}
+    {new_state, actions} = send_fin_and_track(%{state | read_shutdown: true})
+    {:next_state, :last_ack, new_state, [{:reply, from, :ok} | actions]}
   end
 
   def handle_event(:info, segment, :close_wait, %__MODULE__{} = state) do
@@ -996,20 +1013,26 @@ defmodule Tricep.Socket do
 
   def handle_event(:info, segment, :last_ack, %__MODULE__{} = state) do
     case Tcp.parse_segment(segment) do
-      %{flags: flags, ack: ack} ->
+      %{flags: flags, ack: ack, window: window} ->
         rst? = :rst in flags
         ack? = :ack in flags
         ack_of_fin? = ack? and ack == state.snd_nxt
 
+        {ack_state, ack_actions} =
+          if rst?, do: {state, []}, else: process_ack_if_present(state, ack?, ack, window)
+
         cond do
           rst? ->
             reset_state(state)
-            {:next_state, :closed, nil}
+            {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
 
           ack_of_fin? ->
             # ACK of our FIN - connection fully closed
-            reset_state(state)
-            {:next_state, :closed, nil}
+            reset_state(ack_state)
+            {:next_state, :closed, nil, ack_actions}
+
+          ack? ->
+            {:keep_state, ack_state, ack_actions}
 
           true ->
             :keep_state_and_data
@@ -1064,9 +1087,39 @@ defmodule Tricep.Socket do
     {:keep_state, %{state | rto_timer_active: false}}
   end
 
+  defp do_retransmit(%__MODULE__{unacked_segments: [{seq, seq_end, :fin, count} | rest]} = state) do
+    if count >= @max_retransmit_count do
+      # Max retries exceeded - connection failure
+      reset_state(state)
+      actions = notify_waiters_error(state, :etimedout)
+      {:next_state, :closed, nil, actions}
+    else
+      send_fin_segment(state, seq)
+
+      # Update segment with incremented retransmit count
+      updated_entry = {seq, seq_end, :fin, count + 1}
+      new_unacked = [updated_entry | rest]
+
+      # Exponential backoff
+      new_rto = min(state.rto_ms * 2, @max_rto_ms)
+
+      new_state = %{
+        state
+        | unacked_segments: new_unacked,
+          rto_ms: new_rto,
+          rto_timer_active: true
+      }
+
+      # Schedule next RTO timer
+      actions = [{{:timeout, :rto}, new_rto, :retransmit}]
+      {:keep_state, new_state, actions}
+    end
+  end
+
   defp do_retransmit(
          %__MODULE__{unacked_segments: [{seq, _seq_end, payload, count} | rest]} = state
-       ) do
+       )
+       when is_binary(payload) do
     if count >= @max_retransmit_count do
       # Max retries exceeded - connection failure
       reset_state(state)
@@ -1237,13 +1290,32 @@ defmodule Tricep.Socket do
     Tricep.Link.send(state.link, packet)
   end
 
-  defp send_fin(%__MODULE__{} = state) do
+  defp send_fin_and_track(%__MODULE__{} = state) do
+    seq_start = state.snd_nxt
+    seq_end = wrap_seq(seq_start + 1)
+
+    send_fin_segment(state, seq_start)
+
+    new_state = %{
+      state
+      | snd_nxt: seq_end,
+        unacked_segments: state.unacked_segments ++ [{seq_start, seq_end, :fin, 0}]
+    }
+
+    if state.rto_timer_active do
+      {new_state, []}
+    else
+      {%{new_state | rto_timer_active: true}, [{{:timeout, :rto}, state.rto_ms, :retransmit}]}
+    end
+  end
+
+  defp send_fin_segment(%__MODULE__{} = state, seq) do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
       Tcp.build_segment(
         state.pair,
-        state.snd_nxt,
+        seq,
         state.rcv_nxt,
         [:fin, :ack],
         receive_window(state)
@@ -1393,6 +1465,9 @@ defmodule Tricep.Socket do
 
   # Process ACK and update retransmission queue
   # Returns {new_state, timer_actions}
+  defp process_ack_if_present(state, false, _ack, window), do: {%{state | snd_wnd: window}, []}
+  defp process_ack_if_present(state, true, ack, window), do: process_ack(state, ack, window)
+
   defp process_ack(state, ack, window) do
     cond do
       seq_gt(ack, state.snd_nxt) ->
