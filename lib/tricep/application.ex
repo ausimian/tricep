@@ -36,12 +36,32 @@ defmodule Tricep.Application do
     end
   end
 
+  def register_route(srcaddr, dstaddr, prefix_len, mtu)
+      when is_integer(prefix_len) and prefix_len in 0..128 do
+    route_key = route_key(dstaddr, prefix_len)
+
+    with {:ok, _pid} <- Registry.register(@link_registry, route_key, {srcaddr, mtu}) do
+      :ok
+    end
+  end
+
   def lookup_link(dstaddr) do
-    List.first(Registry.lookup(@link_registry, dstaddr))
+    case Registry.lookup(@link_registry, dstaddr) do
+      [{_pid, {_srcaddr, _mtu}} | _] = exact_matches ->
+        List.first(exact_matches)
+
+      [] ->
+        lookup_route(dstaddr)
+    end
   end
 
   def deregister_link(dstaddr) do
     Registry.unregister(@link_registry, dstaddr)
+  end
+
+  def deregister_route(dstaddr, prefix_len)
+      when is_integer(prefix_len) and prefix_len in 0..128 do
+    Registry.unregister(@link_registry, route_key(dstaddr, prefix_len))
   end
 
   @spec register_socket_pair(any()) :: :ok | {:error, {:already_registered, pid()}}
@@ -61,5 +81,44 @@ defmodule Tricep.Application do
       [{pid, nil}] -> pid
       [] -> nil
     end
+  end
+
+  defp lookup_route(dstaddr) do
+    route =
+      @link_registry
+      |> Registry.select([{{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}])
+      |> Enum.flat_map(fn
+        {{:route, prefix, prefix_len}, pid, {srcaddr, mtu}} ->
+          if prefix_match?(dstaddr, prefix, prefix_len) do
+            [{prefix_len, pid, {srcaddr, mtu}}]
+          else
+            []
+          end
+
+        _entry ->
+          []
+      end)
+      |> Enum.max_by(fn {prefix_len, _pid, _link} -> prefix_len end, fn -> nil end)
+
+    case route do
+      nil -> nil
+      {_prefix_len, pid, link} -> {pid, link}
+    end
+  end
+
+  defp route_key(addr, prefix_len), do: {:route, route_prefix(addr, prefix_len), prefix_len}
+
+  defp prefix_match?(addr, prefix, prefix_len) do
+    route_prefix(addr, prefix_len) == prefix
+  end
+
+  defp route_prefix(_addr, 0), do: <<0::128>>
+
+  defp route_prefix(addr, 128) when byte_size(addr) == 16, do: addr
+
+  defp route_prefix(addr, prefix_len) when byte_size(addr) == 16 do
+    suffix_len = 128 - prefix_len
+    <<prefix::bitstring-size(prefix_len), _suffix::bitstring-size(suffix_len)>> = addr
+    <<prefix::bitstring, 0::size(suffix_len)>>
   end
 end
