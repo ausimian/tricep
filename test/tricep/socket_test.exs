@@ -54,6 +54,25 @@ defmodule Tricep.SocketTest do
       Task.shutdown(task, :brutal_kill)
     end
 
+    test "advertises configured receive buffer size in SYN" do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 4096})
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, packet}, 1000
+
+      <<_ip_header::binary-size(40), tcp_segment::binary>> = packet
+      parsed = Tcp.parse_segment(tcp_segment)
+
+      assert :syn in parsed.flags
+      assert parsed.window == 4096
+
+      Task.shutdown(task, :brutal_kill)
+    end
+
     test "transitions to established on valid SYN-ACK", %{
       link: link,
       local_addr: local_addr,
@@ -791,6 +810,96 @@ defmodule Tricep.SocketTest do
       ack_parsed = Tcp.parse_segment(ack_seg)
       assert :ack in ack_parsed.flags
       assert ack_parsed.ack == state.irs + 1 + byte_size("Hello from peer")
+    end
+
+    test "advertised receive window shrinks with buffered data and reopens on recv", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(link, local_addr, remote_addr, open_opts: %{recv_buffer_size: 10})
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
+          payload: "abcdef"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_::binary-size(40), ack_segment::binary>> = ack_packet
+      ack_parsed = Tcp.parse_segment(ack_segment)
+
+      assert ack_parsed.ack == state.irs + 1 + byte_size("abcdef")
+      assert ack_parsed.window == 4
+
+      {:established, buffered_state} = :sys.get_state(socket)
+      assert buffered_state.rcv_wnd == 4
+      assert buffered_state.recv_buffer == "abcdef"
+
+      assert Tricep.recv(socket, 3, 1000) == {:ok, "abc"}
+
+      assert_receive {:dummy_link_packet, _link, update_packet}, 1000
+      <<_::binary-size(40), update_segment::binary>> = update_packet
+      update_parsed = Tcp.parse_segment(update_segment)
+
+      assert update_parsed.ack == ack_parsed.ack
+      assert update_parsed.window == 7
+
+      {:established, reopened_state} = :sys.get_state(socket)
+      assert reopened_state.rcv_wnd == 7
+      assert reopened_state.recv_buffer == "def"
+    end
+
+    test "receive buffer caps accepted payload to advertised window", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(link, local_addr, remote_addr, open_opts: %{recv_buffer_size: 5})
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
+          payload: "123456789"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_::binary-size(40), ack_segment::binary>> = ack_packet
+      ack_parsed = Tcp.parse_segment(ack_segment)
+
+      assert ack_parsed.ack == state.irs + 1 + 5
+      assert ack_parsed.window == 0
+
+      {:established, buffered_state} = :sys.get_state(socket)
+      assert buffered_state.recv_buffer == "12345"
+      assert buffered_state.rcv_nxt == state.irs + 1 + 5
+      assert buffered_state.rcv_wnd == 0
     end
 
     test "blocks until data arrives", %{
@@ -3271,7 +3380,8 @@ defmodule Tricep.SocketTest do
 
   # Helper to establish a connection and return the socket
   defp establish_connection(link, local_addr, remote_addr, opts \\ []) do
-    {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+    open_opts = Keyword.get(opts, :open_opts, %{})
+    {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, open_opts)
 
     task =
       Task.async(fn ->

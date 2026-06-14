@@ -57,6 +57,8 @@ defmodule Tricep do
     * `domain` - The address family, must be `:inet6`
     * `type` - The socket type, must be `:stream`
     * `protocol` - The protocol (`:tcp`, `:default`, or a map of options)
+      * `:recv_buffer_size` - Maximum buffered receive bytes and advertised receive window
+        before TCP window scaling (default: 65535, capped at 65535)
 
   ## Returns
 
@@ -94,7 +96,9 @@ defmodule Tricep do
     * `domain` - The address family, must be `:inet6`
     * `type` - The socket type, must be `:stream`
     * `protocol` - The protocol (`:tcp` or `:default`)
-    * `opts` - A map of socket options (currently unused, reserved for future use)
+    * `opts` - A map of socket options:
+      * `:recv_buffer_size` - Maximum buffered receive bytes and advertised receive window
+        before TCP window scaling (default: 65535, capped at 65535)
 
   ## Returns
 

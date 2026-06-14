@@ -73,6 +73,8 @@ defmodule Tricep.Socket do
 
   # Default MSS for IPv6 (1280 min MTU - 40 IPv6 header - 20 TCP header)
   @default_mss 1220
+  @default_recv_buffer_size 65_535
+  @max_tcp_window 65_535
 
   # Retransmission timeout constants
   @initial_rto_ms 1_000
@@ -97,6 +99,7 @@ defmodule Tricep.Socket do
     # Buffers for data transfer
     field :send_buffer, DataBuffer.t(), default: DataBuffer.new()
     field :recv_buffer, binary(), default: <<>>
+    field :recv_buffer_size, pos_integer(), default: @default_recv_buffer_size
     # Callers waiting on recv (list of {from, length, timer_ref})
     field :recv_waiters, list(), default: []
     # Track if peer has sent FIN (EOF)
@@ -126,19 +129,28 @@ defmodule Tricep.Socket do
   def callback_mode, do: :handle_event_function
 
   @impl true
-  def init(_opts) do
-    {:ok, :closed, nil}
+  def init(opts) do
+    {:ok, :closed, %{socket_opts: socket_opts(opts)}}
   end
 
   @impl true
-  def handle_event({:call, from}, {:connect, address, timeout}, :closed, nil) do
+  def handle_event({:call, from}, {:connect, address, timeout}, :closed, closed_data) do
     case validate_sockaddr_in6(address) do
       {:ok, dstaddr_bin, dst_port} ->
         case Application.lookup_link(dstaddr_bin) do
           {pid, {srcaddr_bin, mtu}} ->
             pair = allocate_port(srcaddr_bin, {dstaddr_bin, dst_port})
             send_syn = {:next_event, :internal, {:send_syn, from, timeout}}
-            state = %__MODULE__{pair: pair, link: pid, rcv_mss: mtu - 60}
+            recv_buffer_size = recv_buffer_size(closed_data)
+
+            state = %__MODULE__{
+              pair: pair,
+              link: pid,
+              rcv_mss: mtu - 60,
+              recv_buffer_size: recv_buffer_size,
+              rcv_wnd: recv_buffer_size
+            }
+
             {:next_state, :closed, state, send_syn}
 
           nil ->
@@ -176,7 +188,7 @@ defmodule Tricep.Socket do
 
   def handle_event(:internal, {:send_syn, from, timeout}, :closed, %__MODULE__{} = state) do
     iss = :crypto.strong_rand_bytes(4) |> :binary.decode_unsigned()
-    rcv_wnd = 65535
+    rcv_wnd = receive_window(state)
 
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
@@ -413,7 +425,7 @@ defmodule Tricep.Socket do
   # --- Send in invalid states ---
 
   # Not connected
-  def handle_event({:call, from}, {:send, _data, _timeout}, :closed, nil) do
+  def handle_event({:call, from}, {:send, _data, _timeout}, :closed, _state_data) do
     {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
   end
 
@@ -493,7 +505,12 @@ defmodule Tricep.Socket do
   def handle_event({:call, from}, {:recv, length, timeout}, :established, %__MODULE__{} = state) do
     case deliver_data(state.recv_buffer, length) do
       {:ok, data, rest} ->
-        new_state = %{state | recv_buffer: rest}
+        new_state =
+          state
+          |> Map.put(:recv_buffer, rest)
+          |> refresh_receive_window()
+          |> maybe_send_window_update(state)
+
         {:keep_state, new_state, {:reply, from, {:ok, data}}}
 
       :wait ->
@@ -564,8 +581,7 @@ defmodule Tricep.Socket do
           fin? and seq == state.rcv_nxt ->
             # FIN from peer - handle any data with it, then transition to CLOSE_WAIT
             data_len = byte_size(payload)
-            new_rcv_nxt = wrap_seq(state.rcv_nxt + data_len + 1)
-            new_recv_buffer = state.recv_buffer <> payload
+            {receive_state, accepted_len} = receive_payload(state, payload)
 
             new_snd_una =
               if ack? and seq_gt(ack, state.snd_una) and seq_leq(ack, state.snd_nxt) do
@@ -574,70 +590,72 @@ defmodule Tricep.Socket do
                 state.snd_una
               end
 
-            # Send ACK for FIN (and any data)
-            send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
+            if accepted_len == data_len do
+              # Send ACK for FIN (and any data) after waiters consume buffered bytes.
+              fin_state = %{receive_state | rcv_nxt: wrap_seq(receive_state.rcv_nxt + 1)}
 
-            # Notify :nowait recv caller if pending
-            new_recv_select =
-              case state.recv_select do
-                {caller_pid, ref, _length} ->
-                  notify_select(caller_pid, ref)
-                  nil
+              receive_state =
+                fin_state
+                |> notify_recv_select(:eof)
+                |> Map.put(:snd_una, new_snd_una)
+                |> Map.put(:snd_wnd, window)
 
-                nil ->
-                  nil
-              end
+              # Notify waiters: deliver buffered data or EOF
+              {new_recv_buffer, new_waiters, replies} =
+                process_waiters_eof(receive_state.recv_buffer, receive_state.recv_waiters)
 
-            # Notify waiters: deliver buffered data or EOF
-            {new_recv_buffer, new_waiters, replies} =
-              process_waiters_eof(new_recv_buffer, state.recv_waiters)
+              new_state =
+                receive_state
+                |> Map.put(:recv_buffer, new_recv_buffer)
+                |> Map.put(:recv_waiters, new_waiters)
+                |> Map.put(:fin_received, true)
+                |> refresh_receive_window()
 
-            new_state = %{
-              state
-              | rcv_nxt: new_rcv_nxt,
-                recv_buffer: new_recv_buffer,
-                recv_waiters: new_waiters,
-                recv_select: new_recv_select,
-                snd_una: new_snd_una,
-                snd_wnd: window,
-                fin_received: true
-            }
+              send_ack(new_state.rcv_nxt, new_state)
 
-            {:next_state, :close_wait, new_state, replies}
+              {:next_state, :close_wait, new_state, replies}
+            else
+              receive_state = notify_recv_select(receive_state, accepted_len)
+
+              {new_recv_buffer, new_waiters, replies} =
+                process_waiters(receive_state.recv_buffer, receive_state.recv_waiters)
+
+              receive_state =
+                receive_state
+                |> Map.put(:recv_buffer, new_recv_buffer)
+                |> Map.put(:recv_waiters, new_waiters)
+                |> refresh_receive_window()
+
+              {new_state, timer_actions} =
+                if ack? do
+                  process_ack(receive_state, ack, window)
+                else
+                  {%{receive_state | snd_wnd: window}, []}
+                end
+
+              send_ack(new_state.rcv_nxt, new_state)
+
+              {:keep_state, new_state, replies ++ timer_actions}
+            end
 
           ack? and seq == state.rcv_nxt and byte_size(payload) > 0 ->
             # Data segment with expected sequence number
-            new_rcv_nxt = wrap_seq(state.rcv_nxt + byte_size(payload))
-            new_recv_buffer = state.recv_buffer <> payload
-
-            # Send ACK for received data
-            send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
-
-            # Notify :nowait recv caller if pending
-            new_recv_select =
-              case state.recv_select do
-                {caller_pid, ref, _length} ->
-                  notify_select(caller_pid, ref)
-                  nil
-
-                nil ->
-                  nil
-              end
+            {receive_state, accepted_len} = receive_payload(state, payload)
+            receive_state = notify_recv_select(receive_state, accepted_len)
 
             # Check if any blocking waiters can be satisfied
             {new_recv_buffer, new_waiters, replies} =
-              process_waiters(new_recv_buffer, state.recv_waiters)
+              process_waiters(receive_state.recv_buffer, receive_state.recv_waiters)
 
             # Process ACK portion to update retransmission queue
-            {ack_state, timer_actions} = process_ack(state, ack, window)
+            receive_state =
+              receive_state
+              |> Map.put(:recv_buffer, new_recv_buffer)
+              |> Map.put(:recv_waiters, new_waiters)
+              |> refresh_receive_window()
 
-            new_state = %{
-              ack_state
-              | rcv_nxt: new_rcv_nxt,
-                recv_buffer: new_recv_buffer,
-                recv_waiters: new_waiters,
-                recv_select: new_recv_select
-            }
+            {new_state, timer_actions} = process_ack(receive_state, ack, window)
+            send_ack(new_state.rcv_nxt, new_state)
 
             {:keep_state, new_state, replies ++ timer_actions}
 
@@ -756,24 +774,29 @@ defmodule Tricep.Socket do
           fin? and seq == state.rcv_nxt ->
             # FIN from peer - ACK it and go to TIME_WAIT
             # Handle any data that came with the FIN
-            new_rcv_nxt = wrap_seq(state.rcv_nxt + byte_size(payload) + 1)
-            send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
-            new_state = %{state | rcv_nxt: new_rcv_nxt, snd_wnd: window, fin_received: true}
+            data_len = byte_size(payload)
+            {receive_state, accepted_len} = receive_payload(%{state | snd_wnd: window}, payload)
 
-            {:next_state, :time_wait, new_state,
-             {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+            if accepted_len == data_len do
+              new_state =
+                receive_state
+                |> Map.put(:rcv_nxt, wrap_seq(receive_state.rcv_nxt + 1))
+                |> Map.put(:fin_received, true)
+                |> refresh_receive_window()
+
+              send_ack(new_state.rcv_nxt, new_state)
+
+              {:next_state, :time_wait, new_state,
+               {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}}
+            else
+              send_ack(receive_state.rcv_nxt, receive_state)
+              {:keep_state, receive_state}
+            end
 
           ack? and seq == state.rcv_nxt and byte_size(payload) > 0 ->
             # Data segment - half-close allows peer to still send data
-            new_rcv_nxt = wrap_seq(state.rcv_nxt + byte_size(payload))
-            send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
-
-            new_state = %{
-              state
-              | rcv_nxt: new_rcv_nxt,
-                recv_buffer: state.recv_buffer <> payload,
-                snd_wnd: window
-            }
+            {new_state, _accepted_len} = receive_payload(%{state | snd_wnd: window}, payload)
+            send_ack(new_state.rcv_nxt, new_state)
 
             {:keep_state, new_state}
 
@@ -906,7 +929,12 @@ defmodule Tricep.Socket do
   def handle_event({:call, from}, {:recv, length, _timeout}, :close_wait, %__MODULE__{} = state) do
     case deliver_data(state.recv_buffer, length) do
       {:ok, data, rest} ->
-        new_state = %{state | recv_buffer: rest}
+        new_state =
+          state
+          |> Map.put(:recv_buffer, rest)
+          |> refresh_receive_window()
+          |> maybe_send_window_update(state)
+
         {:keep_state, new_state, {:reply, from, {:ok, data}}}
 
       :wait ->
@@ -1016,7 +1044,9 @@ defmodule Tricep.Socket do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(state.pair, state.iss, 0, [:syn], state.rcv_wnd, mss: state.rcv_mss)
+      Tcp.build_segment(state.pair, state.iss, 0, [:syn], receive_window(state),
+        mss: state.rcv_mss
+      )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     :ok = Tricep.Link.send(state.link, packet)
@@ -1052,7 +1082,7 @@ defmodule Tricep.Socket do
           seq,
           state.rcv_nxt,
           [:ack, :psh],
-          state.rcv_wnd,
+          receive_window(state),
           payload: payload
         )
 
@@ -1138,7 +1168,7 @@ defmodule Tricep.Socket do
             seq_start,
             state.rcv_nxt,
             [:ack, :psh],
-            state.rcv_wnd,
+            receive_window(state),
             payload: payload
           )
 
@@ -1191,7 +1221,8 @@ defmodule Tricep.Socket do
   defp send_ack(ack_num, %__MODULE__{} = state) do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
-    tcp_segment = Tcp.build_segment(state.pair, state.snd_nxt, ack_num, [:ack], state.rcv_wnd)
+    tcp_segment =
+      Tcp.build_segment(state.pair, state.snd_nxt, ack_num, [:ack], receive_window(state))
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     Tricep.Link.send(state.link, packet)
@@ -1210,7 +1241,13 @@ defmodule Tricep.Socket do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(state.pair, state.snd_nxt, state.rcv_nxt, [:fin, :ack], state.rcv_wnd)
+      Tcp.build_segment(
+        state.pair,
+        state.snd_nxt,
+        state.rcv_nxt,
+        [:fin, :ack],
+        receive_window(state)
+      )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     Tricep.Link.send(state.link, packet)
@@ -1267,6 +1304,81 @@ defmodule Tricep.Socket do
 
   # Returns true if a <= b in sequence space
   defp seq_leq(a, b), do: not seq_gt(a, b)
+
+  defp socket_opts(opts) when is_list(opts), do: Keyword.get(opts, :opts, %{})
+  defp socket_opts(opts) when is_map(opts), do: opts
+  defp socket_opts(_opts), do: %{}
+
+  defp recv_buffer_size(%{socket_opts: opts}), do: configured_recv_buffer_size(opts)
+  defp recv_buffer_size(_closed_data), do: @default_recv_buffer_size
+
+  defp configured_recv_buffer_size(opts) when is_map(opts) do
+    opts
+    |> Map.get(:recv_buffer_size, Map.get(opts, :rcvbuf, @default_recv_buffer_size))
+    |> normalize_recv_buffer_size()
+  end
+
+  defp configured_recv_buffer_size(opts) when is_list(opts) do
+    opts
+    |> Keyword.get(:recv_buffer_size, Keyword.get(opts, :rcvbuf, @default_recv_buffer_size))
+    |> normalize_recv_buffer_size()
+  end
+
+  defp configured_recv_buffer_size(_opts), do: @default_recv_buffer_size
+
+  defp normalize_recv_buffer_size(size) when is_integer(size) and size > 0 do
+    min(size, @max_tcp_window)
+  end
+
+  defp normalize_recv_buffer_size(_size), do: @default_recv_buffer_size
+
+  defp receive_window(%__MODULE__{} = state) do
+    state.recv_buffer
+    |> byte_size()
+    |> then(&max(0, state.recv_buffer_size - &1))
+    |> min(@max_tcp_window)
+  end
+
+  defp refresh_receive_window(%__MODULE__{} = state) do
+    %{state | rcv_wnd: receive_window(state)}
+  end
+
+  defp maybe_send_window_update(%__MODULE__{} = new_state, %__MODULE__{} = old_state) do
+    if new_state.rcv_wnd > old_state.rcv_wnd do
+      send_ack(new_state.rcv_nxt, new_state)
+    end
+
+    new_state
+  end
+
+  defp receive_payload(%__MODULE__{} = state, payload) do
+    accepted_len = min(byte_size(payload), receive_window(state))
+    {accepted_payload, _overflow} = split_binary(payload, accepted_len)
+
+    new_state =
+      state
+      |> Map.put(:recv_buffer, state.recv_buffer <> accepted_payload)
+      |> Map.put(:rcv_nxt, wrap_seq(state.rcv_nxt + accepted_len))
+      |> refresh_receive_window()
+
+    {new_state, accepted_len}
+  end
+
+  defp notify_recv_select(%__MODULE__{recv_select: {caller_pid, ref, _length}} = state, :eof) do
+    notify_select(caller_pid, ref)
+    %{state | recv_select: nil}
+  end
+
+  defp notify_recv_select(
+         %__MODULE__{recv_select: {caller_pid, ref, _length}} = state,
+         accepted_len
+       )
+       when accepted_len > 0 do
+    notify_select(caller_pid, ref)
+    %{state | recv_select: nil}
+  end
+
+  defp notify_recv_select(%__MODULE__{} = state, _accepted_len), do: state
 
   # Calculate available send window (for backpressure detection)
   defp send_window_available(state) do
