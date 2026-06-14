@@ -1016,6 +1016,97 @@ defmodule Tricep.SocketTest do
       assert Task.await(recv_task, 1000) == {:error, :econnreset}
     end
 
+    test "RST notifies blocking send waiters", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 0)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      send_task = Task.async(fn -> Tricep.send(socket, "blocked", :infinity) end)
+      wait_for_send_waiters(socket)
+
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      assert Task.await(send_task, 1000) == {:error, :econnreset}
+      {:closed, nil} = :sys.get_state(socket)
+    end
+
+    test "RST cancels timed send waiters", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 0)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      send_task = Task.async(fn -> Tricep.send(socket, "blocked", 5_000) end)
+      wait_for_send_waiters(socket)
+
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      assert Task.await(send_task, 1000) == {:error, :econnreset}
+      {:closed, nil} = :sys.get_state(socket)
+
+      refute_receive {:EXIT, _pid, _reason}, 100
+    end
+
+    test "RST notifies nowait send waiters", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 0)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      assert {:select, {:select_info, :send, ref}} = Tricep.send(socket, "blocked", :nowait)
+
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+      assert Tricep.send(socket, "blocked", :nowait) == {:error, :enotconn}
+    end
+
     test "pure ACK updates send window", %{
       link: link,
       local_addr: local_addr,
@@ -2873,6 +2964,35 @@ defmodule Tricep.SocketTest do
 
       # Wait for connection to fail after the final retry timeout.
       wait_for_state_name(socket, :closed, 35_000)
+    end
+
+    test "data retransmission failure notifies blocking send waiters", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 1)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "a") == :ok
+      assert_receive {:dummy_link_packet, _link, _data_packet}, 1000
+
+      send_task = Task.async(fn -> Tricep.send(socket, "blocked", :infinity) end)
+      wait_for_send_waiters(socket)
+
+      :sys.replace_state(socket, fn
+        {:established, state} ->
+          unacked_segments =
+            Enum.map(state.unacked_segments, fn {seq_start, seq_end, payload, _count} ->
+              {seq_start, seq_end, payload, 5}
+            end)
+
+          {:established, %{state | unacked_segments: unacked_segments}}
+      end)
+
+      assert Task.await(send_task, 1500) == {:error, :etimedout}
+      {:closed, nil} = :sys.get_state(socket)
     end
 
     test "duplicate ACK leaves retransmission state intact", %{
