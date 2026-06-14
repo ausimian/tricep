@@ -558,15 +558,7 @@ defmodule Tricep.Socket do
         cond do
           rst? ->
             reset_state(state)
-            # Notify any recv waiters and cancel their timers
-            actions =
-              Enum.flat_map(state.recv_waiters, fn {from, _length, timer_ref} ->
-                [
-                  {:reply, from, {:error, :econnreset}},
-                  {{:timeout, timer_ref}, :cancel}
-                ]
-              end)
-
+            actions = notify_waiters_error(state, :econnreset)
             {:next_state, :closed, nil, actions}
 
           fin? and seq == state.rcv_nxt ->
@@ -955,7 +947,8 @@ defmodule Tricep.Socket do
       %{flags: flags, ack: ack, window: window} ->
         if :rst in flags do
           reset_state(state)
-          {:next_state, :closed, nil}
+          actions = notify_waiters_error(state, :econnreset)
+          {:next_state, :closed, nil, actions}
         else
           if :ack in flags do
             # Process ACK and update retransmission queue
@@ -1047,7 +1040,7 @@ defmodule Tricep.Socket do
     if count >= @max_retransmit_count do
       # Max retries exceeded - connection failure
       reset_state(state)
-      actions = notify_recv_waiters_error(state.recv_waiters, :etimedout)
+      actions = notify_waiters_error(state, :etimedout)
       {:next_state, :closed, nil, actions}
     else
       # Retransmit the oldest unacked segment
@@ -1093,6 +1086,28 @@ defmodule Tricep.Socket do
         {{:timeout, timer_ref}, :cancel}
       ]
     end)
+  end
+
+  defp notify_send_waiters_error(waiters, error) do
+    Enum.flat_map(waiters, fn
+      {from, _ref, _data, timer_ref} when is_tuple(from) ->
+        actions = [{:reply, from, {:error, error}}]
+
+        if timer_ref do
+          [{{:timeout, timer_ref}, :cancel} | actions]
+        else
+          actions
+        end
+
+      {caller_pid, ref, _data} when is_pid(caller_pid) ->
+        notify_select(caller_pid, ref)
+        []
+    end)
+  end
+
+  defp notify_waiters_error(%__MODULE__{} = state, error) do
+    notify_recv_waiters_error(state.recv_waiters, error) ++
+      notify_send_waiters_error(state.send_waiters, error)
   end
 
   defp do_flush_send_buffer(%__MODULE__{} = state) do
