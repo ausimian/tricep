@@ -78,4 +78,39 @@ defmodule Tricep.IpTest do
       assert byte_size(packet) == 40 + 1000
     end
   end
+
+  describe "parse/1" do
+    test "parses a valid IPv6 packet" do
+      payload = <<1, 2, 3, 4>>
+      packet = Ip.wrap(@src_addr, @dst_addr, :tcp, payload)
+
+      assert {:ok, parsed} = Ip.parse(packet)
+      assert parsed.version == 6
+      assert parsed.payload_length == byte_size(payload)
+      assert parsed.next_header == 6
+      assert parsed.hop_limit == 64
+      assert parsed.src == @src_addr
+      assert parsed.dst == @dst_addr
+      assert parsed.payload == payload
+    end
+
+    test "rejects truncated IPv6 headers" do
+      assert Ip.parse(<<6::4, 0::28>>) == {:error, :truncated_header}
+    end
+
+    test "rejects non-IPv6 packets" do
+      assert Ip.parse(<<4::4, 0::316>>) == {:error, :unsupported_version}
+    end
+
+    test "rejects packets with mismatched payload length" do
+      src_addr = @src_addr
+      dst_addr = @dst_addr
+
+      packet =
+        <<6::4, 0::8, 0::20, 4::16, 6::8, 64::8, src_addr::binary-size(16),
+          dst_addr::binary-size(16), 1, 2>>
+
+      assert Ip.parse(packet) == {:error, :invalid_payload_length}
+    end
+  end
 end

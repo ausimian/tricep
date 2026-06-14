@@ -5,6 +5,18 @@ defmodule Tricep.Ip do
   @udp 17
   @icmpv6 58
 
+  @type parsed_packet :: %{
+          version: 6,
+          traffic_class: non_neg_integer(),
+          flow_label: non_neg_integer(),
+          payload_length: non_neg_integer(),
+          next_header: non_neg_integer(),
+          hop_limit: non_neg_integer(),
+          src: binary(),
+          dst: binary(),
+          payload: binary()
+        }
+
   @spec wrap(binary(), binary(), atom() | integer(), binary()) :: binary()
   def wrap(src_addr, dst_addr, protocol, payload)
       when byte_size(src_addr) == 16 and byte_size(dst_addr) == 16 do
@@ -32,4 +44,35 @@ defmodule Tricep.Ip do
   defp protocol_number(:udp), do: @udp
   defp protocol_number(:icmpv6), do: @icmpv6
   defp protocol_number(n) when is_integer(n), do: n
+
+  @spec parse(binary()) :: {:ok, parsed_packet()} | {:error, atom()}
+  def parse(
+        <<6::4, traffic_class::8, flow_label::20, payload_length::16, next_header::8,
+          hop_limit::8, src::binary-size(16), dst::binary-size(16), payload::binary>>
+      )
+      when byte_size(payload) == payload_length do
+    {:ok,
+     %{
+       version: 6,
+       traffic_class: traffic_class,
+       flow_label: flow_label,
+       payload_length: payload_length,
+       next_header: next_header,
+       hop_limit: hop_limit,
+       src: src,
+       dst: dst,
+       payload: payload
+     }}
+  end
+
+  def parse(
+        <<6::4, _traffic_class::8, _flow_label::20, payload_length::16, _next_header::8,
+          _hop_limit::8, _src::binary-size(16), _dst::binary-size(16), payload::binary>>
+      )
+      when byte_size(payload) != payload_length do
+    {:error, :invalid_payload_length}
+  end
+
+  def parse(<<version::4, _::bits>>) when version != 6, do: {:error, :unsupported_version}
+  def parse(_packet), do: {:error, :truncated_header}
 end
