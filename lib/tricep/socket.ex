@@ -81,6 +81,8 @@ defmodule Tricep.Socket do
   @initial_rto_ms 1_000
   @max_rto_ms 60_000
   @max_retransmit_count 5
+  @initial_persist_timeout_ms 1_000
+  @max_persist_timeout_ms 60_000
 
   @typep addr_port() :: {binary(), non_neg_integer()}
   typedstruct enforce: true do
@@ -111,6 +113,9 @@ defmodule Tricep.Socket do
     field :rto_ms, non_neg_integer(), default: 1_000
     # Whether the RTO timer is currently active
     field :rto_timer_active, boolean(), default: false
+    # Zero-window persist timer state
+    field :persist_timer_active, boolean(), default: false
+    field :persist_timeout_ms, non_neg_integer(), default: @initial_persist_timeout_ms
     # SYN retransmit count (for connection phase)
     field :syn_retransmit_count, non_neg_integer(), default: 0
     # For :nowait connect readiness/completion - [{caller_pid, ref}]
@@ -482,9 +487,9 @@ defmodule Tricep.Socket do
       available > 0 ->
         # Window available, enqueue data and return immediately
         new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
+        {new_state, actions} = sync_persist_timer(new_state, [{:reply, from, :ok}])
 
-        {:keep_state, new_state,
-         [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+        {:keep_state, new_state, actions ++ [{:next_event, :internal, :flush_send_buffer}]}
 
       timeout == :nowait ->
         # Window exhausted, return select tuple
@@ -499,7 +504,8 @@ defmodule Tricep.Socket do
         ref = make_ref()
         waiter = {from, ref, data, nil}
         new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
-        {:keep_state, new_state}
+        {new_state, actions} = sync_persist_timer(new_state, [])
+        {:keep_state, new_state, actions}
 
       is_integer(timeout) ->
         # Block with timeout
@@ -507,7 +513,12 @@ defmodule Tricep.Socket do
         timer_ref = make_ref()
         waiter = {from, ref, data, timer_ref}
         new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
-        actions = [{{:timeout, timer_ref}, timeout, {:send_timeout, timer_ref}}]
+
+        {new_state, actions} =
+          sync_persist_timer(new_state, [
+            {{:timeout, timer_ref}, timeout, {:send_timeout, timer_ref}}
+          ])
+
         {:keep_state, new_state, actions}
     end
   end
@@ -522,7 +533,8 @@ defmodule Tricep.Socket do
     case List.keytake(state.send_waiters, timer_ref, 3) do
       {{from, _ref, _data, ^timer_ref}, rest} ->
         new_state = %{state | send_waiters: rest}
-        {:keep_state, new_state, {:reply, from, {:error, :timeout}}}
+        {new_state, actions} = sync_persist_timer(new_state, [{:reply, from, {:error, :timeout}}])
+        {:keep_state, new_state, actions}
 
       nil ->
         # Already fulfilled, ignore
@@ -754,6 +766,31 @@ defmodule Tricep.Socket do
 
   def handle_event({:timeout, :rto}, :retransmit, :last_ack, %__MODULE__{} = state) do
     do_retransmit(state)
+  end
+
+  def handle_event({:timeout, :persist}, :persist_probe, state_name, %__MODULE__{} = state)
+      when state_name in [:established, :close_wait] do
+    state = %{state | persist_timer_active: false}
+
+    if persist_needed?(state) do
+      send_zero_window_probe(state)
+
+      next_timeout = min(state.persist_timeout_ms * 2, @max_persist_timeout_ms)
+
+      new_state = %{
+        state
+        | persist_timer_active: true,
+          persist_timeout_ms: next_timeout
+      }
+
+      {:keep_state, new_state, {{:timeout, :persist}, next_timeout, :persist_probe}}
+    else
+      {:keep_state, %{state | persist_timeout_ms: @initial_persist_timeout_ms}}
+    end
+  end
+
+  def handle_event({:timeout, :persist}, :persist_probe, _state_name, _state_data) do
+    :keep_state_and_data
   end
 
   # --- Active close from established ---
@@ -1018,9 +1055,9 @@ defmodule Tricep.Socket do
       available > 0 ->
         # Window available, enqueue data and return immediately
         new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
+        {new_state, actions} = sync_persist_timer(new_state, [{:reply, from, :ok}])
 
-        {:keep_state, new_state,
-         [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+        {:keep_state, new_state, actions ++ [{:next_event, :internal, :flush_send_buffer}]}
 
       timeout == :nowait ->
         # Window exhausted, return select tuple
@@ -1035,7 +1072,8 @@ defmodule Tricep.Socket do
         ref = make_ref()
         waiter = {from, ref, data, nil}
         new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
-        {:keep_state, new_state}
+        {new_state, actions} = sync_persist_timer(new_state, [])
+        {:keep_state, new_state, actions}
 
       is_integer(timeout) ->
         # Block with timeout
@@ -1043,7 +1081,12 @@ defmodule Tricep.Socket do
         timer_ref = make_ref()
         waiter = {from, ref, data, timer_ref}
         new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
-        actions = [{{:timeout, timer_ref}, timeout, {:send_timeout, timer_ref}}]
+
+        {new_state, actions} =
+          sync_persist_timer(new_state, [
+            {{:timeout, timer_ref}, timeout, {:send_timeout, timer_ref}}
+          ])
+
         {:keep_state, new_state, actions}
     end
   end
@@ -1075,7 +1118,8 @@ defmodule Tricep.Socket do
     case List.keytake(state.send_waiters, timer_ref, 3) do
       {{from, _ref, _data, ^timer_ref}, rest} ->
         new_state = %{state | send_waiters: rest}
-        {:keep_state, new_state, {:reply, from, {:error, :timeout}}}
+        {new_state, actions} = sync_persist_timer(new_state, [{:reply, from, {:error, :timeout}}])
+        {:keep_state, new_state, actions}
 
       nil ->
         # Already fulfilled, ignore
@@ -1360,7 +1404,8 @@ defmodule Tricep.Socket do
   defp notify_waiters_error(%__MODULE__{} = state, error) do
     notify_selects(state.recv_selects)
 
-    notify_recv_waiters_error(state.recv_waiters, error) ++
+    cancel_persist_timer_action(state) ++
+      notify_recv_waiters_error(state.recv_waiters, error) ++
       notify_send_waiters_error(state.send_waiters, error)
   end
 
@@ -1369,10 +1414,10 @@ defmodule Tricep.Socket do
 
     cond do
       DataBuffer.empty?(state.send_buffer) ->
-        :keep_state_and_data
+        keep_state_sync_persist(state)
 
       available <= 0 ->
-        :keep_state_and_data
+        keep_state_sync_persist(state)
 
       true ->
         # Take only bytes the peer's advertised receive window currently permits.
@@ -1414,6 +1459,8 @@ defmodule Tricep.Socket do
           new_state
           |> schedule_flush_send_buffer([])
           |> schedule_pending_fin(new_state)
+
+        {new_state, actions} = sync_persist_timer(new_state, actions)
 
         # Start RTO timer if not already running
         {new_state, actions} =
@@ -1679,6 +1726,95 @@ defmodule Tricep.Socket do
 
   defp notify_recv_select(%__MODULE__{} = state, _accepted_len), do: state
 
+  defp keep_state_sync_persist(state, actions \\ []) do
+    {new_state, actions} = sync_persist_timer(state, actions)
+    {:keep_state, new_state, actions}
+  end
+
+  defp sync_persist_timer(%__MODULE__{} = state, actions) do
+    cond do
+      persist_needed?(state) and state.persist_timer_active ->
+        {state, actions}
+
+      persist_needed?(state) ->
+        {%{state | persist_timer_active: true},
+         actions ++ [{{:timeout, :persist}, state.persist_timeout_ms, :persist_probe}]}
+
+      state.persist_timer_active ->
+        new_state = %{
+          state
+          | persist_timer_active: false,
+            persist_timeout_ms: @initial_persist_timeout_ms
+        }
+
+        {new_state, actions ++ [{{:timeout, :persist}, :cancel}]}
+
+      true ->
+        {%{state | persist_timeout_ms: @initial_persist_timeout_ms}, actions}
+    end
+  end
+
+  defp cancel_persist_timer_action(%__MODULE__{persist_timer_active: true}) do
+    [{{:timeout, :persist}, :cancel}]
+  end
+
+  defp cancel_persist_timer_action(%__MODULE__{}), do: []
+
+  defp persist_needed?(%__MODULE__{snd_wnd: 0} = state), do: has_persist_data?(state)
+  defp persist_needed?(%__MODULE__{}), do: false
+
+  defp has_persist_data?(%__MODULE__{} = state) do
+    not DataBuffer.empty?(state.send_buffer) or has_blocking_send_waiter?(state.send_waiters)
+  end
+
+  defp has_blocking_send_waiter?(waiters) do
+    Enum.any?(waiters, fn
+      {from, _ref, data, _timer_ref} when is_tuple(from) -> byte_size(data) > 0
+      _waiter -> false
+    end)
+  end
+
+  defp send_zero_window_probe(%__MODULE__{} = state) do
+    case persist_probe_payload(state) do
+      nil ->
+        :ok
+
+      payload ->
+        {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
+        seq = wrap_seq(state.snd_nxt - 1)
+
+        tcp_segment =
+          Tcp.build_segment(
+            state.pair,
+            seq,
+            state.rcv_nxt,
+            [:ack, :psh],
+            receive_window(state),
+            payload: payload
+          )
+
+        packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
+        Tricep.Link.send(state.link, packet)
+    end
+  end
+
+  defp persist_probe_payload(%__MODULE__{} = state) do
+    case DataBuffer.take(state.send_buffer, 1) do
+      {[], _buffer} -> blocking_send_waiter_probe_payload(state.send_waiters)
+      {iodata, _buffer} -> IO.iodata_to_binary(iodata)
+    end
+  end
+
+  defp blocking_send_waiter_probe_payload(waiters) do
+    Enum.find_value(waiters, fn
+      {from, _ref, data, _timer_ref} when is_tuple(from) and byte_size(data) > 0 ->
+        binary_part(data, 0, 1)
+
+      _waiter ->
+        nil
+    end)
+  end
+
   # Calculate available send window (for backpressure detection)
   defp send_window_available(state) do
     bytes_in_flight = wrap_seq(state.snd_nxt - state.snd_una)
@@ -1699,7 +1835,12 @@ defmodule Tricep.Socket do
 
   # Process ACK and update retransmission queue
   # Returns {new_state, timer_actions}
-  defp process_ack_if_present(state, false, _ack, window), do: {%{state | snd_wnd: window}, []}
+  defp process_ack_if_present(state, false, _ack, window) do
+    state
+    |> Map.put(:snd_wnd, window)
+    |> sync_persist_timer([])
+  end
+
   defp process_ack_if_present(state, true, ack, window), do: process_ack(state, ack, window)
 
   defp invalid_ack?(state, true, ack), do: seq_gt(ack, state.snd_nxt)
@@ -1767,14 +1908,15 @@ defmodule Tricep.Socket do
             [{{:timeout, :rto}, @initial_rto_ms, :retransmit}]
           end
 
-        {%{new_state | rto_timer_active: new_unacked != []}, timer_actions ++ send_waiter_actions}
+        new_state = %{new_state | rto_timer_active: new_unacked != []}
+        sync_persist_timer(new_state, timer_actions ++ send_waiter_actions)
 
       true ->
         # Duplicate or old ACK - just update window (but still check send waiters)
         base_state = %{state | snd_wnd: window}
         {new_state, send_waiter_actions} = process_send_waiters(base_state)
         send_waiter_actions = schedule_flush_send_buffer(new_state, send_waiter_actions)
-        {new_state, send_waiter_actions}
+        sync_persist_timer(new_state, send_waiter_actions)
     end
   end
 

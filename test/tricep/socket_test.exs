@@ -4454,6 +4454,61 @@ defmodule Tricep.SocketTest do
 
       assert parsed.payload == "aabb"
     end
+
+    test "zero-window persist probes continue until a fresh window update arrives", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 0)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      send_task = Task.async(fn -> Tricep.send(socket, "abc", :infinity) end)
+      wait_for_send_waiters(socket)
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      assert state.persist_timer_active
+      assert state.persist_timeout_ms == 1_000
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      assert_receive {:dummy_link_packet, _link, probe_packet}, 1500
+      <<_ip_header::binary-size(40), probe_segment::binary>> = probe_packet
+      probe = Tcp.parse_segment(probe_segment)
+
+      assert probe.payload == "a"
+      assert probe.seq == wrap_seq(state.snd_nxt - 1)
+
+      {:established, after_probe} = :sys.get_state(socket)
+      assert after_probe.persist_timer_active
+      assert after_probe.persist_timeout_ms == 2_000
+
+      window_update =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack],
+          3
+        )
+
+      DummyLink.inject_packet(link, window_update)
+
+      assert Task.await(send_task, 1000) == :ok
+
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+      <<_ip_header::binary-size(40), data_segment::binary>> = data_packet
+      data = Tcp.parse_segment(data_segment)
+
+      assert data.payload == "abc"
+      assert data.seq == state.snd_nxt
+
+      {:established, opened_state} = :sys.get_state(socket)
+      refute opened_state.persist_timer_active
+    end
   end
 
   # Helper functions for timeout tests
