@@ -55,4 +55,39 @@ defmodule Tricep.IntegrationCase do
   def accept_connection(listen_sock, timeout \\ 5_000) do
     :socket.accept(listen_sock, timeout)
   end
+
+  def wait_for_recv_waiters(socket, count \\ 1, timeout \\ 1_000) do
+    wait_for_socket(socket, timeout, fn
+      {_state_name, %{recv_waiters: waiters}} -> length(waiters) >= count
+      _ -> false
+    end)
+  end
+
+  def wait_for_recv_buffer(socket, bytes, timeout \\ 5_000) do
+    wait_for_socket(socket, timeout, fn
+      {_state_name, %{recv_buffer: buffer}} -> byte_size(buffer) >= bytes
+      _ -> false
+    end)
+  end
+
+  defp wait_for_socket(socket, timeout, predicate) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    wait_for_socket(socket, deadline, predicate, nil)
+  end
+
+  defp wait_for_socket(socket, deadline, predicate, last_state) do
+    state = :sys.get_state(socket)
+
+    cond do
+      predicate.(state) ->
+        state
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("socket did not reach expected state; last state: #{inspect(last_state || state)}")
+
+      true ->
+        Process.sleep(1)
+        wait_for_socket(socket, deadline, predicate, state)
+    end
+  end
 end
