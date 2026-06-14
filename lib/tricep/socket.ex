@@ -383,6 +383,24 @@ defmodule Tricep.Socket do
     {:next_state, :closed, nil, actions}
   end
 
+  # --- Calls while connect is pending ---
+
+  def handle_event({:call, from}, {:send, _data, _timeout}, {:syn_sent, _}, %__MODULE__{}) do
+    {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
+  end
+
+  def handle_event({:call, from}, {:recv, _length, _timeout}, {:syn_sent, _}, %__MODULE__{}) do
+    {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
+  end
+
+  def handle_event({:call, from}, :close, {:syn_sent, _}, %__MODULE__{}) do
+    {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
+  end
+
+  def handle_event({:call, from}, {:shutdown, _how}, {:syn_sent, _}, %__MODULE__{}) do
+    {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
+  end
+
   # --- Send in invalid states ---
 
   # Not connected
@@ -975,7 +993,7 @@ defmodule Tricep.Socket do
   # --- Catch-all handlers ---
 
   # Send/recv on non-established socket
-  def handle_event({:call, from}, {:send, _data}, _state, _state_data) do
+  def handle_event({:call, from}, {:send, _data, _timeout}, _state, _state_data) do
     {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
   end
 
