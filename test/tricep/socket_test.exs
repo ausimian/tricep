@@ -478,6 +478,116 @@ defmodule Tricep.SocketTest do
     end
   end
 
+  describe "listen/2 and accept/2" do
+    test "accepts inbound TCP handshake and returns established socket", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 2) == :ok
+
+      accept_task = Task.async(fn -> Tricep.accept(listener, 1000) end)
+
+      client_port = 40_000
+      client_seq = 1000
+      syn_ack = send_passive_syn(link, local_addr, remote_addr, client_port, client_seq)
+
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      assert {:ok, accepted} = Task.await(accept_task, 1000)
+      on_exit(fn -> stop_socket(accepted) end)
+
+      assert {:established, state} = :sys.get_state(accepted)
+      assert state.pair == {{remote_addr, @port}, {local_addr, client_port}}
+      assert state.snd_mss == 1000
+
+      assert Tricep.send(accepted, "ok") == :ok
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+
+      <<6::4, _::4, _::24, _payload_len::16, 6::8, _hop::8, pkt_src::binary-size(16),
+        pkt_dst::binary-size(16), tcp_segment::binary>> = data_packet
+
+      parsed = Tcp.parse_segment(tcp_segment)
+
+      assert pkt_src == remote_addr
+      assert pkt_dst == local_addr
+      assert parsed.seq == syn_ack.seq + 1
+      assert parsed.ack == client_seq + 1
+      assert parsed.payload == "ok"
+
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "accept with nowait notifies when a connection is queued", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 2) == :ok
+
+      assert {:select, {:select_info, :accept, ref}} = Tricep.accept(listener, :nowait)
+
+      client_port = 40_001
+      client_seq = 2000
+      syn_ack = send_passive_syn(link, local_addr, remote_addr, client_port, client_seq)
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      assert_receive {:"$socket", ^listener, :select, ^ref}, 1000
+      assert {:ok, accepted} = Tricep.accept(listener, :nowait)
+      on_exit(fn -> stop_socket(accepted) end)
+
+      assert {:established, state} = :sys.get_state(accepted)
+      assert state.pair == {{remote_addr, @port}, {local_addr, client_port}}
+
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "listen backlog drops additional SYNs while full", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      send_passive_syn(link, local_addr, remote_addr, 40_002, 3000)
+
+      syn =
+        Tcp.build_segment(
+          {{local_addr, 40_003}, {remote_addr, @port}},
+          4000,
+          0,
+          [:syn],
+          32768
+        )
+
+      DummyLink.inject_packet(link, syn)
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "bind rejects duplicate local address and port" do
+      {:ok, listener1} = Tricep.open(:inet6, :stream, :tcp)
+      {:ok, listener2} = Tricep.open(:inet6, :stream, :tcp)
+
+      address = %{family: :inet6, addr: @remote_addr_str, port: @port}
+
+      assert Tricep.bind(listener1, address) == :ok
+      assert Tricep.bind(listener2, address) == {:error, :eaddrinuse}
+
+      assert Tricep.close(listener1) == :ok
+    end
+  end
+
   describe "receive checksum validation" do
     test "drops invalid checksum SYN-ACK without completing connect", %{
       link: link,
@@ -4659,6 +4769,60 @@ defmodule Tricep.SocketTest do
         Process.sleep(1)
         wait_for_socket(socket, predicate, deadline, state)
     end
+  end
+
+  defp send_passive_syn(link, local_addr, remote_addr, client_port, client_seq)
+       when is_pid(link) do
+    syn =
+      Tcp.build_segment(
+        {{local_addr, client_port}, {remote_addr, @port}},
+        client_seq,
+        0,
+        [:syn],
+        32768,
+        mss: 1000
+      )
+
+    DummyLink.inject_packet(link, syn)
+
+    assert_receive {:dummy_link_packet, _link, packet}, 1000
+
+    <<6::4, _::4, _::24, _payload_len::16, 6::8, _hop::8, pkt_src::binary-size(16),
+      pkt_dst::binary-size(16), tcp_segment::binary>> = packet
+
+    parsed = Tcp.parse_segment(tcp_segment)
+
+    assert pkt_src == remote_addr
+    assert pkt_dst == local_addr
+    assert :syn in parsed.flags
+    assert :ack in parsed.flags
+    refute :rst in parsed.flags
+    assert parsed.ack == client_seq + 1
+    assert parsed.options.mss == 1440
+
+    parsed
+  end
+
+  defp send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, server_seq) do
+    ack =
+      Tcp.build_segment(
+        {{local_addr, client_port}, {remote_addr, @port}},
+        wrap_seq(client_seq + 1),
+        wrap_seq(server_seq + 1),
+        [:ack],
+        32768
+      )
+
+    DummyLink.inject_packet(link, ack)
+  end
+
+  defp stop_socket(socket) do
+    if Process.alive?(socket) do
+      Process.exit(socket, :kill)
+    end
+  catch
+    :exit, :noproc -> :ok
+    :exit, {:noproc, _} -> :ok
   end
 
   defp stop_link(link) do

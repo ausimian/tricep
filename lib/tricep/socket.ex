@@ -10,12 +10,28 @@ defmodule Tricep.Socket do
   alias Tricep.Tcp
 
   @type socket_timeout :: non_neg_integer() | :infinity | :nowait
-  @type select_info :: {:select_info, :connect | :recv | :send, reference()}
+  @type select_info :: {:select_info, :accept | :connect | :recv | :send, reference()}
 
   @spec connect(pid(), :socket.sockaddr_in6(), socket_timeout()) ::
           :ok | {:error, any()} | {:select, select_info()}
   def connect(pid, address, timeout \\ :infinity) when is_pid(pid) do
     :gen_statem.call(pid, {:connect, address, timeout})
+  end
+
+  @spec bind(pid(), :socket.sockaddr_in6()) :: :ok | {:error, atom()}
+  def bind(pid, address) when is_pid(pid) do
+    :gen_statem.call(pid, {:bind, address})
+  end
+
+  @spec listen(pid(), pos_integer()) :: :ok | {:error, atom()}
+  def listen(pid, backlog \\ 5) when is_pid(pid) do
+    :gen_statem.call(pid, {:listen, backlog})
+  end
+
+  @spec accept(pid(), socket_timeout()) ::
+          {:ok, pid()} | {:error, atom()} | {:select, select_info()}
+  def accept(pid, timeout \\ :infinity) when is_pid(pid) do
+    :gen_statem.call(pid, {:accept, timeout})
   end
 
   @spec send_data(pid(), binary(), socket_timeout()) ::
@@ -44,8 +60,15 @@ defmodule Tricep.Socket do
     if Tcp.valid_checksum?(src_addr, dst_addr, segment) do
       pair = {{dst_addr, dst_port}, {src_addr, src_port}}
 
-      if pid = Application.lookup_socket_pair(pair) do
-        send(pid, segment)
+      cond do
+        pid = Application.lookup_socket_pair(pair) ->
+          send(pid, segment)
+
+        listener = passive_listener(dst_addr, dst_port, segment) ->
+          send(listener, {:passive_syn, src_addr, dst_addr, src_port, dst_port, segment})
+
+        true ->
+          :ok
       end
     end
 
@@ -84,6 +107,11 @@ defmodule Tricep.Socket do
   @spec start_link(any()) :: :ignore | {:error, any()} | {:ok, pid()}
   def start_link(opts) do
     :gen_statem.start_link(__MODULE__, opts, hibernate_after: 15_000)
+  end
+
+  @spec start_passive_connection(map()) :: :ignore | {:error, any()} | {:ok, pid()}
+  def start_passive_connection(opts) do
+    :gen_statem.start(__MODULE__, {:passive_connection, opts}, hibernate_after: 15_000)
   end
 
   use TypedStruct
@@ -150,6 +178,8 @@ defmodule Tricep.Socket do
     field :write_shutdown, boolean(), default: false
     # How long to wait in FIN_WAIT_2 for the peer FIN
     field :fin_wait_2_timeout_ms, pos_integer(), default: @default_fin_wait_2_timeout_ms
+    # Listening socket that owns this connection while the passive handshake completes
+    field :passive_listener, pid() | nil, default: nil
   end
 
   # TIME_WAIT duration (2*MSL - using short value for TUN-based stack)
@@ -159,8 +189,211 @@ defmodule Tricep.Socket do
   def callback_mode, do: :handle_event_function
 
   @impl true
+  def init({:passive_connection, opts}) do
+    state = passive_connection_state(opts)
+
+    case Application.register_socket_pair(state.pair) do
+      :ok ->
+        {:ok, :syn_received, state}
+
+      {:error, reason} ->
+        {:stop, reason}
+    end
+  end
+
   def init(opts) do
     {:ok, :closed, %{socket_opts: socket_opts(opts)}}
+  end
+
+  @impl true
+  def handle_event({:call, from}, {:bind, address}, :closed, closed_data) do
+    case validate_sockaddr_in6(address) do
+      {:ok, local_addr, local_port} ->
+        case Application.register_bound_socket(local_addr, local_port) do
+          :ok ->
+            data =
+              closed_data
+              |> Map.put(:local_addr, local_addr)
+              |> Map.put(:local_port, local_port)
+
+            {:next_state, :bound, data, {:reply, from, :ok}}
+
+          {:error, {:already_registered, _pid}} ->
+            {:keep_state_and_data, {:reply, from, {:error, :eaddrinuse}}}
+        end
+
+      {:error, reason} ->
+        {:keep_state_and_data, {:reply, from, {:error, reason}}}
+    end
+  end
+
+  def handle_event({:call, from}, {:listen, backlog}, :bound, bound_data)
+      when is_integer(backlog) and backlog > 0 do
+    local_addr = Map.fetch!(bound_data, :local_addr)
+    local_port = Map.fetch!(bound_data, :local_port)
+
+    case Application.register_listener(local_addr, local_port) do
+      :ok ->
+        listen_data =
+          bound_data
+          |> Map.put(:backlog, backlog)
+          |> Map.put(:pending_count, 0)
+          |> Map.put(:accept_queue, [])
+          |> Map.put(:accept_waiters, [])
+          |> Map.put(:accept_selects, [])
+          |> Map.put(:children, %{})
+
+        {:next_state, :listen, listen_data, {:reply, from, :ok}}
+
+      {:error, {:already_registered, _pid}} ->
+        {:keep_state_and_data, {:reply, from, {:error, :eaddrinuse}}}
+    end
+  end
+
+  def handle_event({:call, from}, {:listen, backlog}, :listen, listen_data)
+      when is_integer(backlog) and backlog > 0 do
+    {:keep_state, %{listen_data | backlog: backlog}, {:reply, from, :ok}}
+  end
+
+  def handle_event({:call, from}, {:accept, timeout}, :listen, listen_data) do
+    case listen_data.accept_queue do
+      [child | rest] ->
+        {listen_data, actions} =
+          listen_data
+          |> Map.put(:accept_queue, rest)
+          |> accept_child(child, [{:reply, from, {:ok, child}}])
+
+        {:keep_state, listen_data, actions}
+
+      [] ->
+        {:keep_state_and_data, [{:next_event, :internal, {:wait_accept, from, timeout}}]}
+    end
+  end
+
+  def handle_event(:internal, {:wait_accept, from, :nowait}, :listen, listen_data) do
+    ref = make_ref()
+    {caller_pid, _} = from
+
+    new_data = %{
+      listen_data
+      | accept_selects: listen_data.accept_selects ++ [{caller_pid, ref}]
+    }
+
+    {:keep_state, new_data, {:reply, from, {:select, {:select_info, :accept, ref}}}}
+  end
+
+  def handle_event(:internal, {:wait_accept, from, :infinity}, :listen, listen_data) do
+    waiter = {from, make_ref(), nil}
+    new_data = %{listen_data | accept_waiters: listen_data.accept_waiters ++ [waiter]}
+    {:keep_state, new_data}
+  end
+
+  def handle_event(:internal, {:wait_accept, from, timeout}, :listen, listen_data)
+      when is_integer(timeout) and timeout >= 0 do
+    timer_ref = make_ref()
+    waiter = {from, timer_ref, timer_ref}
+    new_data = %{listen_data | accept_waiters: listen_data.accept_waiters ++ [waiter]}
+    {:keep_state, new_data, {{:timeout, timer_ref}, timeout, {:accept_timeout, timer_ref}}}
+  end
+
+  def handle_event(:internal, {:wait_accept, from, _timeout}, :listen, _listen_data) do
+    {:keep_state_and_data, {:reply, from, {:error, :einval}}}
+  end
+
+  def handle_event(
+        {:timeout, timer_ref},
+        {:accept_timeout, timer_ref},
+        :listen,
+        listen_data
+      ) do
+    case List.keytake(listen_data.accept_waiters, timer_ref, 1) do
+      {{from, ^timer_ref, ^timer_ref}, rest} ->
+        {:keep_state, %{listen_data | accept_waiters: rest}, {:reply, from, {:error, :timeout}}}
+
+      nil ->
+        :keep_state_and_data
+    end
+  end
+
+  def handle_event(
+        :info,
+        {:passive_syn, src_addr, dst_addr, src_port, dst_port, segment},
+        :listen,
+        listen_data
+      ) do
+    cond do
+      not listen_addr_matches?(listen_data.local_addr, dst_addr) ->
+        :keep_state_and_data
+
+      listen_backlog_full?(listen_data) ->
+        :keep_state_and_data
+
+      true ->
+        case passive_link(src_addr, dst_addr) do
+          {:ok, link, mtu} ->
+            opts = %{
+              listener: self(),
+              src_addr: src_addr,
+              dst_addr: dst_addr,
+              src_port: src_port,
+              dst_port: dst_port,
+              segment: segment,
+              link: link,
+              mtu: mtu,
+              socket_opts: listen_data.socket_opts
+            }
+
+            case start_passive_connection(opts) do
+              {:ok, child} ->
+                ref = Process.monitor(child)
+
+                new_data =
+                  listen_data
+                  |> Map.put(:pending_count, listen_data.pending_count + 1)
+                  |> put_child(child, ref, :pending)
+
+                send(child, :send_syn_ack)
+
+                {:keep_state, new_data}
+
+              _ ->
+                :keep_state_and_data
+            end
+
+          :error ->
+            :keep_state_and_data
+        end
+    end
+  end
+
+  def handle_event(:info, {:passive_established, child}, :listen, listen_data) do
+    case Map.get(listen_data.children, child) do
+      {ref, :pending} ->
+        listen_data =
+          listen_data
+          |> Map.put(:pending_count, max(0, listen_data.pending_count - 1))
+          |> put_child(child, ref, :queued)
+
+        {listen_data, actions} = enqueue_accepted_child(listen_data, child)
+        {:keep_state, listen_data, actions}
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  def handle_event(:info, {:passive_failed, child}, :listen, listen_data) do
+    {:keep_state, remove_listen_child(listen_data, child)}
+  end
+
+  def handle_event(:info, {:DOWN, ref, :process, child, _reason}, :listen, listen_data) do
+    case Map.get(listen_data.children, child) do
+      {^ref, _status} ->
+        {:keep_state, remove_listen_child(listen_data, child)}
+
+      _ ->
+        :keep_state_and_data
+    end
   end
 
   @impl true
@@ -413,6 +646,80 @@ defmodule Tricep.Socket do
 
       _ ->
         :keep_state_and_data
+    end
+  end
+
+  # --- Passive open: SYN_RECEIVED child socket ---
+
+  def handle_event(:info, :send_syn_ack, :syn_received, %__MODULE__{} = state) do
+    send_syn_ack(state)
+    {:keep_state, state, {{:timeout, :rto}, @initial_rto_ms, :syn_ack_timeout}}
+  end
+
+  def handle_event(:info, segment, :syn_received, %__MODULE__{} = state)
+      when is_binary(segment) do
+    case Tcp.parse_segment(segment) do
+      %{flags: flags, seq: seq, ack: ack, window: window, payload: payload} ->
+        syn? = :syn in flags
+        ack? = :ack in flags
+        rst? = :rst in flags
+
+        cond do
+          rst? and acceptable_rst?(state, seq) ->
+            reset_state(state)
+            notify_passive_listener(state, :passive_failed)
+            {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
+
+          rst? ->
+            reject_unacceptable_rst(state)
+
+          ack? and ack == state.snd_nxt and seq == state.rcv_nxt ->
+            base_state = %{
+              state
+              | snd_una: ack,
+                snd_wnd: window,
+                syn_retransmit_count: 0,
+                rto_ms: @initial_rto_ms,
+                passive_listener: nil
+            }
+
+            new_state =
+              if byte_size(payload) > 0 do
+                {receive_state, _accepted_len} = receive_payload(base_state, payload)
+                send_ack(receive_state.rcv_nxt, receive_state)
+                receive_state
+              else
+                base_state
+              end
+
+            notify_passive_listener(state, :passive_established)
+
+            {:next_state, :established, new_state, {{:timeout, :rto}, :cancel}}
+
+          ack? ->
+            send_rst(ack, state)
+            :keep_state_and_data
+
+          syn? and seq == state.irs ->
+            send_syn_ack(state)
+            :keep_state_and_data
+
+          true ->
+            :keep_state_and_data
+        end
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  def handle_event({:timeout, :rto}, :syn_ack_timeout, :syn_received, %__MODULE__{} = state) do
+    if state.syn_retransmit_count >= @max_retransmit_count do
+      reset_state(state)
+      notify_passive_listener(state, :passive_failed)
+      {:next_state, :closed, nil}
+    else
+      retransmit_syn_ack(state)
     end
   end
 
@@ -1351,7 +1658,42 @@ defmodule Tricep.Socket do
     end
   end
 
+  # --- Bound/listening socket cleanup ---
+
+  def handle_event({:call, from}, :close, :bound, bound_data) do
+    deregister_bound_data(bound_data)
+    closed_data = %{socket_opts: bound_data.socket_opts}
+    {:next_state, :closed, closed_data, {:reply, from, :ok}}
+  end
+
+  def handle_event({:call, from}, :close, :listen, listen_data) do
+    deregister_listen_data(listen_data)
+    closed_data = %{socket_opts: listen_data.socket_opts}
+    actions = close_accept_actions(listen_data) ++ [{:reply, from, :ok}]
+    {:next_state, :closed, closed_data, actions}
+  end
+
   # --- Catch-all handlers ---
+
+  def handle_event(:info, _message, _state, _state_data) do
+    :keep_state_and_data
+  end
+
+  def handle_event({:call, from}, {:bind, _address}, _state, _state_data) do
+    {:keep_state_and_data, {:reply, from, {:error, :einval}}}
+  end
+
+  def handle_event({:call, from}, {:listen, _backlog}, _state, _state_data) do
+    {:keep_state_and_data, {:reply, from, {:error, :einval}}}
+  end
+
+  def handle_event({:call, from}, {:accept, _timeout}, _state, _state_data) do
+    {:keep_state_and_data, {:reply, from, {:error, :einval}}}
+  end
+
+  def handle_event({:call, from}, {:connect, _address, _timeout}, _state, _state_data) do
+    {:keep_state_and_data, {:reply, from, {:error, :einval}}}
+  end
 
   # Send/recv on non-established socket
   def handle_event({:call, from}, {:send, _data, _timeout}, _state, _state_data) do
@@ -1370,6 +1712,191 @@ defmodule Tricep.Socket do
   def handle_event({:call, from}, {:shutdown, _how}, _state, _state_data) do
     {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
   end
+
+  defp passive_listener(dst_addr, dst_port, segment) do
+    with %{flags: flags} <- Tcp.parse_segment(segment),
+         true <- :syn in flags,
+         false <- :ack in flags,
+         false <- :rst in flags do
+      Application.lookup_listener(dst_addr, dst_port)
+    else
+      _ -> nil
+    end
+  end
+
+  defp passive_connection_state(opts) do
+    %{
+      listener: listener,
+      src_addr: src_addr,
+      dst_addr: dst_addr,
+      src_port: src_port,
+      dst_port: dst_port,
+      segment: segment,
+      link: link,
+      mtu: mtu,
+      socket_opts: socket_opts
+    } = opts
+
+    %{seq: seq, window: window, options: options} = Tcp.parse_segment(segment)
+    iss = :crypto.strong_rand_bytes(4) |> :binary.decode_unsigned()
+    recv_buffer_size = configured_recv_buffer_size(socket_opts)
+
+    %__MODULE__{
+      pair: {{dst_addr, dst_port}, {src_addr, src_port}},
+      link: link,
+      iss: iss,
+      snd_una: iss,
+      snd_nxt: wrap_seq(iss + 1),
+      snd_wnd: window,
+      irs: seq,
+      rcv_nxt: wrap_seq(seq + 1),
+      rcv_wnd: recv_buffer_size,
+      rcv_mss: mtu - 60,
+      snd_mss: Map.get(options, :mss, @default_mss),
+      recv_buffer_size: recv_buffer_size,
+      rto_ms: @initial_rto_ms,
+      syn_retransmit_count: 0,
+      fin_wait_2_timeout_ms: configured_fin_wait_2_timeout_ms(socket_opts),
+      passive_listener: listener
+    }
+  end
+
+  defp listen_addr_matches?(<<0::128>>, _dst_addr), do: true
+  defp listen_addr_matches?(local_addr, dst_addr), do: local_addr == dst_addr
+
+  defp listen_backlog_full?(listen_data) do
+    listen_data.pending_count + length(listen_data.accept_queue) >= listen_data.backlog
+  end
+
+  defp passive_link(peer_addr, local_addr) do
+    case Application.lookup_link(peer_addr) do
+      {link, {^local_addr, mtu}} -> {:ok, link, mtu}
+      _ -> :error
+    end
+  end
+
+  defp put_child(listen_data, child, ref, status) do
+    %{listen_data | children: Map.put(listen_data.children, child, {ref, status})}
+  end
+
+  defp remove_listen_child(listen_data, child) do
+    case Map.pop(listen_data.children, child) do
+      {{_ref, :pending}, children} ->
+        %{
+          listen_data
+          | children: children,
+            pending_count: max(0, listen_data.pending_count - 1)
+        }
+
+      {{_ref, :queued}, children} ->
+        %{
+          listen_data
+          | children: children,
+            accept_queue: List.delete(listen_data.accept_queue, child)
+        }
+
+      {nil, _children} ->
+        listen_data
+    end
+  end
+
+  defp enqueue_accepted_child(%{accept_waiters: [{from, _ref, timer_ref} | rest]} = data, child) do
+    cancel_actions = if timer_ref, do: [{{:timeout, timer_ref}, :cancel}], else: []
+
+    {data, _actions} =
+      data
+      |> Map.put(:accept_waiters, rest)
+      |> accept_child(child)
+
+    {data, cancel_actions ++ [{:reply, from, {:ok, child}}]}
+  end
+
+  defp enqueue_accepted_child(%{accept_selects: selects} = data, child) when selects != [] do
+    notify_selects(selects)
+
+    data =
+      data
+      |> Map.put(:accept_queue, data.accept_queue ++ [child])
+      |> Map.put(:accept_selects, [])
+
+    {data, []}
+  end
+
+  defp enqueue_accepted_child(data, child) do
+    {%{data | accept_queue: data.accept_queue ++ [child]}, []}
+  end
+
+  defp accept_child(data, child, actions \\ []) do
+    case Map.pop(data.children, child) do
+      {{ref, _status}, children} ->
+        Process.demonitor(ref, [:flush])
+        {%{data | children: children}, actions}
+
+      {nil, _children} ->
+        {data, actions}
+    end
+  end
+
+  defp close_accept_actions(data) do
+    notify_selects(data.accept_selects)
+
+    Enum.flat_map(data.accept_waiters, fn {from, _ref, timer_ref} ->
+      actions = [{:reply, from, {:error, :closed}}]
+
+      if timer_ref do
+        [{{:timeout, timer_ref}, :cancel} | actions]
+      else
+        actions
+      end
+    end)
+  end
+
+  defp deregister_bound_data(data) do
+    Application.deregister_bound_socket(data.local_addr, data.local_port)
+  end
+
+  defp deregister_listen_data(data) do
+    Enum.each(data.children, fn {child, {ref, _status}} ->
+      Process.demonitor(ref, [:flush])
+      Process.exit(child, :shutdown)
+    end)
+
+    Application.deregister_listener(data.local_addr, data.local_port)
+    deregister_bound_data(data)
+  end
+
+  defp send_syn_ack(%__MODULE__{} = state) do
+    {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
+
+    tcp_segment =
+      Tcp.build_segment(state.pair, state.iss, state.rcv_nxt, [:syn, :ack], receive_window(state),
+        mss: state.rcv_mss
+      )
+
+    packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
+    :ok = Tricep.Link.send(state.link, packet)
+  end
+
+  defp retransmit_syn_ack(%__MODULE__{} = state) do
+    send_syn_ack(state)
+
+    new_rto = min(state.rto_ms * 2, @max_rto_ms)
+
+    new_state = %{
+      state
+      | syn_retransmit_count: state.syn_retransmit_count + 1,
+        rto_ms: new_rto
+    }
+
+    {:keep_state, new_state, {{:timeout, :rto}, new_rto, :syn_ack_timeout}}
+  end
+
+  defp notify_passive_listener(%__MODULE__{passive_listener: listener}, message)
+       when is_pid(listener) do
+    send(listener, {message, self()})
+  end
+
+  defp notify_passive_listener(%__MODULE__{}, _message), do: :ok
 
   defp retransmit_syn(state, timeout_event) do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
