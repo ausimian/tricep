@@ -109,7 +109,7 @@ defmodule Tricep.Socket do
     field :rto_timer_active, boolean(), default: false
     # SYN retransmit count (for connection phase)
     field :syn_retransmit_count, non_neg_integer(), default: 0
-    # For :nowait connect - {caller_pid, ref}
+    # For :nowait connect readiness/completion - {caller_pid, ref}
     field :connect_select, {pid(), reference()} | nil, default: nil
     # For :nowait recv - {caller_pid, ref, length}
     field :recv_select, {pid(), reference(), non_neg_integer()} | nil, default: nil
@@ -150,13 +150,19 @@ defmodule Tricep.Socket do
     end
   end
 
-  def handle_event({:call, from}, {:connect, _address, _timeout}, _, %__MODULE__{}) do
-    {:keep_state_and_data, {:reply, from, {:error, :eisconn}}}
+  # Connect completion after :nowait readiness - consume exactly one retry
+  def handle_event(
+        {:call, {caller_pid, _} = from},
+        {:connect, _address, _timeout},
+        :established,
+        %__MODULE__{connect_select: {pending_pid, _ref}} = state
+      )
+      when caller_pid == pending_pid do
+    {:keep_state, %{state | connect_select: nil}, {:reply, from, :ok}}
   end
 
-  # Connect completion after :nowait - already established
-  def handle_event({:call, from}, {:connect, _address, _timeout}, :established, %__MODULE__{}) do
-    {:keep_state_and_data, {:reply, from, :ok}}
+  def handle_event({:call, from}, {:connect, _address, _timeout}, _, %__MODULE__{}) do
+    {:keep_state_and_data, {:reply, from, {:error, :eisconn}}}
   end
 
   def handle_event(:internal, {:send_syn, from, timeout}, :closed, %__MODULE__{} = state) do
@@ -310,8 +316,7 @@ defmodule Tricep.Socket do
                 snd_wnd: window,
                 snd_mss: snd_mss,
                 syn_retransmit_count: 0,
-                rto_ms: @initial_rto_ms,
-                connect_select: nil
+                rto_ms: @initial_rto_ms
             }
 
             actions = [{{:timeout, :rto}, :cancel}]
