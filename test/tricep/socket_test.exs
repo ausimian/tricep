@@ -1258,6 +1258,40 @@ defmodule Tricep.SocketTest do
       assert Tricep.recv(socket, 0, 100) == {:ok, <<>>}
     end
 
+    test "passive close ignores ACK beyond snd_nxt", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain ACK
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      fin_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          wrap_seq(state.snd_nxt + 1),
+          [:fin, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      Process.sleep(50)
+
+      {:close_wait, close_wait_state} = :sys.get_state(socket)
+
+      assert close_wait_state.snd_una == state.snd_una
+      assert close_wait_state.snd_nxt == state.snd_nxt
+
+      # Should still ACK the peer's FIN.
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+    end
+
     test "recv returns buffered data then EOF after receiving FIN", %{
       link: link,
       local_addr: local_addr,
@@ -2911,6 +2945,188 @@ defmodule Tricep.SocketTest do
       {:closed, nil} = :sys.get_state(socket)
     end
 
+    test "duplicate ACK leaves retransmission state intact", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "Hello") == :ok
+      assert_receive {:dummy_link_packet, _link, _data_packet}, 1000
+
+      {:established, state_before_ack} = :sys.get_state(socket)
+      {{_, src_port}, _} = state_before_ack.pair
+
+      assert length(state_before_ack.unacked_segments) == 1
+      assert state_before_ack.rto_timer_active == true
+
+      inject_ack(
+        link,
+        local_addr,
+        remote_addr,
+        src_port,
+        state_before_ack.rcv_nxt,
+        state_before_ack.snd_una,
+        12_345
+      )
+
+      Process.sleep(50)
+
+      {:established, state_after_ack} = :sys.get_state(socket)
+
+      assert state_after_ack.snd_una == state_before_ack.snd_una
+      assert state_after_ack.snd_nxt == state_before_ack.snd_nxt
+      assert state_after_ack.unacked_segments == state_before_ack.unacked_segments
+      assert state_after_ack.rto_timer_active == true
+      assert state_after_ack.snd_wnd == 12_345
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+    end
+
+    test "valid partial ACK advances snd_una and keeps later unacked segments", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, mss: 5)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "helloworld") == :ok
+
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+      assert_receive {:dummy_link_packet, _link, packet2}, 1000
+
+      <<_ip_header::binary-size(40), segment1::binary>> = packet1
+      <<_ip_header::binary-size(40), segment2::binary>> = packet2
+      parsed1 = Tcp.parse_segment(segment1)
+      parsed2 = Tcp.parse_segment(segment2)
+
+      {:established, state_before_ack} = :sys.get_state(socket)
+      {{_, src_port}, _} = state_before_ack.pair
+
+      assert length(state_before_ack.unacked_segments) == 2
+
+      partial_ack = wrap_seq(parsed1.seq + byte_size(parsed1.payload))
+
+      inject_ack(
+        link,
+        local_addr,
+        remote_addr,
+        src_port,
+        state_before_ack.rcv_nxt,
+        partial_ack,
+        40_000
+      )
+
+      Process.sleep(50)
+
+      {:established, state_after_ack} = :sys.get_state(socket)
+
+      assert state_after_ack.snd_una == partial_ack
+      assert state_after_ack.snd_nxt == state_before_ack.snd_nxt
+      assert state_after_ack.rto_timer_active == true
+
+      assert [{seq_start, seq_end, payload, _count}] = state_after_ack.unacked_segments
+      assert seq_start == parsed2.seq
+      assert seq_end == wrap_seq(parsed2.seq + byte_size(parsed2.payload))
+      assert payload == parsed2.payload
+    end
+
+    test "valid full ACK clears all retransmission state", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "Hello") == :ok
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+
+      <<_ip_header::binary-size(40), data_segment::binary>> = data_packet
+      parsed = Tcp.parse_segment(data_segment)
+
+      {:established, state_before_ack} = :sys.get_state(socket)
+      {{_, src_port}, _} = state_before_ack.pair
+
+      assert length(state_before_ack.unacked_segments) == 1
+
+      full_ack = wrap_seq(parsed.seq + byte_size(parsed.payload))
+
+      inject_ack(
+        link,
+        local_addr,
+        remote_addr,
+        src_port,
+        state_before_ack.rcv_nxt,
+        full_ack
+      )
+
+      Process.sleep(50)
+
+      {:established, state_after_ack} = :sys.get_state(socket)
+
+      assert state_after_ack.snd_una == full_ack
+      assert state_after_ack.snd_una == state_before_ack.snd_nxt
+      assert state_after_ack.unacked_segments == []
+      assert state_after_ack.rto_timer_active == false
+    end
+
+    test "ACK beyond snd_nxt is rejected without dropping unacked segments", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "Hello") == :ok
+      assert_receive {:dummy_link_packet, _link, _data_packet}, 1000
+
+      {:established, state_before_ack} = :sys.get_state(socket)
+      {{_, src_port}, _} = state_before_ack.pair
+
+      assert length(state_before_ack.unacked_segments) == 1
+      invalid_ack = wrap_seq(state_before_ack.snd_nxt + 1)
+
+      inject_ack(
+        link,
+        local_addr,
+        remote_addr,
+        src_port,
+        state_before_ack.rcv_nxt,
+        invalid_ack,
+        1
+      )
+
+      assert_receive {:dummy_link_packet, _link, corrective_packet}, 1000
+      <<_ip_header::binary-size(40), corrective_segment::binary>> = corrective_packet
+      corrective = Tcp.parse_segment(corrective_segment)
+
+      assert :ack in corrective.flags
+      assert corrective.seq == state_before_ack.snd_nxt
+      assert corrective.ack == state_before_ack.rcv_nxt
+
+      Process.sleep(50)
+
+      {:established, state_after_ack} = :sys.get_state(socket)
+
+      assert state_after_ack.snd_una == state_before_ack.snd_una
+      assert state_after_ack.snd_nxt == state_before_ack.snd_nxt
+      assert state_after_ack.snd_wnd == state_before_ack.snd_wnd
+      assert state_after_ack.unacked_segments == state_before_ack.unacked_segments
+      assert state_after_ack.rto_timer_active == true
+    end
+
     test "unacked_segments cleared after ACK", %{
       link: link,
       local_addr: local_addr,
@@ -3452,6 +3668,19 @@ defmodule Tricep.SocketTest do
   end
 
   # Helper functions for timeout tests
+  defp inject_ack(link, local_addr, remote_addr, src_port, seq, ack, window \\ 32_768) do
+    ack_segment =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        seq,
+        ack,
+        [:ack],
+        window
+      )
+
+    DummyLink.inject_packet(link, ack_segment)
+  end
+
   defp get_socket_src_port(socket) do
     {_state_name, state} = :sys.get_state(socket)
     {{_, src_port}, _} = state.pair

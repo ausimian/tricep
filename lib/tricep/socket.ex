@@ -547,7 +547,13 @@ defmodule Tricep.Socket do
             data_len = byte_size(payload)
             new_rcv_nxt = wrap_seq(state.rcv_nxt + data_len + 1)
             new_recv_buffer = state.recv_buffer <> payload
-            new_snd_una = if ack > state.snd_una, do: ack, else: state.snd_una
+
+            new_snd_una =
+              if ack? and seq_gt(ack, state.snd_una) and seq_leq(ack, state.snd_nxt) do
+                ack
+              else
+                state.snd_una
+              end
 
             # Send ACK for FIN (and any data)
             send_ack(new_rcv_nxt, %{state | rcv_nxt: new_rcv_nxt})
@@ -1203,42 +1209,48 @@ defmodule Tricep.Socket do
   # Process ACK and update retransmission queue
   # Returns {new_state, timer_actions}
   defp process_ack(state, ack, window) do
-    if seq_gt(ack, state.snd_una) do
-      # ACK acknowledges new data - remove acknowledged segments from queue
-      new_unacked =
-        Enum.drop_while(state.unacked_segments, fn {_seq_start, seq_end, _payload, _count} ->
-          seq_leq(seq_end, ack)
-        end)
+    cond do
+      seq_gt(ack, state.snd_nxt) ->
+        send_ack(state.rcv_nxt, state)
+        {state, []}
 
-      base_state = %{
-        state
-        | snd_una: ack,
-          snd_wnd: window,
-          unacked_segments: new_unacked,
-          rto_ms: @initial_rto_ms
-      }
+      seq_gt(ack, state.snd_una) ->
+        # ACK acknowledges new data - remove acknowledged segments from queue
+        new_unacked =
+          Enum.drop_while(state.unacked_segments, fn {_seq_start, seq_end, _payload, _count} ->
+            seq_leq(seq_end, ack)
+          end)
 
-      # Check if window opened and we have send_waiters
-      {new_state, send_waiter_actions} = process_send_waiters(base_state)
-      send_waiter_actions = schedule_flush_send_buffer(new_state, send_waiter_actions)
+        base_state = %{
+          state
+          | snd_una: ack,
+            snd_wnd: window,
+            unacked_segments: new_unacked,
+            rto_ms: @initial_rto_ms
+        }
 
-      # Manage RTO timer based on remaining unacked segments
-      timer_actions =
-        if new_unacked == [] do
-          # All data acknowledged - cancel timer
-          [{{:timeout, :rto}, :cancel}]
-        else
-          # More unacked data - restart timer with fresh RTO
-          [{{:timeout, :rto}, @initial_rto_ms, :retransmit}]
-        end
+        # Check if window opened and we have send_waiters
+        {new_state, send_waiter_actions} = process_send_waiters(base_state)
+        send_waiter_actions = schedule_flush_send_buffer(new_state, send_waiter_actions)
 
-      {%{new_state | rto_timer_active: new_unacked != []}, timer_actions ++ send_waiter_actions}
-    else
-      # Duplicate or old ACK - just update window (but still check send waiters)
-      base_state = %{state | snd_wnd: window}
-      {new_state, send_waiter_actions} = process_send_waiters(base_state)
-      send_waiter_actions = schedule_flush_send_buffer(new_state, send_waiter_actions)
-      {new_state, send_waiter_actions}
+        # Manage RTO timer based on remaining unacked segments
+        timer_actions =
+          if new_unacked == [] do
+            # All data acknowledged - cancel timer
+            [{{:timeout, :rto}, :cancel}]
+          else
+            # More unacked data - restart timer with fresh RTO
+            [{{:timeout, :rto}, @initial_rto_ms, :retransmit}]
+          end
+
+        {%{new_state | rto_timer_active: new_unacked != []}, timer_actions ++ send_waiter_actions}
+
+      true ->
+        # Duplicate or old ACK - just update window (but still check send waiters)
+        base_state = %{state | snd_wnd: window}
+        {new_state, send_waiter_actions} = process_send_waiters(base_state)
+        send_waiter_actions = schedule_flush_send_buffer(new_state, send_waiter_actions)
+        {new_state, send_waiter_actions}
     end
   end
 
