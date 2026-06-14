@@ -1082,7 +1082,7 @@ defmodule Tricep.SocketTest do
       Task.shutdown(task, :brutal_kill)
     end
 
-    test "stores peer window scale and metadata from SYN-ACK", %{
+    test "stores peer window scale from SYN-ACK without unsupported metadata", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -1120,8 +1120,8 @@ defmodule Tricep.SocketTest do
 
       assert state.snd_wnd_scale == 4
       assert state.snd_wnd == 160
-      assert state.peer_sack_permitted == true
-      assert state.peer_timestamp == {123, 456}
+      refute Map.has_key?(state, :peer_sack_permitted)
+      refute Map.has_key?(state, :peer_timestamp)
     end
 
     test "passive open advertises and stores negotiated window scale", %{
@@ -1169,8 +1169,8 @@ defmodule Tricep.SocketTest do
 
       assert state.snd_wnd_scale == 3
       assert state.snd_wnd == 262_144
-      assert state.peer_sack_permitted == true
-      assert state.peer_timestamp == {321, 654}
+      refute Map.has_key?(state, :peer_sack_permitted)
+      refute Map.has_key?(state, :peer_timestamp)
 
       assert Tricep.close(listener) == :ok
     end
@@ -1908,7 +1908,7 @@ defmodule Tricep.SocketTest do
       assert state_after_ack.rto_timer_active == state_before_ack.rto_timer_active
     end
 
-    test "ACKs out of order packets without delivery", %{
+    test "buffers out of order packets until the gap arrives", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -1922,18 +1922,17 @@ defmodule Tricep.SocketTest do
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
 
-      # Inject packet with wrong sequence number (too high)
-      wrong_seq_segment =
+      out_of_order_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1000,
+          state.rcv_nxt + 5,
           state.snd_nxt,
           [:ack, :psh],
           32768,
-          payload: "Out of order"
+          payload: "world"
         )
 
-      DummyLink.inject_packet(link, wrong_seq_segment)
+      DummyLink.inject_packet(link, out_of_order_segment)
 
       assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
       <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
@@ -1942,13 +1941,38 @@ defmodule Tricep.SocketTest do
       assert :ack in ack.flags
       assert ack.ack == state.rcv_nxt
 
-      # Recv should timeout since data was ignored
-      result = Tricep.recv(socket, 0, 100)
-      assert result == {:error, :timeout}
+      assert Tricep.recv(socket, 0, 100) == {:error, :timeout}
 
-      # rcv_nxt should not have changed
+      {:established, queued_state} = :sys.get_state(socket)
+      assert queued_state.rcv_nxt == state.rcv_nxt
+      assert [{seq, seq_end, payload}] = queued_state.out_of_order_segments
+      assert seq == state.rcv_nxt + 5
+      assert seq_end == state.rcv_nxt + 10
+      assert payload == "world"
+
+      gap_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.rcv_nxt,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
+          payload: "hello"
+        )
+
+      DummyLink.inject_packet(link, gap_segment)
+
+      assert_receive {:dummy_link_packet, _link, final_ack_packet}, 1000
+      <<_ip_header::binary-size(40), final_ack_segment::binary>> = final_ack_packet
+      final_ack = Tcp.parse_segment(final_ack_segment)
+
+      assert :ack in final_ack.flags
+      assert final_ack.ack == state.rcv_nxt + 10
+
+      assert Tricep.recv(socket, 10, 1000) == {:ok, "helloworld"}
+
       {:established, new_state} = :sys.get_state(socket)
-      assert new_state.rcv_nxt == state.rcv_nxt
+      assert new_state.out_of_order_segments == []
     end
 
     test "ACKs duplicate data without duplicate delivery", %{

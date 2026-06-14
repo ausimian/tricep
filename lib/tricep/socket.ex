@@ -161,12 +161,10 @@ defmodule Tricep.Socket do
     field :rcv_wnd_scale, non_neg_integer(), default: 0
     # Window scale peer advertised for its receive window
     field :snd_wnd_scale, non_neg_integer(), default: 0
-    # Peer option state parsed during handshake; SACK recovery/PAWS are not implemented yet
-    field :peer_sack_permitted, boolean(), default: false
-    field :peer_timestamp, {non_neg_integer(), non_neg_integer()} | nil, default: nil
     # Buffers for data transfer
     field :send_buffer, DataBuffer.t(), default: DataBuffer.new()
     field :recv_buffer, binary(), default: <<>>
+    field :out_of_order_segments, list(), default: []
     field :recv_buffer_size, pos_integer(), default: @default_recv_buffer_size
     # Callers waiting on recv (list of {from, length, timer_ref})
     field :recv_waiters, list(), default: []
@@ -655,8 +653,6 @@ defmodule Tricep.Socket do
                 snd_wnd: scale_window(window, snd_wnd_scale),
                 snd_mss: snd_mss,
                 snd_wnd_scale: snd_wnd_scale,
-                peer_sack_permitted: Map.get(options, :sack_permitted, false),
-                peer_timestamp: Map.get(options, :timestamp),
                 syn_retransmit_count: 0,
                 rto_ms: @initial_rto_ms
             }
@@ -720,8 +716,6 @@ defmodule Tricep.Socket do
                 snd_wnd: scale_window(window, snd_wnd_scale),
                 snd_mss: snd_mss,
                 snd_wnd_scale: snd_wnd_scale,
-                peer_sack_permitted: Map.get(options, :sack_permitted, false),
-                peer_timestamp: Map.get(options, :timestamp),
                 syn_retransmit_count: 0,
                 rto_ms: @initial_rto_ms
             }
@@ -1163,7 +1157,13 @@ defmodule Tricep.Socket do
             {new_state, timer_actions} = process_ack(state, ack, window)
             {:keep_state, new_state, timer_actions}
 
-          byte_size(payload) > 0 or fin? ->
+          byte_size(payload) > 0 ->
+            receive_state = buffer_out_of_order_payload(state, seq, payload)
+            {new_state, timer_actions} = process_ack_if_present(receive_state, ack?, ack, window)
+            send_ack(new_state.rcv_nxt, new_state)
+            {:keep_state, new_state, timer_actions}
+
+          fin? ->
             ack_unacceptable_segment(state, ack?, ack, window)
 
           true ->
@@ -1913,8 +1913,6 @@ defmodule Tricep.Socket do
       snd_mss: Map.get(options, :mss, @default_mss),
       rcv_wnd_scale: rcv_wnd_scale,
       snd_wnd_scale: snd_wnd_scale,
-      peer_sack_permitted: Map.get(options, :sack_permitted, false),
-      peer_timestamp: Map.get(options, :timestamp),
       recv_buffer_size: recv_buffer_size,
       rto_ms: @initial_rto_ms,
       syn_retransmit_count: 0,
@@ -2529,9 +2527,8 @@ defmodule Tricep.Socket do
   defp normalize_fin_wait_2_timeout_ms(_timeout_ms), do: @default_fin_wait_2_timeout_ms
 
   defp receive_window(%__MODULE__{} = state) do
-    state.recv_buffer
-    |> byte_size()
-    |> then(&max(0, state.recv_buffer_size - &1))
+    buffered_bytes = byte_size(state.recv_buffer) + out_of_order_size(state)
+    max(0, state.recv_buffer_size - buffered_bytes)
   end
 
   defp advertised_receive_window(%__MODULE__{} = state) do
@@ -2561,10 +2558,98 @@ defmodule Tricep.Socket do
       state
       |> Map.put(:recv_buffer, state.recv_buffer <> accepted_payload)
       |> Map.put(:rcv_nxt, wrap_seq(state.rcv_nxt + accepted_len))
+      |> drain_out_of_order_segments()
       |> refresh_receive_window()
 
     {new_state, accepted_len}
   end
+
+  defp out_of_order_size(%__MODULE__{out_of_order_segments: segments}) do
+    Enum.reduce(segments, 0, fn {_seq, _seq_end, payload}, total ->
+      total + byte_size(payload)
+    end)
+  end
+
+  defp buffer_out_of_order_payload(%__MODULE__{} = state, seq, payload)
+       when byte_size(payload) > 0 do
+    cond do
+      not seq_gt(seq, state.rcv_nxt) ->
+        state
+
+      true ->
+        offset = sequence_distance(state.rcv_nxt, seq)
+        accepted_len = min(byte_size(payload), max(0, receive_window(state) - offset))
+
+        if accepted_len > 0 do
+          {accepted_payload, _overflow} = split_binary(payload, accepted_len)
+          seq_end = wrap_seq(seq + accepted_len)
+
+          segments =
+            [{seq, seq_end, accepted_payload} | state.out_of_order_segments]
+            |> sort_out_of_order_segments(state.rcv_nxt)
+            |> merge_out_of_order_segments()
+
+          %{state | out_of_order_segments: segments}
+          |> refresh_receive_window()
+        else
+          state
+        end
+    end
+  end
+
+  defp buffer_out_of_order_payload(%__MODULE__{} = state, _seq, _payload), do: state
+
+  defp sort_out_of_order_segments(segments, rcv_nxt) do
+    Enum.sort_by(segments, fn {seq, _seq_end, _payload} ->
+      sequence_distance(rcv_nxt, seq)
+    end)
+  end
+
+  defp merge_out_of_order_segments([]), do: []
+
+  defp merge_out_of_order_segments([segment | rest]) do
+    rest
+    |> Enum.reduce([segment], &merge_out_of_order_segment/2)
+    |> Enum.reverse()
+  end
+
+  defp merge_out_of_order_segment({seq, seq_end, payload}, [
+         {current_seq, current_end, current_payload} | rest
+       ]) do
+    cond do
+      seq_gt(seq, current_end) ->
+        [{seq, seq_end, payload}, {current_seq, current_end, current_payload} | rest]
+
+      seq_gt(seq_end, current_end) ->
+        overlap = sequence_distance(seq, current_end)
+        tail_len = byte_size(payload) - overlap
+        tail = binary_part(payload, overlap, tail_len)
+        [{current_seq, seq_end, current_payload <> tail} | rest]
+
+      true ->
+        [{current_seq, current_end, current_payload} | rest]
+    end
+  end
+
+  defp drain_out_of_order_segments(%__MODULE__{} = state) do
+    {drained_state, remaining} =
+      Enum.reduce(state.out_of_order_segments, {state, []}, fn
+        {seq, seq_end, payload}, {%__MODULE__{rcv_nxt: rcv_nxt} = acc_state, remaining} ->
+          if seq == rcv_nxt do
+            {%{
+               acc_state
+               | recv_buffer: acc_state.recv_buffer <> payload,
+                 rcv_nxt: seq_end
+             }, remaining}
+          else
+            {acc_state, [{seq, seq_end, payload} | remaining]}
+          end
+      end)
+
+    %{drained_state | out_of_order_segments: Enum.reverse(remaining)}
+  end
+
+  defp sequence_distance(from, to), do: wrap_seq(to - from)
 
   defp window_scale_for(size) when is_integer(size) and size > @max_tcp_window do
     Enum.find(1..@max_window_scale, @max_window_scale, fn scale ->
