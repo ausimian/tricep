@@ -5466,6 +5466,31 @@ defmodule Tricep.SocketTest do
     state.snd_nxt
   end
 
+  defp shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr) do
+    # Drain the ACK packet from handshake
+    assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+    {:established, state} = :sys.get_state(socket)
+    {{_, src_port}, _} = state.pair
+
+    assert Tricep.shutdown(socket, :write) == :ok
+    assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+    ack_segment =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        state.irs + 1,
+        state.snd_nxt + 1,
+        [:ack],
+        32768
+      )
+
+    DummyLink.inject_packet(link, ack_segment)
+
+    {:fin_wait_2, _state} = :sys.get_state(socket)
+    {state, src_port}
+  end
+
   defp wait_for_recv_waiters(socket, count \\ 1) do
     wait_for_socket(socket, fn
       {_state_name, %{recv_waiters: waiters}} -> length(waiters) >= count
@@ -5645,6 +5670,149 @@ defmodule Tricep.SocketTest do
       {:fin_wait_1, state} = :sys.get_state(socket)
       assert state.send_waiters == []
       refute state.persist_timer_active
+    end
+
+    test "shutdown(:write) keeps blocking recv waiters usable in fin_wait_1", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, 5_000) end)
+      wait_for_recv_waiters(socket)
+
+      assert Tricep.shutdown(socket, :write) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      {:fin_wait_1, fin_wait_state} = :sys.get_state(socket)
+      assert length(fin_wait_state.recv_waiters) == 1
+
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
+          payload: "still receiving"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      assert Task.await(recv_task, 1000) == {:ok, "still receiving"}
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:fin_wait_1, fin_wait_state} = :sys.get_state(socket)
+      assert fin_wait_state.recv_waiters == []
+      assert fin_wait_state.recv_buffer == <<>>
+    end
+
+    test "recv after shutdown(:write) returns data buffered in fin_wait_2", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      {state, src_port} = shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr)
+
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack, :psh],
+          32768,
+          payload: "half-close data"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+      assert Tricep.recv(socket, 0, 1000) == {:ok, "half-close data"}
+
+      {:fin_wait_2, fin_wait_state} = :sys.get_state(socket)
+      assert fin_wait_state.recv_buffer == <<>>
+    end
+
+    test "nowait recv after shutdown(:write) is notified by data in fin_wait_2", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      {state, src_port} = shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr)
+
+      assert {:select, {:select_info, :recv, ref}} = Tricep.recv(socket, 0, :nowait)
+
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:ack, :psh],
+          32768,
+          payload: "ready"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+      assert Tricep.recv(socket, 0, :nowait) == {:ok, "ready"}
+    end
+
+    test "recv after shutdown(:write) times out in fin_wait_2", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr)
+
+      assert Tricep.recv(socket, 0, 50) == {:error, :timeout}
+
+      {:fin_wait_2, fin_wait_state} = :sys.get_state(socket)
+      assert fin_wait_state.recv_waiters == []
+    end
+
+    test "blocking recv after shutdown(:write) returns EOF when peer FIN arrives", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      {state, src_port} = shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr)
+
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, 5_000) end)
+      wait_for_recv_waiters(socket)
+
+      fin_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt + 1,
+          [:fin, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+
+      assert Task.await(recv_task, 1000) == {:ok, <<>>}
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:time_wait, _state} = :sys.get_state(socket)
+      assert Tricep.recv(socket, 0, 100) == {:ok, <<>>}
     end
 
     test "shutdown(:write) drains queued send buffer before FIN", %{

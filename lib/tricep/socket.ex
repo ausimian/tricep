@@ -1008,51 +1008,7 @@ defmodule Tricep.Socket do
   # --- Established state: recv ---
 
   def handle_event({:call, from}, {:recv, length, timeout}, :established, %__MODULE__{} = state) do
-    case deliver_data(state.recv_buffer, length) do
-      {:ok, data, rest} ->
-        new_state =
-          state
-          |> Map.put(:recv_buffer, rest)
-          |> refresh_receive_window()
-          |> maybe_send_window_update(state)
-
-        {:keep_state, new_state, {:reply, from, {:ok, data}}}
-
-      :wait ->
-        # If read is shutdown and no data buffered, return closed
-        if state.read_shutdown do
-          {:keep_state_and_data, {:reply, from, {:error, :closed}}}
-        else
-          case timeout do
-            :nowait ->
-              # Return select tuple immediately, store caller info for notification
-              ref = make_ref()
-              {caller_pid, _} = from
-
-              new_state = %{
-                state
-                | recv_selects: state.recv_selects ++ [{caller_pid, ref, length}]
-              }
-
-              {:keep_state, new_state, {:reply, from, {:select, {:select_info, :recv, ref}}}}
-
-            :infinity ->
-              # Block indefinitely
-              timer_ref = make_ref()
-              waiter = {from, length, timer_ref}
-              new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
-              {:keep_state, new_state}
-
-            ms when is_integer(ms) ->
-              # Block with timeout
-              timer_ref = make_ref()
-              waiter = {from, length, timer_ref}
-              new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
-              actions = [{{:timeout, timer_ref}, ms, {:recv_timeout, timer_ref}}]
-              {:keep_state, new_state, actions}
-          end
-        end
-    end
+    handle_recv_call(state, from, length, timeout)
   end
 
   # Handle recv timeout
@@ -1062,15 +1018,7 @@ defmodule Tricep.Socket do
         :established,
         %__MODULE__{} = state
       ) do
-    case List.keytake(state.recv_waiters, timer_ref, 2) do
-      {{from, _length, ^timer_ref}, rest} ->
-        new_state = %{state | recv_waiters: rest}
-        {:keep_state, new_state, {:reply, from, {:error, :timeout}}}
-
-      nil ->
-        # Already fulfilled, ignore
-        :keep_state_and_data
-    end
+    handle_recv_timeout(state, timer_ref)
   end
 
   # --- Established state: incoming data ---
@@ -1329,7 +1277,9 @@ defmodule Tricep.Socket do
   end
 
   def handle_event({:call, from}, :close, :established, %__MODULE__{} = state) do
-    close_or_drain_send_buffer(state, from, :fin_wait_1)
+    state
+    |> Map.put(:read_shutdown, true)
+    |> close_or_drain_send_buffer(from, :fin_wait_1)
   end
 
   # --- Shutdown from established ---
@@ -1373,9 +1323,22 @@ defmodule Tricep.Socket do
 
   # --- FIN_WAIT_1 state ---
 
+  def handle_event({:call, from}, {:recv, length, timeout}, :fin_wait_1, %__MODULE__{} = state) do
+    handle_recv_call(state, from, length, timeout)
+  end
+
+  def handle_event(
+        {:timeout, timer_ref},
+        {:recv_timeout, timer_ref},
+        :fin_wait_1,
+        %__MODULE__{} = state
+      ) do
+    handle_recv_timeout(state, timer_ref)
+  end
+
   def handle_event(:info, segment, :fin_wait_1, %__MODULE__{} = state) when is_binary(segment) do
     case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, window: window} = parsed ->
+      %{flags: flags, seq: seq, ack: ack, payload: payload, window: window} = parsed ->
         fin? = :fin in flags
         ack? = :ack in flags
         rst? = :rst in flags
@@ -1384,7 +1347,8 @@ defmodule Tricep.Socket do
         cond do
           rst? and acceptable_rst?(state, seq) ->
             reset_state(state)
-            {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
+            actions = notify_waiters_error(state, :econnreset)
+            {:next_state, :closed, nil, [{{:timeout, :rto}, :cancel} | actions]}
 
           rst? ->
             reject_unacceptable_rst(state)
@@ -1394,38 +1358,70 @@ defmodule Tricep.Socket do
 
           true ->
             {ack_state, ack_actions} = process_ack_if_present(state, ack?, ack, window)
+            data_len = byte_size(payload)
+
+            {receive_state, accepted_len, recv_actions} =
+              if seq == ack_state.rcv_nxt and data_len > 0 do
+                deliver_received_payload(ack_state, payload)
+              else
+                {ack_state, 0, []}
+              end
+
+            fin_ready? = fin? and seq == ack_state.rcv_nxt and accepted_len == data_len
+
+            if accepted_len > 0 and not fin_ready? do
+              send_ack(receive_state.rcv_nxt, receive_state)
+            end
 
             cond do
-              fin? and ack_of_fin? ->
+              fin_ready? and ack_of_fin? ->
                 # FIN+ACK of our FIN - go directly to TIME_WAIT
-                new_rcv_nxt = wrap_seq(seq + 1)
-                new_state = %{ack_state | rcv_nxt: new_rcv_nxt, fin_received: true}
-                send_ack(new_rcv_nxt, new_state)
+                {new_state, eof_actions} =
+                  receive_state
+                  |> Map.put(:rcv_nxt, wrap_seq(receive_state.rcv_nxt + 1))
+                  |> deliver_receive_eof()
+
+                send_ack(new_state.rcv_nxt, new_state)
 
                 {:next_state, :time_wait, new_state,
-                 ack_actions ++ [{{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}]}
+                 ack_actions ++
+                   recv_actions ++
+                   eof_actions ++
+                   [{{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}]}
 
-              fin? ->
+              fin_ready? ->
                 # FIN but not ACK of our FIN - simultaneous close
-                new_rcv_nxt = wrap_seq(seq + 1)
-                new_state = %{ack_state | rcv_nxt: new_rcv_nxt, fin_received: true}
-                send_ack(new_rcv_nxt, new_state)
-                {:next_state, :closing, new_state, ack_actions}
+                {new_state, eof_actions} =
+                  receive_state
+                  |> Map.put(:rcv_nxt, wrap_seq(receive_state.rcv_nxt + 1))
+                  |> deliver_receive_eof()
+
+                send_ack(new_state.rcv_nxt, new_state)
+                {:next_state, :closing, new_state, ack_actions ++ recv_actions ++ eof_actions}
 
               ack_of_fin? ->
                 # ACK of our FIN - move to FIN_WAIT_2
-                {:next_state, :fin_wait_2, ack_state,
+                {:next_state, :fin_wait_2, receive_state,
                  ack_actions ++
+                   recv_actions ++
                    [
-                     {{:timeout, :fin_wait_2}, ack_state.fin_wait_2_timeout_ms,
+                     {{:timeout, :fin_wait_2}, receive_state.fin_wait_2_timeout_ms,
                       :fin_wait_2_expired}
                    ]}
 
               ack? ->
-                {:keep_state, ack_state, ack_actions}
+                {:keep_state, receive_state, ack_actions ++ recv_actions}
+
+              fin? ->
+                send_ack(receive_state.rcv_nxt, receive_state)
+                {:keep_state, receive_state, ack_actions ++ recv_actions}
 
               true ->
-                :keep_state_and_data
+                if recv_actions == [] do
+                  :keep_state_and_data
+                else
+                  {:keep_state, receive_state, recv_actions}
+                end
             end
         end
 
@@ -1436,6 +1432,19 @@ defmodule Tricep.Socket do
 
   # --- FIN_WAIT_2 state ---
 
+  def handle_event({:call, from}, {:recv, length, timeout}, :fin_wait_2, %__MODULE__{} = state) do
+    handle_recv_call(state, from, length, timeout)
+  end
+
+  def handle_event(
+        {:timeout, timer_ref},
+        {:recv_timeout, timer_ref},
+        :fin_wait_2,
+        %__MODULE__{} = state
+      ) do
+    handle_recv_timeout(state, timer_ref)
+  end
+
   def handle_event(
         {:timeout, :fin_wait_2},
         :fin_wait_2_expired,
@@ -1443,7 +1452,8 @@ defmodule Tricep.Socket do
         %__MODULE__{} = state
       ) do
     reset_state(state)
-    {:next_state, :closed, nil}
+    actions = notify_waiters_error(state, :etimedout)
+    {:next_state, :closed, nil, actions}
   end
 
   def handle_event(:info, segment, :fin_wait_2, %__MODULE__{} = state) when is_binary(segment) do
@@ -1456,7 +1466,8 @@ defmodule Tricep.Socket do
         cond do
           rst? and acceptable_rst?(state, seq) ->
             reset_state(state)
-            {:next_state, :closed, nil, {{:timeout, :fin_wait_2}, :cancel}}
+            actions = notify_waiters_error(state, :econnreset)
+            {:next_state, :closed, nil, [{{:timeout, :fin_wait_2}, :cancel} | actions]}
 
           rst? ->
             reject_unacceptable_rst(state)
@@ -1472,36 +1483,41 @@ defmodule Tricep.Socket do
             # Handle any data that came with the FIN
             data_len = byte_size(payload)
 
-            {receive_state, accepted_len} =
-              receive_payload(%{state | snd_wnd: scale_peer_window(state, window)}, payload)
+            {receive_state, accepted_len, recv_actions} =
+              state
+              |> Map.put(:snd_wnd, scale_peer_window(state, window))
+              |> deliver_received_payload(payload)
 
             if accepted_len == data_len do
-              new_state =
+              {new_state, eof_actions} =
                 receive_state
                 |> Map.put(:rcv_nxt, wrap_seq(receive_state.rcv_nxt + 1))
-                |> Map.put(:fin_received, true)
-                |> refresh_receive_window()
+                |> deliver_receive_eof()
 
               send_ack(new_state.rcv_nxt, new_state)
 
               {:next_state, :time_wait, new_state,
-               [
-                 {{:timeout, :fin_wait_2}, :cancel},
-                 {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}
-               ]}
+               recv_actions ++
+                 eof_actions ++
+                 [
+                   {{:timeout, :fin_wait_2}, :cancel},
+                   {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}
+                 ]}
             else
               send_ack(receive_state.rcv_nxt, receive_state)
-              {:keep_state, receive_state}
+              {:keep_state, receive_state, recv_actions}
             end
 
           ack? and seq == state.rcv_nxt and byte_size(payload) > 0 ->
             # Data segment - half-close allows peer to still send data
-            {new_state, _accepted_len} =
-              receive_payload(%{state | snd_wnd: scale_peer_window(state, window)}, payload)
+            {new_state, _accepted_len, recv_actions} =
+              state
+              |> Map.put(:snd_wnd, scale_peer_window(state, window))
+              |> deliver_received_payload(payload)
 
             send_ack(new_state.rcv_nxt, new_state)
 
-            {:keep_state, new_state}
+            {:keep_state, new_state, recv_actions}
 
           byte_size(payload) > 0 or fin? ->
             ack_unacceptable_segment(state, ack?, ack, window)
@@ -1513,6 +1529,16 @@ defmodule Tricep.Socket do
       _ ->
         :keep_state_and_data
     end
+  end
+
+  def handle_event(
+        {:call, from},
+        {:recv, length, timeout},
+        state_name,
+        %__MODULE__{read_shutdown: false, fin_received: true} = state
+      )
+      when state_name in [:closing, :last_ack, :time_wait] do
+    handle_recv_call(state, from, length, timeout)
   end
 
   # --- TIME_WAIT state ---
@@ -1691,7 +1717,9 @@ defmodule Tricep.Socket do
   end
 
   def handle_event({:call, from}, :close, :close_wait, %__MODULE__{} = state) do
-    close_or_drain_send_buffer(state, from, :last_ack)
+    state
+    |> Map.put(:read_shutdown, true)
+    |> close_or_drain_send_buffer(from, :last_ack)
   end
 
   # shutdown(:write) in close_wait - send FIN, go to last_ack
@@ -2190,6 +2218,70 @@ defmodule Tricep.Socket do
     end
   end
 
+  defp handle_recv_call(%__MODULE__{} = state, from, length, timeout) do
+    case deliver_data(state.recv_buffer, length) do
+      {:ok, data, rest} ->
+        new_state =
+          state
+          |> Map.put(:recv_buffer, rest)
+          |> refresh_receive_window()
+          |> maybe_send_window_update(state)
+
+        {:keep_state, new_state, {:reply, from, {:ok, data}}}
+
+      :wait ->
+        cond do
+          state.fin_received ->
+            {:keep_state_and_data, {:reply, from, {:ok, <<>>}}}
+
+          state.read_shutdown ->
+            {:keep_state_and_data, {:reply, from, {:error, :closed}}}
+
+          true ->
+            wait_for_recv_data(state, from, length, timeout)
+        end
+    end
+  end
+
+  defp wait_for_recv_data(%__MODULE__{} = state, from, length, timeout) do
+    case timeout do
+      :nowait ->
+        ref = make_ref()
+        {caller_pid, _} = from
+
+        new_state = %{
+          state
+          | recv_selects: state.recv_selects ++ [{caller_pid, ref, length}]
+        }
+
+        {:keep_state, new_state, {:reply, from, {:select, {:select_info, :recv, ref}}}}
+
+      :infinity ->
+        timer_ref = make_ref()
+        waiter = {from, length, timer_ref}
+        new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
+        {:keep_state, new_state}
+
+      ms when is_integer(ms) ->
+        timer_ref = make_ref()
+        waiter = {from, length, timer_ref}
+        new_state = %{state | recv_waiters: state.recv_waiters ++ [waiter]}
+        actions = [{{:timeout, timer_ref}, ms, {:recv_timeout, timer_ref}}]
+        {:keep_state, new_state, actions}
+    end
+  end
+
+  defp handle_recv_timeout(%__MODULE__{} = state, timer_ref) do
+    case List.keytake(state.recv_waiters, timer_ref, 2) do
+      {{from, _length, ^timer_ref}, rest} ->
+        new_state = %{state | recv_waiters: rest}
+        {:keep_state, new_state, {:reply, from, {:error, :timeout}}}
+
+      nil ->
+        :keep_state_and_data
+    end
+  end
+
   defp notify_recv_waiters_error(waiters, error) do
     Enum.flat_map(waiters, fn {from, _length, timer_ref} ->
       [
@@ -2225,20 +2317,27 @@ defmodule Tricep.Socket do
   end
 
   defp settle_close_waiters(%__MODULE__{} = state) do
-    notify_selects(state.recv_selects)
+    {state, recv_actions} =
+      if state.read_shutdown do
+        notify_selects(state.recv_selects)
 
-    {recv_buffer, _recv_waiters, recv_actions} =
-      process_waiters_eof(state.recv_buffer, state.recv_waiters)
+        {recv_buffer, _recv_waiters, recv_actions} =
+          process_waiters_eof(state.recv_buffer, state.recv_waiters)
+
+        new_state = %{
+          state
+          | recv_buffer: recv_buffer,
+            recv_waiters: [],
+            recv_selects: []
+        }
+
+        {new_state, recv_actions}
+      else
+        {state, []}
+      end
 
     send_actions = notify_send_waiters_error(state.send_waiters, :epipe)
-
-    new_state = %{
-      state
-      | recv_buffer: recv_buffer,
-        recv_waiters: [],
-        recv_selects: [],
-        send_waiters: []
-    }
+    new_state = %{state | send_waiters: []}
 
     {new_state, recv_actions ++ send_actions}
   end
@@ -2610,6 +2709,38 @@ defmodule Tricep.Socket do
       |> refresh_receive_window()
 
     {new_state, accepted_len}
+  end
+
+  defp deliver_received_payload(%__MODULE__{} = state, payload) do
+    {receive_state, accepted_len} = receive_payload(state, payload)
+    receive_state = notify_recv_select(receive_state, accepted_len)
+
+    {recv_buffer, recv_waiters, actions} =
+      process_waiters(receive_state.recv_buffer, receive_state.recv_waiters)
+
+    new_state =
+      receive_state
+      |> Map.put(:recv_buffer, recv_buffer)
+      |> Map.put(:recv_waiters, recv_waiters)
+      |> refresh_receive_window()
+
+    {new_state, accepted_len, actions}
+  end
+
+  defp deliver_receive_eof(%__MODULE__{} = state) do
+    receive_state = notify_recv_select(state, :eof)
+
+    {recv_buffer, recv_waiters, actions} =
+      process_waiters_eof(receive_state.recv_buffer, receive_state.recv_waiters)
+
+    new_state =
+      receive_state
+      |> Map.put(:recv_buffer, recv_buffer)
+      |> Map.put(:recv_waiters, recv_waiters)
+      |> Map.put(:fin_received, true)
+      |> refresh_receive_window()
+
+    {new_state, actions}
   end
 
   defp out_of_order_size(%__MODULE__{out_of_order_segments: segments}) do
