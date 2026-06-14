@@ -194,7 +194,29 @@ defmodule Tricep.SocketTest do
       # Try to connect with an invalid address
       result = Tricep.connect(socket, %{family: :inet6, addr: "not-an-ip", port: 80})
 
-      assert {:error, _} = result
+      assert result == {:error, :einval}
+    end
+
+    test "returns error for invalid sockaddr maps without sending SYN" do
+      invalid_addresses = [
+        %{family: :inet, addr: @local_addr_str, port: @port},
+        %{family: :inet6, addr: @local_addr_str},
+        %{family: :inet6, addr: @local_addr_str, port: 0},
+        %{family: :inet6, addr: @local_addr_str, port: -1},
+        %{family: :inet6, addr: @local_addr_str, port: 65_536},
+        %{family: :inet6, addr: @local_addr_str, port: "8080"},
+        %{family: :inet6, addr: {0x1_0000, 0, 0, 0, 0, 0, 0, 1}, port: @port},
+        %{}
+      ]
+
+      for address <- invalid_addresses do
+        {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+        assert Tricep.connect(socket, address) == {:error, :einval}
+        assert Process.alive?(socket)
+      end
+
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
     end
 
     test "ignores malformed segments in SYN_SENT state", %{

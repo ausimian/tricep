@@ -79,5 +79,10 @@ defmodule Tricep.AddressTest do
 
       assert result == expected
     end
+
+    test "returns error for tuple components outside the IPv6 hextet range" do
+      assert Address.from({0x1_0000, 0, 0, 0, 0, 0, 0, 1}) == {:error, :einval}
+      assert Address.from({-1, 0, 0, 0, 0, 0, 0, 1}) == {:error, :einval}
+    end
   end
 end

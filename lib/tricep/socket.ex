@@ -131,12 +131,12 @@ defmodule Tricep.Socket do
   end
 
   @impl true
-  def handle_event({:call, from}, {:connect, %{addr: addr} = address, timeout}, :closed, nil) do
-    case Tricep.Address.from(addr) do
-      {:ok, dstaddr_bin} ->
+  def handle_event({:call, from}, {:connect, address, timeout}, :closed, nil) do
+    case validate_sockaddr_in6(address) do
+      {:ok, dstaddr_bin, dst_port} ->
         case Application.lookup_link(dstaddr_bin) do
           {pid, {srcaddr_bin, mtu}} ->
-            pair = allocate_port(srcaddr_bin, {dstaddr_bin, address.port})
+            pair = allocate_port(srcaddr_bin, {dstaddr_bin, dst_port})
             send_syn = {:next_event, :internal, {:send_syn, from, timeout}}
             state = %__MODULE__{pair: pair, link: pid, rcv_mss: mtu - 60}
             {:next_state, :closed, state, send_syn}
@@ -145,8 +145,8 @@ defmodule Tricep.Socket do
             {:keep_state_and_data, {:reply, from, {:error, :enetunreach}}}
         end
 
-      {:error, _} = err ->
-        {:keep_state_and_data, {:reply, from, err}}
+      {:error, reason} ->
+        {:keep_state_and_data, {:reply, from, {:error, reason}}}
     end
   end
 
@@ -1199,6 +1199,24 @@ defmodule Tricep.Socket do
   end
 
   # --- Helper functions ---
+
+  defp validate_sockaddr_in6(%{family: :inet6, addr: addr, port: port}) do
+    with true <- is_integer(port) and port in 1..65_535,
+         {:ok, dstaddr_bin} <- valid_ipv6_address(addr) do
+      {:ok, dstaddr_bin, port}
+    else
+      _ -> {:error, :einval}
+    end
+  end
+
+  defp validate_sockaddr_in6(_address), do: {:error, :einval}
+
+  defp valid_ipv6_address(addr) do
+    Tricep.Address.from(addr)
+  rescue
+    FunctionClauseError -> {:error, :einval}
+    ArgumentError -> {:error, :einval}
+  end
 
   # Wrap sequence number at 32 bits
   defp wrap_seq(n), do: n &&& 0xFFFFFFFF
