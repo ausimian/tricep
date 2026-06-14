@@ -209,6 +209,65 @@ defmodule Tricep.TunLinkTest do
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
     end
 
+    test "reassembles fragmented TCP packets after extension headers", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn_parsed = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn_parsed.seq + 1,
+          [:syn, :ack],
+          32768
+        )
+
+      <<fragment1::binary-size(16), fragment2::binary>> = syn_ack_segment
+      identification = 5678
+      state = tun_state()
+
+      state =
+        state
+        |> handle_hop_by_hop_fragment_packet(
+          local_addr,
+          remote_addr,
+          identification,
+          0,
+          true,
+          fragment1
+        )
+
+      refute Task.yield(task, 100)
+      assert map_size(state.fragment_buffers) == 1
+
+      state =
+        state
+        |> handle_hop_by_hop_fragment_packet(
+          local_addr,
+          remote_addr,
+          identification,
+          16,
+          false,
+          fragment2
+        )
+
+      assert state.fragment_buffers == %{}
+      assert Task.await(task, 1000) == :ok
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+    end
+
     test "rejects malformed non-final fragment payload length", %{
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -283,15 +342,55 @@ defmodule Tricep.TunLinkTest do
     new_state
   end
 
+  defp handle_hop_by_hop_fragment_packet(
+         state,
+         src,
+         dst,
+         identification,
+         offset,
+         more_fragments?,
+         payload
+       ) do
+    packet =
+      hop_by_hop_fragment_packet(src, dst, 6, identification, offset, more_fragments?, payload)
+
+    assert {:keep_state, new_state, {:next_event, :internal, :read_tun}} =
+             TunLink.handle_ip_packet(packet, state)
+
+    new_state
+  end
+
   defp fragment_packet(src, dst, next_header, identification, offset, more_fragments?, payload) do
+    Ip.wrap(
+      src,
+      dst,
+      44,
+      fragment_header(next_header, identification, offset, more_fragments?, payload)
+    )
+  end
+
+  defp hop_by_hop_fragment_packet(
+         src,
+         dst,
+         next_header,
+         identification,
+         offset,
+         more_fragments?,
+         payload
+       ) do
+    hop_by_hop_header =
+      <<44, 0, 0::48,
+        fragment_header(next_header, identification, offset, more_fragments?, payload)::binary>>
+
+    Ip.wrap(src, dst, 0, hop_by_hop_header)
+  end
+
+  defp fragment_header(next_header, identification, offset, more_fragments?, payload) do
     offset_units = div(offset, 8)
     more_flag = if more_fragments?, do: 1, else: 0
     offset_flags = offset_units |> Bitwise.bsl(3) |> Bitwise.bor(more_flag)
 
-    fragment_header =
-      <<next_header::8, 0::8, offset_flags::16, identification::32, payload::binary>>
-
-    Ip.wrap(src, dst, 44, fragment_header)
+    <<next_header::8, 0::8, offset_flags::16, identification::32, payload::binary>>
   end
 
   defp tun_state do
