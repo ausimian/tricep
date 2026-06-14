@@ -12,11 +12,20 @@ defmodule Tricep.Socket do
   @type socket_timeout :: non_neg_integer() | :infinity | :nowait
   @type select_info :: {:select_info, :accept | :connect | :recv | :send, reference()}
 
+  defguardp valid_socket_timeout(timeout)
+            when timeout in [:infinity, :nowait] or (is_integer(timeout) and timeout >= 0)
+
+  defguardp valid_recv_length(length) when is_integer(length) and length >= 0
+
   @spec connect(pid(), :socket.sockaddr_in6(), socket_timeout()) ::
           :ok | {:error, any()} | {:select, select_info()}
-  def connect(pid, address, timeout \\ :infinity) when is_pid(pid) do
+  def connect(pid, address, timeout \\ :infinity)
+
+  def connect(pid, address, timeout) when is_pid(pid) and valid_socket_timeout(timeout) do
     :gen_statem.call(pid, {:connect, address, timeout})
   end
+
+  def connect(pid, _address, _timeout) when is_pid(pid), do: {:error, :einval}
 
   @spec bind(pid(), :socket.sockaddr_in6()) :: :ok | {:error, atom()}
   def bind(pid, address) when is_pid(pid) do
@@ -35,21 +44,38 @@ defmodule Tricep.Socket do
 
   @spec accept(pid(), socket_timeout()) ::
           {:ok, pid()} | {:error, atom()} | {:select, select_info()}
-  def accept(pid, timeout \\ :infinity) when is_pid(pid) do
+  def accept(pid, timeout \\ :infinity)
+
+  def accept(pid, timeout) when is_pid(pid) and valid_socket_timeout(timeout) do
     :gen_statem.call(pid, {:accept, timeout})
   end
 
+  def accept(pid, _timeout) when is_pid(pid), do: {:error, :einval}
+
   @spec send_data(pid(), binary(), socket_timeout()) ::
           :ok | {:error, atom()} | {:select, select_info()}
-  def send_data(pid, data, timeout \\ :infinity) when is_pid(pid) and is_binary(data) do
+  def send_data(pid, data, timeout \\ :infinity)
+
+  def send_data(pid, <<>>, timeout) when is_pid(pid) and valid_socket_timeout(timeout), do: :ok
+
+  def send_data(pid, data, timeout)
+      when is_pid(pid) and is_binary(data) and valid_socket_timeout(timeout) do
     :gen_statem.call(pid, {:send, data, timeout})
   end
 
+  def send_data(pid, data, _timeout) when is_pid(pid) and is_binary(data),
+    do: {:error, :einval}
+
   @spec recv(pid(), non_neg_integer(), socket_timeout()) ::
           {:ok, binary()} | {:error, atom()} | {:select, select_info()}
-  def recv(pid, length \\ 0, timeout \\ :infinity) when is_pid(pid) do
+  def recv(pid, length \\ 0, timeout \\ :infinity)
+
+  def recv(pid, length, timeout)
+      when is_pid(pid) and valid_recv_length(length) and valid_socket_timeout(timeout) do
     :gen_statem.call(pid, {:recv, length, timeout})
   end
+
+  def recv(pid, _length, _timeout) when is_pid(pid), do: {:error, :einval}
 
   @spec close(pid()) :: :ok | {:error, atom()}
   def close(pid) when is_pid(pid) do

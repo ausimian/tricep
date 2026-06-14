@@ -1201,6 +1201,42 @@ defmodule Tricep.SocketTest do
       assert :psh in parsed.flags
     end
 
+    test "empty send returns immediately without waiting for peer window", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 0)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "", :nowait) == :ok
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      {:established, state} = :sys.get_state(socket)
+      assert state.send_waiters == []
+      assert Tricep.DataBuffer.empty?(state.send_buffer)
+    end
+
+    test "returns {:error, :einval} for negative send timeout", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet from handshake
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "Hello", -1) == {:error, :einval}
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      {:established, state} = :sys.get_state(socket)
+      assert Tricep.DataBuffer.empty?(state.send_buffer)
+      assert state.send_waiters == []
+    end
+
     test "segments large data at MSS boundary", %{
       link: link,
       local_addr: local_addr,
@@ -1595,6 +1631,56 @@ defmodule Tricep.SocketTest do
 
       # Now recv should return immediately (data already buffered)
       assert Tricep.recv(socket, 0, 1000) == {:ok, "Pre-buffered data"}
+    end
+
+    test "negative recv length returns {:error, :einval} without consuming buffered data", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
+          payload: "buffered"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      # Drain the ACK
+      assert_receive {:dummy_link_packet, _link, _ack}, 1000
+
+      assert Tricep.recv(socket, -1, 1000) == {:error, :einval}
+      assert Process.alive?(socket)
+      assert Tricep.recv(socket, 0, 1000) == {:ok, "buffered"}
+    end
+
+    test "negative recv timeout returns {:error, :einval} without adding a waiter", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.recv(socket, 0, -1) == {:error, :einval}
+
+      {:established, state} = :sys.get_state(socket)
+      assert state.recv_waiters == []
+      assert state.recv_selects == []
     end
 
     test "recv timeout is canceled after data arrives", %{
@@ -4882,6 +4968,17 @@ defmodule Tricep.SocketTest do
   end
 
   describe "connect with timeout" do
+    test "returns {:error, :einval} for negative timeout" do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      result =
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, -1)
+
+      assert result == {:error, :einval}
+      assert Process.alive?(socket)
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+    end
+
     test "returns {:error, :timeout} when no SYN-ACK received", %{} do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
 
