@@ -55,6 +55,7 @@ defmodule Tricep.MixProject do
     [
       {:typedstruct, "~> 0.5", runtime: false},
       {:elixir_make, "~> 0.9", runtime: false},
+      {:castore, "~> 1.0", only: :test},
       {:excoveralls, "~> 0.18", only: :test},
       {:tundra, "~> 0.4.0"},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false}
