@@ -1255,7 +1255,7 @@ defmodule Tricep.SocketTest do
       assert new_state.snd_wnd != initial_snd_wnd or initial_snd_wnd == new_window
     end
 
-    test "ignores out of order packets", %{
+    test "ACKs out of order packets without delivery", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -1282,6 +1282,13 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, wrong_seq_segment)
 
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert :ack in ack.flags
+      assert ack.ack == state.rcv_nxt
+
       # Recv should timeout since data was ignored
       result = Tricep.recv(socket, 0, 100)
       assert result == {:error, :timeout}
@@ -1289,6 +1296,45 @@ defmodule Tricep.SocketTest do
       # rcv_nxt should not have changed
       {:established, new_state} = :sys.get_state(socket)
       assert new_state.rcv_nxt == state.rcv_nxt
+    end
+
+    test "ACKs duplicate data without duplicate delivery", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      # Drain the ACK packet
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.irs + 1,
+          state.snd_nxt,
+          [:ack, :psh],
+          32768,
+          payload: "duplicate once"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      assert_receive {:dummy_link_packet, _link, first_ack_packet}, 1000
+      <<_ip_header::binary-size(40), first_ack_segment::binary>> = first_ack_packet
+      first_ack = Tcp.parse_segment(first_ack_segment)
+
+      DummyLink.inject_packet(link, data_segment)
+
+      assert_receive {:dummy_link_packet, _link, duplicate_ack_packet}, 1000
+      <<_ip_header::binary-size(40), duplicate_ack_segment::binary>> = duplicate_ack_packet
+      duplicate_ack = Tcp.parse_segment(duplicate_ack_segment)
+
+      assert duplicate_ack.ack == first_ack.ack
+      assert Tricep.recv(socket, 0, 1000) == {:ok, "duplicate once"}
     end
 
     test "ignores malformed segments in established state", %{
@@ -2096,7 +2142,7 @@ defmodule Tricep.SocketTest do
       {:fin_wait_2, _} = :sys.get_state(socket)
     end
 
-    test "ignores unexpected segment in FIN_WAIT_2", %{
+    test "ACKs unexpected data in FIN_WAIT_2 without buffering", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -2139,6 +2185,13 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, wrong_seq)
+
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert :ack in ack.flags
+      assert ack.ack == state.irs + 1
 
       # Should still be in FIN_WAIT_2 with empty buffer
       {:fin_wait_2, fin_wait_2_state} = :sys.get_state(socket)
