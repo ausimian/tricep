@@ -6,7 +6,11 @@ defmodule Tricep.Tcp do
   @type flag :: :fin | :syn | :rst | :psh | :ack | :urg | :ece | :cwr
 
   @type tcp_options :: %{
-          optional(:mss) => non_neg_integer()
+          optional(:mss) => non_neg_integer(),
+          optional(:window_scale) => non_neg_integer(),
+          optional(:sack_permitted) => boolean(),
+          optional(:sack_blocks) => [{non_neg_integer(), non_neg_integer()}],
+          optional(:timestamp) => {non_neg_integer(), non_neg_integer()}
         }
 
   @type parsed_segment :: %{
@@ -31,6 +35,10 @@ defmodule Tricep.Tcp do
   - `opts` - optional keyword list:
     - `:payload` - data payload (default: `<<>>`)
     - `:mss` - Maximum Segment Size option (typically sent in SYN)
+    - `:window_scale` - TCP Window Scale shift count
+    - `:sack_permitted` - Emit SACK-permitted option when true
+    - `:sack_blocks` - SACK block edges as `{left, right}` tuples
+    - `:timestamp` - TCP timestamp `{tsval, tsecr}` tuple
   """
   @spec build_segment(
           {{binary(), non_neg_integer()}, {binary(), non_neg_integer()}},
@@ -44,10 +52,9 @@ defmodule Tricep.Tcp do
 
   def build_segment({{src_addr, src_port}, {dst_addr, dst_port}}, seq, ack, flags, window, opts) do
     payload = Keyword.get(opts, :payload, <<>>)
-    mss = Keyword.get(opts, :mss)
 
     # Build TCP options
-    options = encode_options(mss: mss)
+    options = encode_options(opts)
     options_len = byte_size(options)
 
     # data_offset is in 32-bit words (base header is 5 words = 20 bytes)
@@ -91,19 +98,83 @@ defmodule Tricep.Tcp do
   end
 
   defp encode_options(opts) do
-    mss = Keyword.get(opts, :mss)
+    base_options =
+      [
+        encode_mss_option(Keyword.get(opts, :mss)),
+        encode_window_scale_option(Keyword.get(opts, :window_scale)),
+        encode_sack_permitted_option(Keyword.get(opts, :sack_permitted, false)),
+        encode_timestamp_option(Keyword.get(opts, :timestamp))
+      ]
+      |> IO.iodata_to_binary()
 
-    options =
-      if mss do
-        # MSS option: Kind=2, Length=4, Value=MSS
-        <<2, 4, mss::16>>
-      else
-        <<>>
-      end
+    sack_blocks =
+      opts
+      |> Keyword.get(:sack_blocks, [])
+      |> encode_sack_blocks_option()
+      |> IO.iodata_to_binary()
 
-    # Pad to 32-bit boundary with NOP (kind=1) or END (kind=0)
-    pad_options(options)
+    [
+      base_options,
+      if(byte_size(base_options) + byte_size(sack_blocks) <= 40, do: sack_blocks, else: <<>>)
+    ]
+    |> IO.iodata_to_binary()
+    |> pad_options()
   end
+
+  defp encode_mss_option(nil), do: <<>>
+  defp encode_mss_option(mss) when is_integer(mss) and mss in 0..65_535, do: <<2, 4, mss::16>>
+  defp encode_mss_option(_mss), do: <<>>
+
+  defp encode_window_scale_option(nil), do: <<>>
+
+  defp encode_window_scale_option(scale) when is_integer(scale) and scale in 0..255 do
+    <<3, 3, scale>>
+  end
+
+  defp encode_window_scale_option(_scale), do: <<>>
+
+  defp encode_sack_permitted_option(true), do: <<4, 2>>
+  defp encode_sack_permitted_option(_sack_permitted), do: <<>>
+
+  defp encode_timestamp_option({tsval, tsecr})
+       when is_integer(tsval) and tsval in 0..0xFFFFFFFF and is_integer(tsecr) and
+              tsecr in 0..0xFFFFFFFF do
+    <<8, 10, tsval::32, tsecr::32>>
+  end
+
+  defp encode_timestamp_option(_timestamp), do: <<>>
+
+  defp encode_sack_blocks_option([]), do: <<>>
+
+  defp encode_sack_blocks_option(blocks) when is_list(blocks) do
+    blocks =
+      blocks
+      |> Enum.take(4)
+      |> Enum.filter(fn
+        {left, right}
+        when is_integer(left) and left in 0..0xFFFFFFFF and is_integer(right) and
+               right in 0..0xFFFFFFFF ->
+          true
+
+        _ ->
+          false
+      end)
+
+    case blocks do
+      [] ->
+        <<>>
+
+      blocks ->
+        encoded_blocks =
+          Enum.map(blocks, fn {left, right} ->
+            <<left::32, right::32>>
+          end)
+
+        [<<5, 2 + length(blocks) * 8>>, encoded_blocks]
+    end
+  end
+
+  defp encode_sack_blocks_option(_blocks), do: <<>>
 
   defp pad_options(options) do
     case rem(byte_size(options), 4) do
@@ -173,6 +244,34 @@ defmodule Tricep.Tcp do
     parse_options(rest, Map.put(acc, :mss, mss))
   end
 
+  # Window Scale (kind=3, length=3)
+  defp parse_options(<<3, 3, scale, rest::binary>>, acc) do
+    parse_options(rest, Map.put(acc, :window_scale, scale))
+  end
+
+  # SACK permitted (kind=4, length=2)
+  defp parse_options(<<4, 2, rest::binary>>, acc) do
+    parse_options(rest, Map.put(acc, :sack_permitted, true))
+  end
+
+  # SACK blocks (kind=5, length=2+8n)
+  defp parse_options(<<5, len, rest::binary>>, acc) when len >= 10 and rem(len - 2, 8) == 0 do
+    blocks_len = len - 2
+
+    case rest do
+      <<blocks_bin::binary-size(blocks_len), remaining::binary>> ->
+        parse_options(remaining, Map.put(acc, :sack_blocks, parse_sack_blocks(blocks_bin)))
+
+      _ ->
+        acc
+    end
+  end
+
+  # Timestamp (kind=8, length=10)
+  defp parse_options(<<8, 10, tsval::32, tsecr::32, rest::binary>>, acc) do
+    parse_options(rest, Map.put(acc, :timestamp, {tsval, tsecr}))
+  end
+
   # Unknown option with length - skip it
   defp parse_options(<<_kind, len, rest::binary>>, acc) when len >= 2 do
     skip_len = len - 2
@@ -188,6 +287,10 @@ defmodule Tricep.Tcp do
 
   # Malformed - stop parsing
   defp parse_options(_, acc), do: acc
+
+  defp parse_sack_blocks(blocks_bin) do
+    for <<left::32, right::32 <- blocks_bin>>, do: {left, right}
+  end
 
   @doc """
   Decodes TCP flag bits into a list of flag atoms.

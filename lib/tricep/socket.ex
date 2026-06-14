@@ -120,6 +120,8 @@ defmodule Tricep.Socket do
   @default_mss 1220
   @default_recv_buffer_size 65_535
   @max_tcp_window 65_535
+  @max_window_scale 14
+  @max_scaled_tcp_window @max_tcp_window <<< @max_window_scale
   @default_fin_wait_2_timeout_ms 60_000
   @ephemeral_port_first 49_152
   @ephemeral_port_last 65_535
@@ -147,6 +149,13 @@ defmodule Tricep.Socket do
     field :rcv_mss, non_neg_integer() | nil, default: nil
     # MSS peer advertised (max we can send)
     field :snd_mss, non_neg_integer() | nil, default: nil
+    # Window scale we advertise to peer for our receive window
+    field :rcv_wnd_scale, non_neg_integer(), default: 0
+    # Window scale peer advertised for its receive window
+    field :snd_wnd_scale, non_neg_integer(), default: 0
+    # Peer option state parsed during handshake; SACK recovery/PAWS are not implemented yet
+    field :peer_sack_permitted, boolean(), default: false
+    field :peer_timestamp, {non_neg_integer(), non_neg_integer()} | nil, default: nil
     # Buffers for data transfer
     field :send_buffer, DataBuffer.t(), default: DataBuffer.new()
     field :recv_buffer, binary(), default: <<>>
@@ -413,6 +422,7 @@ defmodule Tricep.Socket do
                   rcv_mss: mtu - 60,
                   recv_buffer_size: recv_buffer_size,
                   rcv_wnd: recv_buffer_size,
+                  rcv_wnd_scale: window_scale_for(recv_buffer_size),
                   fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(closed_data)
                 }
 
@@ -483,12 +493,15 @@ defmodule Tricep.Socket do
 
   def handle_event(:internal, {:send_syn, from, timeout}, :closed, %__MODULE__{} = state) do
     iss = :crypto.strong_rand_bytes(4) |> :binary.decode_unsigned()
-    rcv_wnd = receive_window(state)
+    rcv_wnd = advertised_receive_window(state)
 
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(state.pair, iss, 0, [:syn], rcv_wnd, mss: state.rcv_mss)
+      Tcp.build_segment(state.pair, iss, 0, [:syn], rcv_wnd,
+        mss: state.rcv_mss,
+        window_scale: state.rcv_wnd_scale
+      )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     :ok = Tricep.Link.send(state.link, packet)
@@ -561,14 +574,18 @@ defmodule Tricep.Socket do
 
             # Extract peer's MSS from options, default to 1220 (IPv6 min MTU 1280 - 60) if not present
             snd_mss = Map.get(options, :mss, @default_mss)
+            snd_wnd_scale = peer_window_scale(options)
 
             new_state = %{
               state
               | irs: seq,
                 rcv_nxt: seq + 1,
                 snd_una: ack,
-                snd_wnd: window,
+                snd_wnd: scale_window(window, snd_wnd_scale),
                 snd_mss: snd_mss,
+                snd_wnd_scale: snd_wnd_scale,
+                peer_sack_permitted: Map.get(options, :sack_permitted, false),
+                peer_timestamp: Map.get(options, :timestamp),
                 syn_retransmit_count: 0,
                 rto_ms: @initial_rto_ms
             }
@@ -618,6 +635,7 @@ defmodule Tricep.Socket do
             send_ack(seq + 1, state)
 
             snd_mss = Map.get(options, :mss, @default_mss)
+            snd_wnd_scale = peer_window_scale(options)
 
             # Notify callers that connect can complete
             notify_selects(state.connect_selects)
@@ -627,8 +645,11 @@ defmodule Tricep.Socket do
               | irs: seq,
                 rcv_nxt: seq + 1,
                 snd_una: ack,
-                snd_wnd: window,
+                snd_wnd: scale_window(window, snd_wnd_scale),
                 snd_mss: snd_mss,
+                snd_wnd_scale: snd_wnd_scale,
+                peer_sack_permitted: Map.get(options, :sack_permitted, false),
+                peer_timestamp: Map.get(options, :timestamp),
                 syn_retransmit_count: 0,
                 rto_ms: @initial_rto_ms
             }
@@ -677,7 +698,7 @@ defmodule Tricep.Socket do
             base_state = %{
               state
               | snd_una: ack,
-                snd_wnd: window,
+                snd_wnd: scale_peer_window(state, window),
                 syn_retransmit_count: 0,
                 rto_ms: @initial_rto_ms,
                 passive_listener: nil
@@ -1001,7 +1022,7 @@ defmodule Tricep.Socket do
                 fin_state
                 |> notify_recv_select(:eof)
                 |> Map.put(:snd_una, new_snd_una)
-                |> Map.put(:snd_wnd, window)
+                |> Map.put(:snd_wnd, scale_peer_window(state, window))
 
               # Notify waiters: deliver buffered data or EOF
               {new_recv_buffer, new_waiters, replies} =
@@ -1033,7 +1054,7 @@ defmodule Tricep.Socket do
                 if ack? do
                   process_ack(receive_state, ack, window)
                 else
-                  {%{receive_state | snd_wnd: window}, []}
+                  {%{receive_state | snd_wnd: scale_peer_window(receive_state, window)}, []}
                 end
 
               send_ack(new_state.rcv_nxt, new_state)
@@ -1340,7 +1361,9 @@ defmodule Tricep.Socket do
             # FIN from peer - ACK it and go to TIME_WAIT
             # Handle any data that came with the FIN
             data_len = byte_size(payload)
-            {receive_state, accepted_len} = receive_payload(%{state | snd_wnd: window}, payload)
+
+            {receive_state, accepted_len} =
+              receive_payload(%{state | snd_wnd: scale_peer_window(state, window)}, payload)
 
             if accepted_len == data_len do
               new_state =
@@ -1363,7 +1386,9 @@ defmodule Tricep.Socket do
 
           ack? and seq == state.rcv_nxt and byte_size(payload) > 0 ->
             # Data segment - half-close allows peer to still send data
-            {new_state, _accepted_len} = receive_payload(%{state | snd_wnd: window}, payload)
+            {new_state, _accepted_len} =
+              receive_payload(%{state | snd_wnd: scale_peer_window(state, window)}, payload)
+
             send_ack(new_state.rcv_nxt, new_state)
 
             {:keep_state, new_state}
@@ -1740,6 +1765,8 @@ defmodule Tricep.Socket do
     %{seq: seq, window: window, options: options} = Tcp.parse_segment(segment)
     iss = :crypto.strong_rand_bytes(4) |> :binary.decode_unsigned()
     recv_buffer_size = configured_recv_buffer_size(socket_opts)
+    rcv_wnd_scale = window_scale_for(recv_buffer_size)
+    snd_wnd_scale = peer_window_scale(options)
 
     %__MODULE__{
       pair: {{dst_addr, dst_port}, {src_addr, src_port}},
@@ -1747,12 +1774,16 @@ defmodule Tricep.Socket do
       iss: iss,
       snd_una: iss,
       snd_nxt: wrap_seq(iss + 1),
-      snd_wnd: window,
+      snd_wnd: scale_window(window, snd_wnd_scale),
       irs: seq,
       rcv_nxt: wrap_seq(seq + 1),
       rcv_wnd: recv_buffer_size,
       rcv_mss: mtu - 60,
       snd_mss: Map.get(options, :mss, @default_mss),
+      rcv_wnd_scale: rcv_wnd_scale,
+      snd_wnd_scale: snd_wnd_scale,
+      peer_sack_permitted: Map.get(options, :sack_permitted, false),
+      peer_timestamp: Map.get(options, :timestamp),
       recv_buffer_size: recv_buffer_size,
       rto_ms: @initial_rto_ms,
       syn_retransmit_count: 0,
@@ -1869,8 +1900,14 @@ defmodule Tricep.Socket do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(state.pair, state.iss, state.rcv_nxt, [:syn, :ack], receive_window(state),
-        mss: state.rcv_mss
+      Tcp.build_segment(
+        state.pair,
+        state.iss,
+        state.rcv_nxt,
+        [:syn, :ack],
+        advertised_receive_window(state),
+        mss: state.rcv_mss,
+        window_scale: state.rcv_wnd_scale
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
@@ -1902,8 +1939,9 @@ defmodule Tricep.Socket do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(state.pair, state.iss, 0, [:syn], receive_window(state),
-        mss: state.rcv_mss
+      Tcp.build_segment(state.pair, state.iss, 0, [:syn], advertised_receive_window(state),
+        mss: state.rcv_mss,
+        window_scale: state.rcv_wnd_scale
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
@@ -1970,7 +2008,7 @@ defmodule Tricep.Socket do
           seq,
           state.rcv_nxt,
           [:ack, :psh],
-          receive_window(state),
+          advertised_receive_window(state),
           payload: payload
         )
 
@@ -2059,7 +2097,7 @@ defmodule Tricep.Socket do
             seq_start,
             state.rcv_nxt,
             [:ack, :psh],
-            receive_window(state),
+            advertised_receive_window(state),
             payload: payload
           )
 
@@ -2118,7 +2156,13 @@ defmodule Tricep.Socket do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(state.pair, state.snd_nxt, ack_num, [:ack], receive_window(state))
+      Tcp.build_segment(
+        state.pair,
+        state.snd_nxt,
+        ack_num,
+        [:ack],
+        advertised_receive_window(state)
+      )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     Tricep.Link.send(state.link, packet)
@@ -2192,7 +2236,7 @@ defmodule Tricep.Socket do
         seq,
         state.rcv_nxt,
         [:fin, :ack],
-        receive_window(state)
+        advertised_receive_window(state)
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
@@ -2296,7 +2340,7 @@ defmodule Tricep.Socket do
   defp configured_fin_wait_2_timeout_ms(_opts), do: @default_fin_wait_2_timeout_ms
 
   defp normalize_recv_buffer_size(size) when is_integer(size) and size > 0 do
-    min(size, @max_tcp_window)
+    min(size, @max_scaled_tcp_window)
   end
 
   defp normalize_recv_buffer_size(_size), do: @default_recv_buffer_size
@@ -2312,6 +2356,12 @@ defmodule Tricep.Socket do
     state.recv_buffer
     |> byte_size()
     |> then(&max(0, state.recv_buffer_size - &1))
+  end
+
+  defp advertised_receive_window(%__MODULE__{} = state) do
+    state
+    |> receive_window()
+    |> then(&(&1 >>> state.rcv_wnd_scale))
     |> min(@max_tcp_window)
   end
 
@@ -2338,6 +2388,34 @@ defmodule Tricep.Socket do
       |> refresh_receive_window()
 
     {new_state, accepted_len}
+  end
+
+  defp window_scale_for(size) when is_integer(size) and size > @max_tcp_window do
+    Enum.find(1..@max_window_scale, @max_window_scale, fn scale ->
+      size <= @max_tcp_window <<< scale
+    end)
+  end
+
+  defp window_scale_for(_size), do: 0
+
+  defp peer_window_scale(options) do
+    options
+    |> Map.get(:window_scale, 0)
+    |> normalize_window_scale()
+  end
+
+  defp normalize_window_scale(scale) when is_integer(scale) and scale >= 0 do
+    min(scale, @max_window_scale)
+  end
+
+  defp normalize_window_scale(_scale), do: 0
+
+  defp scale_peer_window(%__MODULE__{} = state, window) do
+    scale_window(window, state.snd_wnd_scale)
+  end
+
+  defp scale_window(window, scale) when is_integer(window) and is_integer(scale) do
+    window <<< scale
   end
 
   defp notify_recv_select(%__MODULE__{} = state, :eof) do
@@ -2415,7 +2493,7 @@ defmodule Tricep.Socket do
             seq,
             state.rcv_nxt,
             [:ack, :psh],
-            receive_window(state),
+            advertised_receive_window(state),
             payload: payload
           )
 
@@ -2478,7 +2556,7 @@ defmodule Tricep.Socket do
   # Returns {new_state, timer_actions}
   defp process_ack_if_present(state, false, _ack, window) do
     state
-    |> Map.put(:snd_wnd, window)
+    |> Map.put(:snd_wnd, scale_peer_window(state, window))
     |> sync_persist_timer([])
   end
 
@@ -2530,7 +2608,7 @@ defmodule Tricep.Socket do
         base_state = %{
           state
           | snd_una: ack,
-            snd_wnd: window,
+            snd_wnd: scale_peer_window(state, window),
             unacked_segments: new_unacked,
             rto_ms: @initial_rto_ms
         }
@@ -2554,7 +2632,7 @@ defmodule Tricep.Socket do
 
       true ->
         # Duplicate or old ACK - just update window (but still check send waiters)
-        base_state = %{state | snd_wnd: window}
+        base_state = %{state | snd_wnd: scale_peer_window(state, window)}
         {new_state, send_waiter_actions} = process_send_waiters(base_state)
         send_waiter_actions = schedule_flush_send_buffer(new_state, send_waiter_actions)
         sync_persist_timer(new_state, send_waiter_actions)
