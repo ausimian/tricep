@@ -213,6 +213,16 @@ defmodule Tricep do
   end
 
   @doc """
+  Returns the local address and port assigned to a socket.
+
+  This is available after `bind/2` succeeds and for connected sockets.
+  """
+  @spec sockname(pid()) :: {:ok, :socket.sockaddr_in6()} | {:error, atom()}
+  def sockname(socket) when is_pid(socket) do
+    Tricep.Socket.sockname(socket)
+  end
+
+  @doc """
   Marks a bound socket as a TCP listener.
 
   Incoming SYNs for the bound local address and port are answered with SYN-ACKs,

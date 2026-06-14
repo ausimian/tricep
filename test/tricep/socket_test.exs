@@ -660,6 +660,38 @@ defmodule Tricep.SocketTest do
       assert Tricep.close(specific) == :ok
     end
 
+    test "bind with port zero assigns an ephemeral local port", %{remote_addr: remote_addr} do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(socket, %{family: :inet6, addr: remote_addr, port: 0}) == :ok
+
+      assert {:ok, %{family: :inet6, addr: {0xFD00, 0, 0, 0, 0, 0, 0, 2}, port: port}} =
+               Tricep.sockname(socket)
+
+      assert port in 49_152..65_535
+
+      assert Tricep.close(socket) == :ok
+    end
+
+    test "bind with port zero reserves the selected local port", %{remote_addr: remote_addr} do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+      {:ok, duplicate} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(socket, %{family: :inet6, addr: remote_addr, port: 0}) == :ok
+      assert {:ok, %{port: port}} = Tricep.sockname(socket)
+
+      assert Tricep.bind(duplicate, %{family: :inet6, addr: remote_addr, port: port}) ==
+               {:error, :eaddrinuse}
+
+      assert Tricep.close(socket) == :ok
+    end
+
+    test "sockname on an unbound socket returns error" do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.sockname(socket) == {:error, :einval}
+    end
+
     test "bind accepts a raw 16-byte IPv6 address binary", %{remote_addr: remote_addr} do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
 
