@@ -157,6 +157,9 @@ defmodule Tricep.TunLink do
       17 ->
         handle_udp(data, src, dst, state)
 
+      44 ->
+        handle_fragment(data, src, dst, state)
+
       58 ->
         handle_icmpv6(data, src, dst, state)
 
@@ -168,7 +171,7 @@ defmodule Tricep.TunLink do
     end
   end
 
-  defp unwrap_ipv6_payload(protocol, payload) when protocol in [6, 17, 58, 59] do
+  defp unwrap_ipv6_payload(protocol, payload) when protocol in [6, 17, 44, 58, 59] do
     {:ok, protocol, payload}
   end
 
