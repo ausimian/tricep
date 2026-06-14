@@ -57,6 +57,51 @@ defmodule Tricep.SocketTest do
       Task.shutdown(task, :brutal_kill)
     end
 
+    test "connect from a bound socket uses the bound source address and port", %{
+      link: link,
+      remote_addr: remote_addr,
+      local_addr: local_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+      bound_port = 40_020
+
+      on_exit(fn -> stop_socket(socket) end)
+
+      assert Tricep.bind(socket, %{family: :inet6, addr: remote_addr, port: bound_port}) == :ok
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+
+      <<6::4, _::4, _::24, _payload_len::16, 6::8, _hop::8, pkt_src::binary-size(16),
+        pkt_dst::binary-size(16), syn_segment::binary>> = syn_packet
+
+      <<src_port::16, _dst_port::16, _::binary>> = syn_segment
+      syn = Tcp.parse_segment(syn_segment)
+
+      assert pkt_src == remote_addr
+      assert pkt_dst == local_addr
+      assert src_port == bound_port
+      assert :syn in syn.flags
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, bound_port}},
+          5000,
+          syn.seq + 1,
+          [:syn, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert Task.await(task, 1000) == :ok
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+    end
+
     test "returns eaddrnotavail when all ephemeral ports are exhausted", %{
       local_addr: local_addr,
       remote_addr: remote_addr
