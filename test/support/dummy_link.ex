@@ -31,6 +31,7 @@ defmodule Tricep.DummyLink do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
+    opts = Keyword.put_new(opts, :owner, self())
     GenServer.start_link(__MODULE__, opts)
   end
 
@@ -74,7 +75,7 @@ defmodule Tricep.DummyLink do
   def init(opts) do
     local_addr = normalize_addr(Keyword.fetch!(opts, :local_addr))
     remote_addr = normalize_addr(Keyword.fetch!(opts, :remote_addr))
-    owner = Keyword.get(opts, :owner, self())
+    owner = Keyword.fetch!(opts, :owner)
 
     # Register with the application so Socket can find us when connecting to local_addr
     # register_link(srcaddr, dstaddr) -> key=dstaddr, value=srcaddr
