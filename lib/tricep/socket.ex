@@ -2198,6 +2198,25 @@ defmodule Tricep.Socket do
       notify_send_waiters_error(state.send_waiters, error)
   end
 
+  defp settle_close_waiters(%__MODULE__{} = state) do
+    notify_selects(state.recv_selects)
+
+    {recv_buffer, _recv_waiters, recv_actions} =
+      process_waiters_eof(state.recv_buffer, state.recv_waiters)
+
+    send_actions = notify_send_waiters_error(state.send_waiters, :epipe)
+
+    new_state = %{
+      state
+      | recv_buffer: recv_buffer,
+        recv_waiters: [],
+        recv_selects: [],
+        send_waiters: []
+    }
+
+    {new_state, recv_actions ++ send_actions}
+  end
+
   defp do_flush_send_buffer(%__MODULE__{} = state) do
     available = send_window_available(state)
 
@@ -2326,14 +2345,17 @@ defmodule Tricep.Socket do
   end
 
   defp close_or_drain_send_buffer(%__MODULE__{} = state, from, next_state) do
+    {state, waiter_actions} = settle_close_waiters(state)
+
     if DataBuffer.empty?(state.send_buffer) do
+      {state, waiter_actions} = sync_persist_timer(state, waiter_actions)
       {new_state, actions} = send_fin_and_track(%{state | write_shutdown: false})
-      {:next_state, next_state, new_state, [{:reply, from, :ok} | actions]}
+      {:next_state, next_state, new_state, [{:reply, from, :ok}] ++ waiter_actions ++ actions}
     else
       new_state = %{state | write_shutdown: true}
 
       {:keep_state, new_state,
-       [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+       waiter_actions ++ [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
     end
   end
 
