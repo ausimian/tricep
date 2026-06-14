@@ -120,6 +120,8 @@ defmodule Tricep.Socket do
     field :send_waiters, list(), default: []
     # Track if read side has been shutdown
     field :read_shutdown, boolean(), default: false
+    # Track if write side has been shutdown while queued data drains
+    field :write_shutdown, boolean(), default: false
   end
 
   # TIME_WAIT duration (2*MSL - using short value for TUN-based stack)
@@ -437,6 +439,15 @@ defmodule Tricep.Socket do
 
   # --- Established state: send ---
 
+  def handle_event(
+        {:call, from},
+        {:send, _data, _timeout},
+        :established,
+        %__MODULE__{write_shutdown: true}
+      ) do
+    {:keep_state_and_data, {:reply, from, {:error, :epipe}}}
+  end
+
   def handle_event({:call, from}, {:send, data, timeout}, :established, %__MODULE__{} = state) do
     available = send_window_available(state)
 
@@ -493,11 +504,20 @@ defmodule Tricep.Socket do
   end
 
   def handle_event(:internal, :flush_send_buffer, :established, %__MODULE__{} = state) do
-    if DataBuffer.empty?(state.send_buffer) do
-      :keep_state_and_data
-    else
-      do_flush_send_buffer(state)
+    cond do
+      not DataBuffer.empty?(state.send_buffer) ->
+        do_flush_send_buffer(state)
+
+      state.write_shutdown ->
+        {:keep_state, state, {:next_event, :internal, :send_pending_fin}}
+
+      true ->
+        :keep_state_and_data
     end
+  end
+
+  def handle_event(:internal, :send_pending_fin, :established, %__MODULE__{} = state) do
+    send_pending_fin(state, :fin_wait_1)
   end
 
   # --- Established state: recv ---
@@ -698,17 +718,33 @@ defmodule Tricep.Socket do
 
   # --- Active close from established ---
 
+  def handle_event(
+        {:call, from},
+        :close,
+        :established,
+        %__MODULE__{write_shutdown: true} = state
+      ) do
+    {:keep_state, state, {:reply, from, :ok}}
+  end
+
   def handle_event({:call, from}, :close, :established, %__MODULE__{} = state) do
-    {new_state, actions} = send_fin_and_track(state)
-    {:next_state, :fin_wait_1, new_state, [{:reply, from, :ok} | actions]}
+    close_or_drain_send_buffer(state, from, :fin_wait_1)
   end
 
   # --- Shutdown from established ---
 
   # shutdown(:write) - send FIN, transition to fin_wait_1
+  def handle_event(
+        {:call, from},
+        {:shutdown, :write},
+        :established,
+        %__MODULE__{write_shutdown: true} = state
+      ) do
+    {:keep_state, state, {:reply, from, :ok}}
+  end
+
   def handle_event({:call, from}, {:shutdown, :write}, :established, %__MODULE__{} = state) do
-    {new_state, actions} = send_fin_and_track(state)
-    {:next_state, :fin_wait_1, new_state, [{:reply, from, :ok} | actions]}
+    close_or_drain_send_buffer(state, from, :fin_wait_1)
   end
 
   # shutdown(:read) - just mark read as shutdown, stay in established
@@ -718,9 +754,20 @@ defmodule Tricep.Socket do
   end
 
   # shutdown(:read_write) - same as close
+  def handle_event(
+        {:call, from},
+        {:shutdown, :read_write},
+        :established,
+        %__MODULE__{write_shutdown: true} = state
+      ) do
+    new_state = %{state | read_shutdown: true}
+    {:keep_state, new_state, {:reply, from, :ok}}
+  end
+
   def handle_event({:call, from}, {:shutdown, :read_write}, :established, %__MODULE__{} = state) do
-    {new_state, actions} = send_fin_and_track(%{state | read_shutdown: true})
-    {:next_state, :fin_wait_1, new_state, [{:reply, from, :ok} | actions]}
+    state
+    |> Map.put(:read_shutdown, true)
+    |> close_or_drain_send_buffer(from, :fin_wait_1)
   end
 
   # --- FIN_WAIT_1 state ---
@@ -883,6 +930,15 @@ defmodule Tricep.Socket do
 
   # --- CLOSE_WAIT state (peer closed, we can still send) ---
 
+  def handle_event(
+        {:call, from},
+        {:send, _data, _timeout},
+        :close_wait,
+        %__MODULE__{write_shutdown: true}
+      ) do
+    {:keep_state_and_data, {:reply, from, {:error, :epipe}}}
+  end
+
   def handle_event({:call, from}, {:send, data, timeout}, :close_wait, %__MODULE__{} = state) do
     available = send_window_available(state)
 
@@ -921,11 +977,20 @@ defmodule Tricep.Socket do
   end
 
   def handle_event(:internal, :flush_send_buffer, :close_wait, %__MODULE__{} = state) do
-    if DataBuffer.empty?(state.send_buffer) do
-      :keep_state_and_data
-    else
-      do_flush_send_buffer(state)
+    cond do
+      not DataBuffer.empty?(state.send_buffer) ->
+        do_flush_send_buffer(state)
+
+      state.write_shutdown ->
+        {:keep_state, state, {:next_event, :internal, :send_pending_fin}}
+
+      true ->
+        :keep_state_and_data
     end
+  end
+
+  def handle_event(:internal, :send_pending_fin, :close_wait, %__MODULE__{} = state) do
+    send_pending_fin(state, :last_ack)
   end
 
   # Handle send timeout in close_wait
@@ -963,15 +1028,26 @@ defmodule Tricep.Socket do
     end
   end
 
+  def handle_event({:call, from}, :close, :close_wait, %__MODULE__{write_shutdown: true} = state) do
+    {:keep_state, state, {:reply, from, :ok}}
+  end
+
   def handle_event({:call, from}, :close, :close_wait, %__MODULE__{} = state) do
-    {new_state, actions} = send_fin_and_track(state)
-    {:next_state, :last_ack, new_state, [{:reply, from, :ok} | actions]}
+    close_or_drain_send_buffer(state, from, :last_ack)
   end
 
   # shutdown(:write) in close_wait - send FIN, go to last_ack
+  def handle_event(
+        {:call, from},
+        {:shutdown, :write},
+        :close_wait,
+        %__MODULE__{write_shutdown: true} = state
+      ) do
+    {:keep_state, state, {:reply, from, :ok}}
+  end
+
   def handle_event({:call, from}, {:shutdown, :write}, :close_wait, %__MODULE__{} = state) do
-    {new_state, actions} = send_fin_and_track(state)
-    {:next_state, :last_ack, new_state, [{:reply, from, :ok} | actions]}
+    close_or_drain_send_buffer(state, from, :last_ack)
   end
 
   # shutdown(:read) in close_wait - already received FIN, just mark it
@@ -981,9 +1057,20 @@ defmodule Tricep.Socket do
   end
 
   # shutdown(:read_write) in close_wait - send FIN, go to last_ack
+  def handle_event(
+        {:call, from},
+        {:shutdown, :read_write},
+        :close_wait,
+        %__MODULE__{write_shutdown: true} = state
+      ) do
+    new_state = %{state | read_shutdown: true}
+    {:keep_state, new_state, {:reply, from, :ok}}
+  end
+
   def handle_event({:call, from}, {:shutdown, :read_write}, :close_wait, %__MODULE__{} = state) do
-    {new_state, actions} = send_fin_and_track(%{state | read_shutdown: true})
-    {:next_state, :last_ack, new_state, [{:reply, from, :ok} | actions]}
+    state
+    |> Map.put(:read_shutdown, true)
+    |> close_or_drain_send_buffer(from, :last_ack)
   end
 
   def handle_event(:info, segment, :close_wait, %__MODULE__{} = state) do
@@ -1239,7 +1326,10 @@ defmodule Tricep.Socket do
             unacked_segments: new_unacked
         }
 
-        actions = schedule_flush_send_buffer(new_state, [])
+        actions =
+          new_state
+          |> schedule_flush_send_buffer([])
+          |> schedule_pending_fin(new_state)
 
         # Start RTO timer if not already running
         {new_state, actions} =
@@ -1308,6 +1398,37 @@ defmodule Tricep.Socket do
       {%{new_state | rto_timer_active: true}, [{{:timeout, :rto}, state.rto_ms, :retransmit}]}
     end
   end
+
+  defp close_or_drain_send_buffer(%__MODULE__{} = state, from, next_state) do
+    if DataBuffer.empty?(state.send_buffer) do
+      {new_state, actions} = send_fin_and_track(%{state | write_shutdown: false})
+      {:next_state, next_state, new_state, [{:reply, from, :ok} | actions]}
+    else
+      new_state = %{state | write_shutdown: true}
+
+      {:keep_state, new_state,
+       [{:reply, from, :ok}, {:next_event, :internal, :flush_send_buffer}]}
+    end
+  end
+
+  defp send_pending_fin(%__MODULE__{} = state, next_state) do
+    if DataBuffer.empty?(state.send_buffer) do
+      {new_state, actions} = send_fin_and_track(%{state | write_shutdown: false})
+      {:next_state, next_state, new_state, actions}
+    else
+      {:keep_state, state, {:next_event, :internal, :flush_send_buffer}}
+    end
+  end
+
+  defp schedule_pending_fin(actions, %__MODULE__{write_shutdown: true} = state) do
+    if DataBuffer.empty?(state.send_buffer) do
+      actions ++ [{:next_event, :internal, :send_pending_fin}]
+    else
+      actions
+    end
+  end
+
+  defp schedule_pending_fin(actions, %__MODULE__{}), do: actions
 
   defp send_fin_segment(%__MODULE__{} = state, seq) do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
