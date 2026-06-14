@@ -20,9 +20,7 @@ defmodule Tricep.SocketTest do
     {:ok, link} =
       DummyLink.start_link(local_addr: local_addr, remote_addr: remote_addr, owner: self())
 
-    on_exit(fn ->
-      if Process.alive?(link), do: GenServer.stop(link)
-    end)
+    on_exit(fn -> stop_link(link) end)
 
     %{link: link, local_addr: local_addr, remote_addr: remote_addr}
   end
@@ -3455,6 +3453,15 @@ defmodule Tricep.SocketTest do
   defp get_socket_snd_nxt(socket) do
     {_state_name, state} = :sys.get_state(socket)
     state.snd_nxt
+  end
+
+  defp stop_link(link) do
+    if Process.alive?(link) do
+      GenServer.stop(link)
+    end
+  catch
+    :exit, :noproc -> :ok
+    :exit, {:noproc, _} -> :ok
   end
 
   defp wrap_seq(n), do: Bitwise.band(n, 0xFFFFFFFF)
