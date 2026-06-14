@@ -133,6 +133,7 @@ defmodule Tricep.Socket do
   @max_retransmit_count 5
   @initial_persist_timeout_ms 1_000
   @max_persist_timeout_ms 60_000
+  @any_addr <<0::128>>
 
   @typep addr_port() :: {binary(), non_neg_integer()}
   typedstruct enforce: true do
@@ -430,6 +431,49 @@ defmodule Tricep.Socket do
 
               {:error, reason} ->
                 {:keep_state_and_data, {:reply, from, {:error, reason}}}
+            end
+
+          nil ->
+            {:keep_state_and_data, {:reply, from, {:error, :enetunreach}}}
+        end
+
+      {:error, reason} ->
+        {:keep_state_and_data, {:reply, from, {:error, reason}}}
+    end
+  end
+
+  def handle_event({:call, from}, {:connect, address, timeout}, :bound, bound_data) do
+    case validate_sockaddr_in6(address) do
+      {:ok, dstaddr_bin, dst_port} ->
+        case Application.lookup_link(dstaddr_bin) do
+          {pid, {srcaddr_bin, mtu}} ->
+            with {:ok, local_addr} <- bound_connect_source(bound_data.local_addr, srcaddr_bin),
+                 :ok <-
+                   Application.register_socket_pair(
+                     {{local_addr, bound_data.local_port}, {dstaddr_bin, dst_port}}
+                   ) do
+              pair = {{local_addr, bound_data.local_port}, {dstaddr_bin, dst_port}}
+              send_syn = {:next_event, :internal, {:send_syn, from, timeout}}
+              recv_buffer_size = recv_buffer_size(bound_data)
+
+              state = %__MODULE__{
+                pair: pair,
+                link: pid,
+                rcv_mss: mtu - 60,
+                recv_buffer_size: recv_buffer_size,
+                rcv_wnd: recv_buffer_size,
+                rcv_wnd_scale: window_scale_for(recv_buffer_size),
+                fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(bound_data)
+              }
+
+              deregister_bound_data(bound_data)
+              {:next_state, :closed, state, send_syn}
+            else
+              {:error, :eaddrnotavail} ->
+                {:keep_state_and_data, {:reply, from, {:error, :eaddrnotavail}}}
+
+              {:error, {:already_registered, _pid}} ->
+                {:keep_state_and_data, {:reply, from, {:error, :eaddrinuse}}}
             end
 
           nil ->
@@ -2242,6 +2286,10 @@ defmodule Tricep.Socket do
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
     Tricep.Link.send(state.link, packet)
   end
+
+  defp bound_connect_source(@any_addr, route_srcaddr), do: {:ok, route_srcaddr}
+  defp bound_connect_source(addr, addr), do: {:ok, addr}
+  defp bound_connect_source(_bound_addr, _route_srcaddr), do: {:error, :eaddrnotavail}
 
   defp allocate_port(srcaddr_bin, dst) do
     start_offset = System.unique_integer([:positive, :monotonic]) |> rem(@ephemeral_port_count)
