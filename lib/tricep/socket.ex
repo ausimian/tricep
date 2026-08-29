@@ -152,6 +152,12 @@ defmodule Tricep.Socket do
   @tcp_ipv6_header_size 60
   # Default MSS for IPv6 (1280 min MTU - 40 IPv6 header - 20 TCP header)
   @default_mss @ipv6_min_mtu - @tcp_ipv6_header_size
+  # Harden against peer-controlled packet and CPU amplification from tiny MSS
+  # values. This matches Linux's default tcp_min_snd_mss compatibility floor.
+  @minimum_snd_mss 48
+  # IPv6 payload length is 16-bit and jumbograms are not supported. Reserve
+  # the fixed 20-byte TCP header so Ip.wrap/4 can always encode data segments.
+  @maximum_ipv6_tcp_mss 65_535 - 20
   @default_recv_buffer_size 65_535
   @max_tcp_window 65_535
   @max_window_scale 14
@@ -182,7 +188,7 @@ defmodule Tricep.Socket do
     field :rcv_wnd, non_neg_integer() | nil, default: nil
     # MSS we advertise to peer (what we can receive)
     field :rcv_mss, non_neg_integer() | nil, default: nil
-    # MSS peer advertised (max we can send)
+    # Effective send MSS after applying peer, path, and protocol bounds
     field :snd_mss, non_neg_integer() | nil, default: nil
     # Window scale we advertise to peer for our receive window
     field :rcv_wnd_scale, non_neg_integer(), default: 0
@@ -457,7 +463,7 @@ defmodule Tricep.Socket do
                 state = %__MODULE__{
                   pair: pair,
                   link: pid,
-                  rcv_mss: mtu - 60,
+                  rcv_mss: local_send_mss(mtu),
                   recv_buffer_size: recv_buffer_size,
                   rcv_wnd: recv_buffer_size,
                   rcv_wnd_scale: window_scale_for(recv_buffer_size),
@@ -497,7 +503,7 @@ defmodule Tricep.Socket do
               state = %__MODULE__{
                 pair: pair,
                 link: pid,
-                rcv_mss: mtu - 60,
+                rcv_mss: local_send_mss(mtu),
                 recv_buffer_size: recv_buffer_size,
                 rcv_wnd: recv_buffer_size,
                 rcv_wnd_scale: window_scale_for(recv_buffer_size),
@@ -672,8 +678,7 @@ defmodule Tricep.Socket do
             # Valid SYN-ACK: send ACK and transition to ESTABLISHED
             send_ack(wrap_seq(seq + 1), state)
 
-            # Extract peer's MSS from options, default to 1220 (IPv6 min MTU 1280 - 60) if not present
-            snd_mss = Map.get(options, :mss, @default_mss)
+            snd_mss = peer_send_mss(options, state.rcv_mss)
             snd_wnd_scale = peer_window_scale(options)
 
             new_state = %{
@@ -734,7 +739,7 @@ defmodule Tricep.Socket do
             # Valid SYN-ACK: send ACK, notify caller, transition to ESTABLISHED
             send_ack(wrap_seq(seq + 1), state)
 
-            snd_mss = Map.get(options, :mss, @default_mss)
+            snd_mss = peer_send_mss(options, state.rcv_mss)
             snd_wnd_scale = peer_window_scale(options)
 
             # Notify callers that connect can complete
@@ -1970,6 +1975,7 @@ defmodule Tricep.Socket do
     recv_buffer_size = configured_recv_buffer_size(socket_opts)
     rcv_wnd_scale = window_scale_for(recv_buffer_size)
     snd_wnd_scale = peer_window_scale(options)
+    local_mss = local_send_mss(mtu)
 
     %__MODULE__{
       pair: {{dst_addr, dst_port}, {src_addr, src_port}},
@@ -1981,8 +1987,8 @@ defmodule Tricep.Socket do
       irs: seq,
       rcv_nxt: wrap_seq(seq + 1),
       rcv_wnd: recv_buffer_size,
-      rcv_mss: mtu - 60,
-      snd_mss: Map.get(options, :mss, @default_mss),
+      rcv_mss: local_mss,
+      snd_mss: peer_send_mss(options, local_mss),
       rcv_wnd_scale: rcv_wnd_scale,
       snd_wnd_scale: snd_wnd_scale,
       recv_buffer_size: recv_buffer_size,
@@ -2428,6 +2434,20 @@ defmodule Tricep.Socket do
 
   defp reset_state(%__MODULE__{} = state) do
     Application.deregister_socket_pair(state.pair)
+  end
+
+  defp peer_send_mss(options, local_mss) do
+    peer_mss =
+      case options do
+        %{mss: mss} when is_integer(mss) -> max(mss, @minimum_snd_mss)
+        _options -> @default_mss
+      end
+
+    min(peer_mss, min(local_mss, @maximum_ipv6_tcp_mss))
+  end
+
+  defp local_send_mss(mtu) when is_integer(mtu) and mtu >= @ipv6_min_mtu do
+    min(mtu - @tcp_ipv6_header_size, @maximum_ipv6_tcp_mss)
   end
 
   defp nowait_connect_failure(%__MODULE__{} = state, reason) do

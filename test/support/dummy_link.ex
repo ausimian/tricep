@@ -12,11 +12,12 @@ defmodule Tricep.DummyLink do
 
   use GenServer
 
-  defstruct [:local_addr, :remote_addr, :packets, :owner]
+  defstruct [:local_addr, :remote_addr, :mtu, :packets, :owner]
 
   @type t :: %__MODULE__{
           local_addr: binary(),
           remote_addr: binary(),
+          mtu: pos_integer(),
           packets: [binary()],
           owner: pid()
         }
@@ -27,6 +28,7 @@ defmodule Tricep.DummyLink do
   Options:
   - `:local_addr` - address Socket connects TO (16 bytes binary or string)
   - `:remote_addr` - address Socket sends FROM (16 bytes binary or string)
+  - `:mtu` - registered IPv6 link MTU (defaults to 1500)
   - `:owner` - pid to notify of events (defaults to caller)
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -75,20 +77,26 @@ defmodule Tricep.DummyLink do
   def init(opts) do
     local_addr = normalize_addr(Keyword.fetch!(opts, :local_addr))
     remote_addr = normalize_addr(Keyword.fetch!(opts, :remote_addr))
+    mtu = Keyword.get(opts, :mtu, 1500)
     owner = Keyword.fetch!(opts, :owner)
 
     # Register with the application so Socket can find us when connecting to local_addr
     # register_link(srcaddr, dstaddr) -> key=dstaddr, value=srcaddr
-    # We want: key=local_addr (what Socket connects to), value=remote_addr (Socket's source)
-    :ok = Tricep.Application.register_link(remote_addr, {local_addr, 1500})
+    # We want: key=local_addr (what Socket connects to), value={remote_addr, mtu}
+    case Tricep.Application.register_link(remote_addr, {local_addr, mtu}) do
+      :ok ->
+        {:ok,
+         %__MODULE__{
+           local_addr: local_addr,
+           remote_addr: remote_addr,
+           mtu: mtu,
+           packets: [],
+           owner: owner
+         }}
 
-    {:ok,
-     %__MODULE__{
-       local_addr: local_addr,
-       remote_addr: remote_addr,
-       packets: [],
-       owner: owner
-     }}
+      {:error, reason} ->
+        {:stop, reason}
+    end
   end
 
   @impl true

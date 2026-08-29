@@ -9,6 +9,7 @@ defmodule Tricep.Application do
   @link_registry Tricep.LinkRegistry
   @socket_registry Tricep.SocketRegistry
   @any_addr <<0::128>>
+  @ipv6_min_mtu 1280
 
   @impl true
   def start(_type, _args) do
@@ -31,8 +32,11 @@ defmodule Tricep.Application do
     DynamicSupervisor.start_child(@link_supervisor, {Tricep.TunLink, opts})
   end
 
+  @spec register_link(binary(), {binary(), integer()}) ::
+          :ok | {:error, :invalid_mtu | {:already_registered, pid()}}
   def register_link(srcaddr, {dstaddr, mtu}) do
-    with {:ok, _pid} <- Registry.register(@link_registry, dstaddr, {srcaddr, mtu}) do
+    with :ok <- validate_ipv6_mtu(mtu),
+         {:ok, _pid} <- Registry.register(@link_registry, dstaddr, {srcaddr, mtu}) do
       :ok
     end
   end
@@ -41,7 +45,8 @@ defmodule Tricep.Application do
       when is_integer(prefix_len) and prefix_len in 0..128 do
     route_key = route_key(dstaddr, prefix_len)
 
-    with {:ok, _pid} <- Registry.register(@link_registry, route_key, {srcaddr, mtu}) do
+    with :ok <- validate_ipv6_mtu(mtu),
+         {:ok, _pid} <- Registry.register(@link_registry, route_key, {srcaddr, mtu}) do
       :ok
     end
   end
@@ -127,6 +132,9 @@ defmodule Tricep.Application do
   end
 
   defp route_key(addr, prefix_len), do: {:route, route_prefix(addr, prefix_len), prefix_len}
+
+  defp validate_ipv6_mtu(mtu) when is_integer(mtu) and mtu >= @ipv6_min_mtu, do: :ok
+  defp validate_ipv6_mtu(_mtu), do: {:error, :invalid_mtu}
 
   defp prefix_match?(addr, prefix, prefix_len) do
     route_prefix(addr, prefix_len) == prefix
