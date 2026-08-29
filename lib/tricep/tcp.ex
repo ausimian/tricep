@@ -3,7 +3,12 @@ defmodule Tricep.Tcp do
 
   import Bitwise
 
+  @max_window 65_535
+
   @type flag :: :fin | :syn | :rst | :psh | :ack | :urg | :ece | :cwr
+
+  # Compile-time TCP wire-window bound shared by internal protocol modules.
+  defmacro max_window, do: @max_window
 
   @type tcp_options :: %{
           optional(:mss) => non_neg_integer(),

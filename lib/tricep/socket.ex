@@ -1,5 +1,4 @@
 defmodule Tricep.Socket do
-  # Targeted Credo suppressions below cover legacy state-machine complexity tracked by issue #111.
   @moduledoc false
 
   @behaviour :gen_statem
@@ -9,6 +8,11 @@ defmodule Tricep.Socket do
   alias Tricep.Application
   alias Tricep.DataBuffer
   alias Tricep.Tcp
+  alias Tricep.Tcp.Sequence
+  alias Tricep.Tcp.Synchronized
+  alias Tricep.Tcp.Tcb
+
+  require Tcp
 
   @type socket_timeout :: non_neg_integer() | :infinity | :nowait
   @type select_info :: {:select_info, :accept | :connect | :recv | :send, reference()}
@@ -159,9 +163,9 @@ defmodule Tricep.Socket do
   # the fixed 20-byte TCP header so Ip.wrap/4 can always encode data segments.
   @maximum_ipv6_tcp_mss 65_535 - 20
   @default_recv_buffer_size 65_535
-  @max_tcp_window 65_535
+  @max_window Tcp.max_window()
   @max_window_scale 14
-  @max_scaled_tcp_window @max_tcp_window <<< @max_window_scale
+  @max_scaled_tcp_window @max_window <<< @max_window_scale
   @default_fin_wait_2_timeout_ms 60_000
   @ephemeral_port_first 49_152
   @ephemeral_port_last 65_535
@@ -179,27 +183,9 @@ defmodule Tricep.Socket do
   typedstruct enforce: true do
     field :pair, {addr_port(), addr_port()}
     field :link, pid()
-    field :iss, non_neg_integer() | nil, default: nil
-    field :snd_una, non_neg_integer() | nil, default: nil
-    field :snd_nxt, non_neg_integer() | nil, default: nil
-    field :snd_wnd, non_neg_integer() | nil, default: nil
-    field :irs, non_neg_integer() | nil, default: nil
-    field :rcv_nxt, non_neg_integer() | nil, default: nil
-    field :rcv_wnd, non_neg_integer() | nil, default: nil
-    # Effective (post-scale) window represented by the outgoing 16-bit field
-    field :rcv_adv_wnd, non_neg_integer() | nil, default: nil
-    # Furthest logical edge previously offered; physical admission stays capped
-    field :rcv_right_edge, non_neg_integer() | nil, default: nil
-    # MSS we advertise to peer (what we can receive)
-    field :rcv_mss, non_neg_integer() | nil, default: nil
-    # Effective send MSS after applying peer, path, and protocol bounds
-    field :snd_mss, non_neg_integer() | nil, default: nil
-    # Window scale we advertise to peer for our receive window
-    field :rcv_wnd_scale, non_neg_integer(), default: 0
-    # Window scale peer advertised for its receive window
-    field :snd_wnd_scale, non_neg_integer(), default: 0
-    # Window scaling is enabled only after both SYNs carried the option
-    field :window_scaling_negotiated, boolean(), default: false
+    # Protocol control state is owned by the pure TCP control block. The
+    # adapter fields below contain only OTP, I/O, buffering, and timer state.
+    field :tcb, Tcb.t(), default: %Tcb{}
     # Buffers for data transfer
     field :send_buffer, DataBuffer.t(), default: DataBuffer.new()
     field :recv_buffer, binary(), default: <<>>
@@ -378,49 +364,16 @@ defmodule Tricep.Socket do
         :listen,
         listen_data
       ) do
-    cond do
-      not listen_addr_matches?(listen_data.local_addr, dst_addr) ->
-        :keep_state_and_data
-
-      listen_backlog_full?(listen_data) ->
-        :keep_state_and_data
-
-      true ->
-        case passive_link(src_addr, dst_addr) do
-          {:ok, link, mtu} ->
-            opts = %{
-              listener: self(),
-              src_addr: src_addr,
-              dst_addr: dst_addr,
-              src_port: src_port,
-              dst_port: dst_port,
-              segment: segment,
-              link: link,
-              mtu: mtu,
-              socket_opts: listen_data.socket_opts
-            }
-
-            # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-            case start_passive_connection(opts) do
-              {:ok, child} ->
-                ref = Process.monitor(child)
-
-                new_data =
-                  listen_data
-                  |> Map.put(:pending_count, listen_data.pending_count + 1)
-                  |> put_child(child, ref, :pending)
-
-                send(child, :send_syn_ack)
-
-                {:keep_state, new_data}
-
-              _ ->
-                :keep_state_and_data
-            end
-
-          :error ->
-            :keep_state_and_data
-        end
+    case passive_connection_opts(
+           listen_data,
+           src_addr,
+           dst_addr,
+           src_port,
+           dst_port,
+           segment
+         ) do
+      {:ok, opts} -> start_passive_child(listen_data, opts)
+      :ignore -> :keep_state_and_data
     end
   end
 
@@ -458,33 +411,7 @@ defmodule Tricep.Socket do
   def handle_event({:call, from}, {:connect, address, timeout}, :closed, closed_data) do
     case validate_sockaddr_in6(address) do
       {:ok, dstaddr_bin, dst_port} ->
-        case Application.lookup_link(dstaddr_bin) do
-          {pid, {srcaddr_bin, mtu}} ->
-            # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-            case allocate_port(srcaddr_bin, {dstaddr_bin, dst_port}) do
-              {:ok, pair} ->
-                send_syn = {:next_event, :internal, {:send_syn, from, timeout}}
-                recv_buffer_size = recv_buffer_size(closed_data)
-
-                state = %__MODULE__{
-                  pair: pair,
-                  link: pid,
-                  rcv_mss: local_send_mss(mtu),
-                  recv_buffer_size: recv_buffer_size,
-                  rcv_wnd: recv_buffer_size,
-                  rcv_wnd_scale: window_scale_for(recv_buffer_size),
-                  fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(closed_data)
-                }
-
-                {:next_state, :closed, state, send_syn}
-
-              {:error, reason} ->
-                {:keep_state_and_data, {:reply, from, {:error, reason}}}
-            end
-
-          nil ->
-            {:keep_state_and_data, {:reply, from, {:error, :enetunreach}}}
-        end
+        connect_from_closed(from, timeout, closed_data, dstaddr_bin, dst_port)
 
       {:error, reason} ->
         {:keep_state_and_data, {:reply, from, {:error, reason}}}
@@ -494,41 +421,7 @@ defmodule Tricep.Socket do
   def handle_event({:call, from}, {:connect, address, timeout}, :bound, bound_data) do
     case validate_sockaddr_in6(address) do
       {:ok, dstaddr_bin, dst_port} ->
-        case Application.lookup_link(dstaddr_bin) do
-          {pid, {srcaddr_bin, mtu}} ->
-            # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-            with {:ok, local_addr} <- bound_connect_source(bound_data.local_addr, srcaddr_bin),
-                 :ok <-
-                   Application.register_socket_pair(
-                     {{local_addr, bound_data.local_port}, {dstaddr_bin, dst_port}}
-                   ) do
-              pair = {{local_addr, bound_data.local_port}, {dstaddr_bin, dst_port}}
-              send_syn = {:next_event, :internal, {:send_syn, from, timeout}}
-              recv_buffer_size = recv_buffer_size(bound_data)
-
-              state = %__MODULE__{
-                pair: pair,
-                link: pid,
-                rcv_mss: local_send_mss(mtu),
-                recv_buffer_size: recv_buffer_size,
-                rcv_wnd: recv_buffer_size,
-                rcv_wnd_scale: window_scale_for(recv_buffer_size),
-                fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(bound_data)
-              }
-
-              deregister_bound_data(bound_data)
-              {:next_state, :closed, state, send_syn}
-            else
-              {:error, :eaddrnotavail} ->
-                {:keep_state_and_data, {:reply, from, {:error, :eaddrnotavail}}}
-
-              {:error, {:already_registered, _pid}} ->
-                {:keep_state_and_data, {:reply, from, {:error, :eaddrinuse}}}
-            end
-
-          nil ->
-            {:keep_state_and_data, {:reply, from, {:error, :enetunreach}}}
-        end
+        connect_from_bound(from, timeout, bound_data, dstaddr_bin, dst_port)
 
       {:error, reason} ->
         {:keep_state_and_data, {:reply, from, {:error, reason}}}
@@ -609,8 +502,8 @@ defmodule Tricep.Socket do
 
     tcp_segment =
       Tcp.build_segment(state.pair, iss, 0, [:syn], syn_window,
-        mss: state.rcv_mss,
-        window_scale: state.rcv_wnd_scale
+        mss: state.tcb.rcv_mss,
+        window_scale: state.tcb.rcv_wnd_scale
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
@@ -618,11 +511,7 @@ defmodule Tricep.Socket do
 
     base_state = %{
       state
-      | iss: iss,
-        snd_una: iss,
-        snd_nxt: wrap_seq(iss + 1),
-        snd_wnd: 0,
-        rcv_wnd: syn_window,
+      | tcb: Tcb.begin_active_open(state.tcb, iss, syn_window),
         syn_retransmit_count: 0,
         rto_ms: @initial_rto_ms
     }
@@ -658,137 +547,56 @@ defmodule Tricep.Socket do
   end
 
   # SYN-ACK handler for blocking connect (from is a gen_statem from tuple)
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def handle_event(:info, segment, {:syn_sent, from}, %__MODULE__{} = state)
       when is_tuple(from) and is_binary(segment) do
-    case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, window: window, options: options} ->
-        syn? = :syn in flags
-        ack? = :ack in flags
-        rst? = :rst in flags
-        expected_ack = state.snd_nxt
+    case syn_sent_segment(state, segment) do
+      :reset ->
+        reset_state(state)
 
-        cond do
-          rst? ->
-            reset_state(state)
+        {:next_state, :closed, nil,
+         [
+           {{:timeout, :rto}, :cancel},
+           {{:timeout, :connect_timeout}, :cancel},
+           {:reply, from, {:error, :econnrefused}}
+         ]}
 
-            actions = [
-              {{:timeout, :rto}, :cancel},
-              {{:timeout, :connect_timeout}, :cancel},
-              {:reply, from, {:error, :econnrefused}}
-            ]
+      {:established, new_state} ->
+        send_ack(new_state.tcb.rcv_nxt, new_state)
 
-            {:next_state, :closed, nil, actions}
+        {:next_state, :established, new_state,
+         [
+           {{:timeout, :rto}, :cancel},
+           {{:timeout, :connect_timeout}, :cancel},
+           {:reply, from, :ok}
+         ]}
 
-          syn? and ack? and ack == expected_ack ->
-            snd_mss = peer_send_mss(options, state.rcv_mss)
+      {:bad_ack, acknowledgment} ->
+        send_rst(acknowledgment, state)
+        :keep_state_and_data
 
-            {rcv_wnd_scale, snd_wnd_scale, window_scaling_negotiated} =
-              negotiated_window_scaling(options, state.rcv_wnd_scale)
-
-            new_state =
-              %{
-                state
-                | irs: seq,
-                  rcv_nxt: wrap_seq(seq + 1),
-                  snd_una: ack,
-                  # The window in a SYN or SYN-ACK is never scaled.
-                  snd_wnd: window,
-                  snd_mss: snd_mss,
-                  rcv_wnd_scale: rcv_wnd_scale,
-                  snd_wnd_scale: snd_wnd_scale,
-                  window_scaling_negotiated: window_scaling_negotiated,
-                  syn_retransmit_count: 0,
-                  rto_ms: @initial_rto_ms
-              }
-              |> open_receive_window()
-
-            # The final ACK is the first segment whose window may be scaled.
-            send_ack(new_state.rcv_nxt, new_state)
-
-            # Cancel timers and reply success
-            actions = [
-              {{:timeout, :rto}, :cancel},
-              {{:timeout, :connect_timeout}, :cancel},
-              {:reply, from, :ok}
-            ]
-
-            {:next_state, :established, new_state, actions}
-
-          ack? and ack != expected_ack ->
-            # Bad ACK: send RST
-            send_rst(ack, state)
-            :keep_state_and_data
-
-          true ->
-            # Ignore anything else
-            :keep_state_and_data
-        end
-
-      _ ->
+      :ignore ->
         :keep_state_and_data
     end
   end
 
   # SYN-ACK handler for :nowait connect
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def handle_event(:info, segment, {:syn_sent, :nowait}, %__MODULE__{} = state)
       when is_binary(segment) do
-    case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, window: window, options: options} ->
-        syn? = :syn in flags
-        ack? = :ack in flags
-        rst? = :rst in flags
-        expected_ack = state.snd_nxt
+    case syn_sent_segment(state, segment) do
+      :reset ->
+        {state_name, state_data} = nowait_connect_failure(state, :econnrefused)
+        {:next_state, state_name, state_data, {{:timeout, :rto}, :cancel}}
 
-        cond do
-          rst? ->
-            # Connection refused - notify caller so a retry can complete with the stored error.
-            actions = [{{:timeout, :rto}, :cancel}]
-            {state_name, state_data} = nowait_connect_failure(state, :econnrefused)
-            {:next_state, state_name, state_data, actions}
+      {:established, new_state} ->
+        notify_selects(state.connect_selects)
+        send_ack(new_state.tcb.rcv_nxt, new_state)
+        {:next_state, :established, new_state, {{:timeout, :rto}, :cancel}}
 
-          syn? and ack? and ack == expected_ack ->
-            snd_mss = peer_send_mss(options, state.rcv_mss)
+      {:bad_ack, acknowledgment} ->
+        send_rst(acknowledgment, state)
+        :keep_state_and_data
 
-            {rcv_wnd_scale, snd_wnd_scale, window_scaling_negotiated} =
-              negotiated_window_scaling(options, state.rcv_wnd_scale)
-
-            # Notify callers that connect can complete
-            notify_selects(state.connect_selects)
-
-            new_state =
-              %{
-                state
-                | irs: seq,
-                  rcv_nxt: wrap_seq(seq + 1),
-                  snd_una: ack,
-                  # The window in a SYN or SYN-ACK is never scaled.
-                  snd_wnd: window,
-                  snd_mss: snd_mss,
-                  rcv_wnd_scale: rcv_wnd_scale,
-                  snd_wnd_scale: snd_wnd_scale,
-                  window_scaling_negotiated: window_scaling_negotiated,
-                  syn_retransmit_count: 0,
-                  rto_ms: @initial_rto_ms
-              }
-              |> open_receive_window()
-
-            # The final ACK is the first segment whose window may be scaled.
-            send_ack(new_state.rcv_nxt, new_state)
-
-            actions = [{{:timeout, :rto}, :cancel}]
-            {:next_state, :established, new_state, actions}
-
-          ack? and ack != expected_ack ->
-            send_rst(ack, state)
-            :keep_state_and_data
-
-          true ->
-            :keep_state_and_data
-        end
-
-      _ ->
+      :ignore ->
         :keep_state_and_data
     end
   end
@@ -800,63 +608,30 @@ defmodule Tricep.Socket do
     {:keep_state, state, {{:timeout, :rto}, @initial_rto_ms, :syn_ack_timeout}}
   end
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def handle_event(:info, segment, :syn_received, %__MODULE__{} = state)
       when is_binary(segment) do
-    case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, window: window, payload: payload} ->
-        syn? = :syn in flags
-        ack? = :ack in flags
-        rst? = :rst in flags
+    case syn_received_segment(state, segment) do
+      :acceptable_reset ->
+        reset_state(state)
+        notify_passive_listener(state, :passive_failed)
+        {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
 
-        cond do
-          rst? and acceptable_rst?(state, seq) ->
-            reset_state(state)
-            notify_passive_listener(state, :passive_failed)
-            {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
+      :unacceptable_reset ->
+        reject_unacceptable_rst(state)
 
-          rst? ->
-            reject_unacceptable_rst(state)
+      {:established, new_state} ->
+        notify_passive_listener(state, :passive_established)
+        {:next_state, :established, new_state, {{:timeout, :rto}, :cancel}}
 
-          ack? and ack == state.snd_nxt and seq == state.rcv_nxt ->
-            base_state =
-              %{
-                state
-                | snd_una: ack,
-                  snd_wnd: scale_peer_window(state, window),
-                  syn_retransmit_count: 0,
-                  rto_ms: @initial_rto_ms,
-                  passive_listener: nil
-              }
-              |> open_receive_window()
+      {:bad_ack, acknowledgment} ->
+        send_rst(acknowledgment, state)
+        :keep_state_and_data
 
-            # credo:disable-for-lines:2 Credo.Check.Refactor.Nesting
-            new_state =
-              if byte_size(payload) > 0 do
-                {receive_state, _accepted_len} = receive_payload(base_state, payload)
-                send_ack(receive_state.rcv_nxt, receive_state)
-                receive_state
-              else
-                base_state
-              end
+      :retransmit_syn_ack ->
+        send_syn_ack(state)
+        :keep_state_and_data
 
-            notify_passive_listener(state, :passive_established)
-
-            {:next_state, :established, new_state, {{:timeout, :rto}, :cancel}}
-
-          ack? ->
-            send_rst(ack, state)
-            :keep_state_and_data
-
-          syn? and seq == state.irs ->
-            send_syn_ack(state)
-            :keep_state_and_data
-
-          true ->
-            :keep_state_and_data
-        end
-
-      _ ->
+      :ignore ->
         :keep_state_and_data
     end
   end
@@ -962,7 +737,7 @@ defmodule Tricep.Socket do
   end
 
   def handle_event({:call, from}, {:send, data, timeout}, :established, %__MODULE__{} = state) do
-    available = send_window_available(state)
+    available = Tcb.send_window_available(state.tcb)
 
     cond do
       available > 0 ->
@@ -1058,131 +833,10 @@ defmodule Tricep.Socket do
 
   # --- Established state: incoming data ---
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def handle_event(:info, segment, :established, %__MODULE__{} = state) when is_binary(segment) do
-    case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, payload: payload, window: window} = parsed ->
-        rst? = :rst in flags
-        ack? = :ack in flags
-        fin? = :fin in flags
-
-        cond do
-          rst? and acceptable_rst?(state, seq) ->
-            reset_state(state)
-            actions = notify_waiters_error(state, :econnreset)
-            {:next_state, :closed, nil, actions}
-
-          rst? ->
-            reject_unacceptable_rst(state)
-
-          not segment_acceptable?(state, parsed) ->
-            reject_unacceptable_segment(state)
-
-          invalid_ack?(state, ack?, ack) ->
-            reject_invalid_ack(state)
-
-          fin? and seq == state.rcv_nxt ->
-            # FIN from peer - handle any data with it, then transition to CLOSE_WAIT
-            data_len = byte_size(payload)
-            {receive_state, accepted_len} = receive_payload(state, payload)
-
-            new_snd_una =
-              if ack? and seq_gt(ack, state.snd_una) and seq_leq(ack, state.snd_nxt) do
-                ack
-              else
-                state.snd_una
-              end
-
-            if accepted_len == data_len do
-              # Send ACK for FIN (and any data) after waiters consume buffered bytes.
-              fin_state = %{receive_state | rcv_nxt: wrap_seq(receive_state.rcv_nxt + 1)}
-
-              receive_state =
-                fin_state
-                |> notify_recv_select(:eof)
-                |> Map.put(:snd_una, new_snd_una)
-                |> Map.put(:snd_wnd, scale_peer_window(state, window))
-
-              # Notify waiters: deliver buffered data or EOF
-              {new_recv_buffer, new_waiters, replies} =
-                process_waiters_eof(receive_state.recv_buffer, receive_state.recv_waiters)
-
-              new_state =
-                receive_state
-                |> Map.put(:recv_buffer, new_recv_buffer)
-                |> Map.put(:recv_waiters, new_waiters)
-                |> Map.put(:fin_received, true)
-                |> refresh_receive_window()
-
-              send_ack(new_state.rcv_nxt, new_state)
-
-              {:next_state, :close_wait, new_state, replies}
-            else
-              receive_state = notify_recv_select(receive_state, accepted_len)
-
-              {new_recv_buffer, new_waiters, replies} =
-                process_waiters(receive_state.recv_buffer, receive_state.recv_waiters)
-
-              receive_state =
-                receive_state
-                |> Map.put(:recv_buffer, new_recv_buffer)
-                |> Map.put(:recv_waiters, new_waiters)
-                |> refresh_receive_window()
-
-              # credo:disable-for-lines:2 Credo.Check.Refactor.Nesting
-              {new_state, timer_actions} =
-                if ack? do
-                  process_ack(receive_state, ack, window)
-                else
-                  {%{receive_state | snd_wnd: scale_peer_window(receive_state, window)}, []}
-                end
-
-              send_ack(new_state.rcv_nxt, new_state)
-
-              {:keep_state, new_state, replies ++ timer_actions}
-            end
-
-          ack? and seq == state.rcv_nxt and byte_size(payload) > 0 ->
-            # Data segment with expected sequence number
-            {receive_state, accepted_len} = receive_payload(state, payload)
-            receive_state = notify_recv_select(receive_state, accepted_len)
-
-            # Check if any blocking waiters can be satisfied
-            {new_recv_buffer, new_waiters, replies} =
-              process_waiters(receive_state.recv_buffer, receive_state.recv_waiters)
-
-            # Process ACK portion to update retransmission queue
-            receive_state =
-              receive_state
-              |> Map.put(:recv_buffer, new_recv_buffer)
-              |> Map.put(:recv_waiters, new_waiters)
-              |> refresh_receive_window()
-
-            {new_state, timer_actions} = process_ack(receive_state, ack, window)
-            send_ack(new_state.rcv_nxt, new_state)
-
-            {:keep_state, new_state, replies ++ timer_actions}
-
-          ack? and byte_size(payload) == 0 ->
-            # Pure ACK - process ACK and update retransmission queue
-            {new_state, timer_actions} = process_ack(state, ack, window)
-            {:keep_state, new_state, timer_actions}
-
-          byte_size(payload) > 0 ->
-            receive_state = buffer_out_of_order_payload(state, seq, payload)
-            {new_state, timer_actions} = process_ack_if_present(receive_state, ack?, ack, window)
-            send_ack(new_state.rcv_nxt, new_state)
-            {:keep_state, new_state, timer_actions}
-
-          fin? ->
-            ack_unacceptable_segment(state, ack?, ack, window)
-
-          true ->
-            :keep_state_and_data
-        end
-
-      _ ->
-        :keep_state_and_data
+    case Synchronized.process(state.tcb, segment, validate_ack?: true) do
+      {:ok, parsed} -> handle_established_segment(state, parsed)
+      outcome -> synchronized_rejection(state, outcome)
     end
   end
 
@@ -1373,99 +1027,13 @@ defmodule Tricep.Socket do
     handle_recv_timeout(state, timer_ref)
   end
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def handle_event(:info, segment, :fin_wait_1, %__MODULE__{} = state) when is_binary(segment) do
-    case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, payload: payload, window: window} = parsed ->
-        fin? = :fin in flags
-        ack? = :ack in flags
-        rst? = :rst in flags
-        ack_of_fin? = ack? and ack == state.snd_nxt
+    case Synchronized.process(state.tcb, segment) do
+      {:ok, parsed} ->
+        handle_fin_wait_1_segment(state, parsed)
 
-        cond do
-          rst? and acceptable_rst?(state, seq) ->
-            reset_state(state)
-            actions = notify_waiters_error(state, :econnreset)
-            {:next_state, :closed, nil, [{{:timeout, :rto}, :cancel} | actions]}
-
-          rst? ->
-            reject_unacceptable_rst(state)
-
-          not segment_acceptable?(state, parsed) ->
-            reject_unacceptable_segment(state)
-
-          true ->
-            {ack_state, ack_actions} = process_ack_if_present(state, ack?, ack, window)
-            data_len = byte_size(payload)
-
-            {receive_state, accepted_len, recv_actions} =
-              if seq == ack_state.rcv_nxt and data_len > 0 do
-                deliver_received_payload(ack_state, payload)
-              else
-                {ack_state, 0, []}
-              end
-
-            fin_ready? = fin? and seq == ack_state.rcv_nxt and accepted_len == data_len
-
-            if accepted_len > 0 and not fin_ready? do
-              send_ack(receive_state.rcv_nxt, receive_state)
-            end
-
-            cond do
-              fin_ready? and ack_of_fin? ->
-                # FIN+ACK of our FIN - go directly to TIME_WAIT
-                {new_state, eof_actions} =
-                  receive_state
-                  |> Map.put(:rcv_nxt, wrap_seq(receive_state.rcv_nxt + 1))
-                  |> deliver_receive_eof()
-
-                send_ack(new_state.rcv_nxt, new_state)
-
-                {:next_state, :time_wait, new_state,
-                 ack_actions ++
-                   recv_actions ++
-                   eof_actions ++
-                   [{{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}]}
-
-              fin_ready? ->
-                # FIN but not ACK of our FIN - simultaneous close
-                {new_state, eof_actions} =
-                  receive_state
-                  |> Map.put(:rcv_nxt, wrap_seq(receive_state.rcv_nxt + 1))
-                  |> deliver_receive_eof()
-
-                send_ack(new_state.rcv_nxt, new_state)
-                {:next_state, :closing, new_state, ack_actions ++ recv_actions ++ eof_actions}
-
-              ack_of_fin? ->
-                # ACK of our FIN - move to FIN_WAIT_2
-                {:next_state, :fin_wait_2, receive_state,
-                 ack_actions ++
-                   recv_actions ++
-                   [
-                     {{:timeout, :fin_wait_2}, receive_state.fin_wait_2_timeout_ms,
-                      :fin_wait_2_expired}
-                   ]}
-
-              ack? ->
-                {:keep_state, receive_state, ack_actions ++ recv_actions}
-
-              fin? ->
-                send_ack(receive_state.rcv_nxt, receive_state)
-                {:keep_state, receive_state, ack_actions ++ recv_actions}
-
-              true ->
-                # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-                if recv_actions == [] do
-                  :keep_state_and_data
-                else
-                  {:keep_state, receive_state, recv_actions}
-                end
-            end
-        end
-
-      _ ->
-        :keep_state_and_data
+      outcome ->
+        synchronized_rejection(state, outcome, {:connection, [{{:timeout, :rto}, :cancel}]})
     end
   end
 
@@ -1495,80 +1063,17 @@ defmodule Tricep.Socket do
     {:next_state, :closed, nil, actions}
   end
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def handle_event(:info, segment, :fin_wait_2, %__MODULE__{} = state) when is_binary(segment) do
-    case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, payload: payload, window: window} = parsed ->
-        fin? = :fin in flags
-        ack? = :ack in flags
-        rst? = :rst in flags
+    case Synchronized.process(state.tcb, segment, validate_ack?: true) do
+      {:ok, parsed} ->
+        handle_fin_wait_2_segment(state, parsed)
 
-        cond do
-          rst? and acceptable_rst?(state, seq) ->
-            reset_state(state)
-            actions = notify_waiters_error(state, :econnreset)
-            {:next_state, :closed, nil, [{{:timeout, :fin_wait_2}, :cancel} | actions]}
-
-          rst? ->
-            reject_unacceptable_rst(state)
-
-          not segment_acceptable?(state, parsed) ->
-            reject_unacceptable_segment(state)
-
-          invalid_ack?(state, ack?, ack) ->
-            reject_invalid_ack(state)
-
-          fin? and seq == state.rcv_nxt ->
-            # FIN from peer - ACK it and go to TIME_WAIT
-            # Handle any data that came with the FIN
-            data_len = byte_size(payload)
-
-            {receive_state, accepted_len, recv_actions} =
-              state
-              |> Map.put(:snd_wnd, scale_peer_window(state, window))
-              |> deliver_received_payload(payload)
-
-            # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-            if accepted_len == data_len do
-              {new_state, eof_actions} =
-                receive_state
-                |> Map.put(:rcv_nxt, wrap_seq(receive_state.rcv_nxt + 1))
-                |> deliver_receive_eof()
-
-              send_ack(new_state.rcv_nxt, new_state)
-
-              {:next_state, :time_wait, new_state,
-               recv_actions ++
-                 eof_actions ++
-                 [
-                   {{:timeout, :fin_wait_2}, :cancel},
-                   {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}
-                 ]}
-            else
-              send_ack(receive_state.rcv_nxt, receive_state)
-              {:keep_state, receive_state, recv_actions}
-            end
-
-          ack? and seq == state.rcv_nxt and byte_size(payload) > 0 ->
-            # Data segment - half-close allows peer to still send data
-            {new_state, _accepted_len, recv_actions} =
-              state
-              |> Map.put(:snd_wnd, scale_peer_window(state, window))
-              |> deliver_received_payload(payload)
-
-            send_ack(new_state.rcv_nxt, new_state)
-
-            {:keep_state, new_state, recv_actions}
-
-          byte_size(payload) > 0 or fin? ->
-            ack_unacceptable_segment(state, ack?, ack, window)
-
-          true ->
-            :keep_state_and_data
-        end
-
-      _ ->
-        :keep_state_and_data
+      outcome ->
+        synchronized_rejection(
+          state,
+          outcome,
+          {:connection, [{{:timeout, :fin_wait_2}, :cancel}]}
+        )
     end
   end
 
@@ -1594,7 +1099,7 @@ defmodule Tricep.Socket do
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: _seq} ->
         if :fin in flags do
-          send_ack(state.rcv_nxt, state)
+          send_ack(state.tcb.rcv_nxt, state)
         end
 
         :keep_state_and_data
@@ -1606,45 +1111,10 @@ defmodule Tricep.Socket do
 
   # --- CLOSING state (simultaneous close) ---
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def handle_event(:info, segment, :closing, %__MODULE__{} = state) when is_binary(segment) do
-    case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, window: window} = parsed ->
-        ack? = :ack in flags
-        rst? = :rst in flags
-        ack_of_fin? = ack? and ack == state.snd_nxt
-
-        cond do
-          rst? and acceptable_rst?(state, seq) ->
-            reset_state(state)
-            {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
-
-          rst? ->
-            reject_unacceptable_rst(state)
-
-          not segment_acceptable?(state, parsed) ->
-            reject_unacceptable_segment(state)
-
-          true ->
-            {ack_state, ack_actions} = process_ack_if_present(state, ack?, ack, window)
-
-            # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-            cond do
-              ack_of_fin? ->
-                # ACK of our FIN - go to TIME_WAIT
-                {:next_state, :time_wait, ack_state,
-                 ack_actions ++ [{{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}]}
-
-              ack? ->
-                {:keep_state, ack_state, ack_actions}
-
-              true ->
-                :keep_state_and_data
-            end
-        end
-
-      _ ->
-        :keep_state_and_data
+    case Synchronized.process(state.tcb, segment) do
+      {:ok, parsed} -> handle_closing_segment(state, parsed)
+      outcome -> synchronized_rejection(state, outcome, :close)
     end
   end
 
@@ -1660,7 +1130,7 @@ defmodule Tricep.Socket do
   end
 
   def handle_event({:call, from}, {:send, data, timeout}, :close_wait, %__MODULE__{} = state) do
-    available = send_window_available(state)
+    available = Tcb.send_window_available(state.tcb)
 
     cond do
       available > 0 ->
@@ -1803,79 +1273,18 @@ defmodule Tricep.Socket do
   end
 
   def handle_event(:info, segment, :close_wait, %__MODULE__{} = state) when is_binary(segment) do
-    # Handle ACKs for data we sent
-    case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, window: window} = parsed ->
-        rst? = :rst in flags
-        ack? = :ack in flags
-
-        cond do
-          rst? and acceptable_rst?(state, seq) ->
-            reset_state(state)
-            actions = notify_waiters_error(state, :econnreset)
-            {:next_state, :closed, nil, actions}
-
-          rst? ->
-            reject_unacceptable_rst(state)
-
-          not segment_acceptable?(state, parsed) ->
-            reject_unacceptable_segment(state)
-
-          ack? ->
-            # Process ACK and update retransmission queue
-            {new_state, timer_actions} = process_ack(state, ack, window)
-            {:keep_state, new_state, timer_actions}
-
-          true ->
-            :keep_state_and_data
-        end
-
-      _ ->
-        :keep_state_and_data
+    case Synchronized.process(state.tcb, segment) do
+      {:ok, parsed} -> handle_close_wait_segment(state, parsed)
+      outcome -> synchronized_rejection(state, outcome)
     end
   end
 
   # --- LAST_ACK state ---
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def handle_event(:info, segment, :last_ack, %__MODULE__{} = state) when is_binary(segment) do
-    case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: seq, ack: ack, window: window} = parsed ->
-        rst? = :rst in flags
-        ack? = :ack in flags
-        ack_of_fin? = ack? and ack == state.snd_nxt
-
-        cond do
-          rst? and acceptable_rst?(state, seq) ->
-            reset_state(state)
-            {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
-
-          rst? ->
-            reject_unacceptable_rst(state)
-
-          not segment_acceptable?(state, parsed) ->
-            reject_unacceptable_segment(state)
-
-          true ->
-            {ack_state, ack_actions} = process_ack_if_present(state, ack?, ack, window)
-
-            # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-            cond do
-              ack_of_fin? ->
-                # ACK of our FIN - connection fully closed
-                reset_state(ack_state)
-                {:next_state, :closed, nil, ack_actions}
-
-              ack? ->
-                {:keep_state, ack_state, ack_actions}
-
-              true ->
-                :keep_state_and_data
-            end
-        end
-
-      _ ->
-        :keep_state_and_data
+    case Synchronized.process(state.tcb, segment) do
+      {:ok, parsed} -> handle_last_ack_segment(state, parsed)
+      outcome -> synchronized_rejection(state, outcome, :close)
     end
   end
 
@@ -1938,6 +1347,301 @@ defmodule Tricep.Socket do
     {:keep_state_and_data, {:reply, from, {:error, :enotconn}}}
   end
 
+  # State-specific effects begin only after Synchronized has applied the
+  # common RST, sequence-window, and ACK-bound admission pipeline.
+  defp handle_established_segment(state, %{
+         flags: flags,
+         seq: seq,
+         ack: ack,
+         payload: payload,
+         window: window
+       }) do
+    fin? = :fin in flags
+    ack? = :ack in flags
+    expected_sequence? = seq == state.tcb.rcv_nxt
+    payload? = payload != <<>>
+
+    case {fin?, ack?, expected_sequence?, payload?} do
+      {true, _ack?, true, _payload?} ->
+        handle_established_fin(state, ack?, ack, window, payload)
+
+      {_fin?, true, true, true} ->
+        handle_established_payload(state, ack, window, payload)
+
+      {_fin?, true, _expected_sequence?, false} ->
+        {new_state, timer_actions} = process_ack(state, ack, window)
+        {:keep_state, new_state, timer_actions}
+
+      {_fin?, _ack?, _expected_sequence?, true} ->
+        receive_state = buffer_out_of_order_payload(state, seq, payload)
+        {new_state, timer_actions} = process_ack_if_present(receive_state, ack?, ack, window)
+        send_ack(new_state.tcb.rcv_nxt, new_state)
+        {:keep_state, new_state, timer_actions}
+
+      {true, _ack?, _expected_sequence?, false} ->
+        ack_unacceptable_segment(state, ack?, ack, window)
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  defp handle_established_fin(state, ack?, ack, window, payload) do
+    data_length = byte_size(payload)
+    {receive_state, accepted_length} = receive_payload(state, payload)
+
+    if accepted_length == data_length do
+      send_unacknowledged =
+        if ack? and Sequence.gt?(ack, state.tcb.snd_una) and
+             Sequence.lte?(ack, state.tcb.snd_nxt),
+           do: ack,
+           else: state.tcb.snd_una
+
+      fin_state = %{receive_state | tcb: Tcb.advance_receive(receive_state.tcb, 1)}
+
+      receive_state =
+        fin_state
+        |> notify_recv_select(:eof)
+
+      # Preserve legacy FIN-carried ACK bookkeeping; bug #121 owns its fix.
+      receive_state = %{
+        receive_state
+        | tcb: Tcb.acknowledge(receive_state.tcb, send_unacknowledged, window)
+      }
+
+      {recv_buffer, recv_waiters, replies} =
+        process_waiters_eof(receive_state.recv_buffer, receive_state.recv_waiters)
+
+      new_state =
+        receive_state
+        |> Map.put(:recv_buffer, recv_buffer)
+        |> Map.put(:recv_waiters, recv_waiters)
+        |> Map.put(:fin_received, true)
+        |> refresh_receive_window()
+
+      send_ack(new_state.tcb.rcv_nxt, new_state)
+      {:next_state, :close_wait, new_state, replies}
+    else
+      handle_partially_accepted_fin(receive_state, ack?, ack, window, accepted_length)
+    end
+  end
+
+  defp handle_partially_accepted_fin(receive_state, ack?, ack, window, accepted_length) do
+    receive_state = notify_recv_select(receive_state, accepted_length)
+
+    {recv_buffer, recv_waiters, replies} =
+      process_waiters(receive_state.recv_buffer, receive_state.recv_waiters)
+
+    receive_state =
+      receive_state
+      |> Map.put(:recv_buffer, recv_buffer)
+      |> Map.put(:recv_waiters, recv_waiters)
+      |> refresh_receive_window()
+
+    {new_state, timer_actions} =
+      if ack? do
+        process_ack(receive_state, ack, window)
+      else
+        {%{receive_state | tcb: Tcb.update_send_window(receive_state.tcb, window)}, []}
+      end
+
+    send_ack(new_state.tcb.rcv_nxt, new_state)
+    {:keep_state, new_state, replies ++ timer_actions}
+  end
+
+  defp handle_established_payload(state, ack, window, payload) do
+    {receive_state, accepted_length} = receive_payload(state, payload)
+    receive_state = notify_recv_select(receive_state, accepted_length)
+
+    {recv_buffer, recv_waiters, replies} =
+      process_waiters(receive_state.recv_buffer, receive_state.recv_waiters)
+
+    receive_state =
+      receive_state
+      |> Map.put(:recv_buffer, recv_buffer)
+      |> Map.put(:recv_waiters, recv_waiters)
+      |> refresh_receive_window()
+
+    {new_state, timer_actions} = process_ack(receive_state, ack, window)
+    send_ack(new_state.tcb.rcv_nxt, new_state)
+    {:keep_state, new_state, replies ++ timer_actions}
+  end
+
+  defp handle_fin_wait_1_segment(state, %{
+         flags: flags,
+         seq: seq,
+         ack: ack,
+         payload: payload,
+         window: window
+       }) do
+    ack? = :ack in flags
+    {ack_state, ack_actions} = process_ack_if_present(state, ack?, ack, window)
+
+    {receive_state, accepted_length, recv_actions} =
+      maybe_deliver_payload(ack_state, seq, payload)
+
+    fin_ready? =
+      :fin in flags and seq == ack_state.tcb.rcv_nxt and accepted_length == byte_size(payload)
+
+    if accepted_length > 0 and not fin_ready?,
+      do: send_ack(receive_state.tcb.rcv_nxt, receive_state)
+
+    transition =
+      fin_wait_1_transition(%{
+        ack?: ack?,
+        ack_of_fin?: ack? and ack == state.tcb.snd_nxt,
+        fin?: :fin in flags,
+        fin_ready?: fin_ready?,
+        recv_actions: recv_actions
+      })
+
+    handle_fin_wait_1_transition(
+      receive_state,
+      transition,
+      ack_actions,
+      recv_actions
+    )
+  end
+
+  defp fin_wait_1_transition(%{} = segment) do
+    cond do
+      segment.fin_ready? and segment.ack_of_fin? -> :time_wait
+      segment.fin_ready? -> :closing
+      segment.ack_of_fin? -> :fin_wait_2
+      segment.ack? -> :ack
+      segment.fin? -> :unready_fin
+      segment.recv_actions == [] -> :no_op
+      true -> :receive
+    end
+  end
+
+  defp handle_fin_wait_1_transition(state, :time_wait, ack_actions, recv_actions) do
+    transition_after_peer_fin(state, :time_wait, ack_actions ++ recv_actions, [
+      {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}
+    ])
+  end
+
+  defp handle_fin_wait_1_transition(state, :closing, ack_actions, recv_actions) do
+    transition_after_peer_fin(state, :closing, ack_actions ++ recv_actions)
+  end
+
+  defp handle_fin_wait_1_transition(state, :fin_wait_2, ack_actions, recv_actions) do
+    {:next_state, :fin_wait_2, state,
+     ack_actions ++
+       recv_actions ++
+       [{{:timeout, :fin_wait_2}, state.fin_wait_2_timeout_ms, :fin_wait_2_expired}]}
+  end
+
+  defp handle_fin_wait_1_transition(state, :ack, ack_actions, recv_actions) do
+    {:keep_state, state, ack_actions ++ recv_actions}
+  end
+
+  defp handle_fin_wait_1_transition(state, :unready_fin, ack_actions, recv_actions) do
+    send_ack(state.tcb.rcv_nxt, state)
+    {:keep_state, state, ack_actions ++ recv_actions}
+  end
+
+  # Preserve the ACK-less payload acknowledgement/discard behavior; bug #120 owns its fix.
+  defp handle_fin_wait_1_transition(_state, :no_op, _ack_actions, _recv_actions) do
+    :keep_state_and_data
+  end
+
+  defp handle_fin_wait_1_transition(state, :receive, _ack_actions, recv_actions) do
+    {:keep_state, state, recv_actions}
+  end
+
+  defp handle_fin_wait_2_segment(state, %{
+         flags: flags,
+         seq: seq,
+         ack: ack,
+         payload: payload,
+         window: window
+       }) do
+    ack? = :ack in flags
+    fin? = :fin in flags
+    receive_state = %{state | tcb: Tcb.update_send_window(state.tcb, window)}
+
+    cond do
+      fin? and seq == state.tcb.rcv_nxt ->
+        handle_fin_wait_2_fin(receive_state, payload)
+
+      ack? and seq == state.tcb.rcv_nxt and payload != <<>> ->
+        {new_state, _accepted_length, recv_actions} =
+          deliver_received_payload(receive_state, payload)
+
+        send_ack(new_state.tcb.rcv_nxt, new_state)
+        {:keep_state, new_state, recv_actions}
+
+      payload != <<>> or fin? ->
+        ack_unacceptable_segment(state, ack?, ack, window)
+
+      true ->
+        :keep_state_and_data
+    end
+  end
+
+  defp handle_fin_wait_2_fin(state, payload) do
+    {receive_state, accepted_length, recv_actions} = deliver_received_payload(state, payload)
+
+    if accepted_length == byte_size(payload) do
+      transition_after_peer_fin(
+        receive_state,
+        :time_wait,
+        recv_actions,
+        [
+          {{:timeout, :fin_wait_2}, :cancel},
+          {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}
+        ]
+      )
+    else
+      send_ack(receive_state.tcb.rcv_nxt, receive_state)
+      {:keep_state, receive_state, recv_actions}
+    end
+  end
+
+  defp handle_closing_segment(state, %{flags: flags, ack: ack, window: window}) do
+    ack? = :ack in flags
+    {ack_state, ack_actions} = process_ack_if_present(state, ack?, ack, window)
+
+    cond do
+      ack? and ack == state.tcb.snd_nxt ->
+        {:next_state, :time_wait, ack_state,
+         ack_actions ++ [{{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}]}
+
+      ack? ->
+        {:keep_state, ack_state, ack_actions}
+
+      true ->
+        :keep_state_and_data
+    end
+  end
+
+  defp handle_close_wait_segment(state, %{flags: flags, ack: ack, window: window}) do
+    if :ack in flags do
+      {new_state, timer_actions} = process_ack(state, ack, window)
+      {:keep_state, new_state, timer_actions}
+    else
+      :keep_state_and_data
+    end
+  end
+
+  defp handle_last_ack_segment(state, %{flags: flags, ack: ack, window: window}) do
+    ack? = :ack in flags
+    {ack_state, ack_actions} = process_ack_if_present(state, ack?, ack, window)
+
+    cond do
+      ack? and ack == state.tcb.snd_nxt ->
+        reset_state(ack_state)
+        {:next_state, :closed, nil, ack_actions}
+
+      ack? ->
+        {:keep_state, ack_state, ack_actions}
+
+      true ->
+        :keep_state_and_data
+    end
+  end
+
   defp passive_listener(dst_addr, dst_port, segment) do
     with %{flags: flags} <- Tcp.parse_segment(segment),
          true <- :syn in flags,
@@ -1969,15 +1673,9 @@ defmodule Tricep.Socket do
     if :ack in flags do
       {ack, 0, [:rst]}
     else
-      {0, wrap_seq(seq + segment_sequence_length(parsed)), [:rst, :ack]}
+      {0, Sequence.wrap(seq + Sequence.segment_length(parsed)), [:rst, :ack]}
     end
   end
-
-  defp segment_sequence_length(%{flags: flags, payload: payload}) do
-    byte_size(payload) + flag_sequence_length(flags, :syn) + flag_sequence_length(flags, :fin)
-  end
-
-  defp flag_sequence_length(flags, flag), do: if(flag in flags, do: 1, else: 0)
 
   defp passive_connection_state(opts) do
     %{
@@ -2004,21 +1702,23 @@ defmodule Tricep.Socket do
     %__MODULE__{
       pair: {{dst_addr, dst_port}, {src_addr, src_port}},
       link: link,
-      iss: iss,
-      snd_una: iss,
-      snd_nxt: wrap_seq(iss + 1),
-      # The window in the initial SYN is never scaled.
-      snd_wnd: window,
-      irs: seq,
-      rcv_nxt: wrap_seq(seq + 1),
-      rcv_wnd: min(recv_buffer_size, @max_tcp_window),
-      rcv_adv_wnd: min(recv_buffer_size, @max_tcp_window),
-      rcv_right_edge: wrap_seq(seq + 1 + min(recv_buffer_size, @max_tcp_window)),
-      rcv_mss: local_mss,
-      snd_mss: peer_send_mss(options, local_mss),
-      rcv_wnd_scale: rcv_wnd_scale,
-      snd_wnd_scale: snd_wnd_scale,
-      window_scaling_negotiated: window_scaling_negotiated,
+      tcb: %Tcb{
+        iss: iss,
+        snd_una: iss,
+        snd_nxt: Sequence.wrap(iss + 1),
+        # The window in the initial SYN is never scaled.
+        snd_wnd: window,
+        irs: seq,
+        rcv_nxt: Sequence.wrap(seq + 1),
+        rcv_wnd: min(recv_buffer_size, @max_window),
+        rcv_adv_wnd: min(recv_buffer_size, @max_window),
+        rcv_right_edge: Sequence.wrap(seq + 1 + min(recv_buffer_size, @max_window)),
+        rcv_mss: local_mss,
+        snd_mss: peer_send_mss(options, local_mss),
+        rcv_wnd_scale: rcv_wnd_scale,
+        snd_wnd_scale: snd_wnd_scale,
+        window_scaling_negotiated: window_scaling_negotiated
+      },
       recv_buffer_size: recv_buffer_size,
       rto_ms: @initial_rto_ms,
       syn_retransmit_count: 0,
@@ -2039,6 +1739,139 @@ defmodule Tricep.Socket do
       {link, {^local_addr, mtu}} -> {:ok, link, mtu}
       _ -> :error
     end
+  end
+
+  defp passive_connection_opts(
+         listen_data,
+         src_addr,
+         dst_addr,
+         src_port,
+         dst_port,
+         segment
+       ) do
+    with true <- listen_addr_matches?(listen_data.local_addr, dst_addr),
+         false <- listen_backlog_full?(listen_data),
+         {:ok, link, mtu} <- passive_link(src_addr, dst_addr) do
+      {:ok,
+       %{
+         listener: self(),
+         src_addr: src_addr,
+         dst_addr: dst_addr,
+         src_port: src_port,
+         dst_port: dst_port,
+         segment: segment,
+         link: link,
+         mtu: mtu,
+         socket_opts: listen_data.socket_opts
+       }}
+    else
+      _ -> :ignore
+    end
+  end
+
+  defp start_passive_child(listen_data, opts) do
+    case start_passive_connection(opts) do
+      {:ok, child} ->
+        ref = Process.monitor(child)
+
+        new_data =
+          listen_data
+          |> Map.put(:pending_count, listen_data.pending_count + 1)
+          |> put_child(child, ref, :pending)
+
+        send(child, :send_syn_ack)
+        {:keep_state, new_data}
+
+      _ ->
+        :keep_state_and_data
+    end
+  end
+
+  defp connect_from_closed(from, timeout, closed_data, dst_addr, dst_port) do
+    case Application.lookup_link(dst_addr) do
+      {link, {src_addr, mtu}} ->
+        start_closed_connection(
+          from,
+          timeout,
+          closed_data,
+          link,
+          src_addr,
+          mtu,
+          dst_addr,
+          dst_port
+        )
+
+      nil ->
+        {:keep_state_and_data, {:reply, from, {:error, :enetunreach}}}
+    end
+  end
+
+  defp start_closed_connection(
+         from,
+         timeout,
+         closed_data,
+         link,
+         src_addr,
+         mtu,
+         dst_addr,
+         dst_port
+       ) do
+    case allocate_port(src_addr, {dst_addr, dst_port}) do
+      {:ok, pair} ->
+        state = connection_state(pair, link, mtu, closed_data)
+        send_syn = {:next_event, :internal, {:send_syn, from, timeout}}
+        {:next_state, :closed, state, send_syn}
+
+      {:error, reason} ->
+        {:keep_state_and_data, {:reply, from, {:error, reason}}}
+    end
+  end
+
+  defp connect_from_bound(from, timeout, bound_data, dst_addr, dst_port) do
+    case Application.lookup_link(dst_addr) do
+      {link, {src_addr, mtu}} ->
+        start_bound_connection(from, timeout, bound_data, link, src_addr, mtu, dst_addr, dst_port)
+
+      nil ->
+        {:keep_state_and_data, {:reply, from, {:error, :enetunreach}}}
+    end
+  end
+
+  defp start_bound_connection(from, timeout, bound_data, link, src_addr, mtu, dst_addr, dst_port) do
+    with {:ok, local_addr} <- bound_connect_source(bound_data.local_addr, src_addr),
+         :ok <-
+           Application.register_socket_pair(
+             {{local_addr, bound_data.local_port}, {dst_addr, dst_port}}
+           ) do
+      pair = {{local_addr, bound_data.local_port}, {dst_addr, dst_port}}
+      state = connection_state(pair, link, mtu, bound_data)
+      send_syn = {:next_event, :internal, {:send_syn, from, timeout}}
+
+      deregister_bound_data(bound_data)
+      {:next_state, :closed, state, send_syn}
+    else
+      {:error, :eaddrnotavail} ->
+        {:keep_state_and_data, {:reply, from, {:error, :eaddrnotavail}}}
+
+      {:error, {:already_registered, _pid}} ->
+        {:keep_state_and_data, {:reply, from, {:error, :eaddrinuse}}}
+    end
+  end
+
+  defp connection_state(pair, link, mtu, data) do
+    recv_buffer_size = recv_buffer_size(data)
+
+    %__MODULE__{
+      pair: pair,
+      link: link,
+      tcb: %Tcb{
+        rcv_mss: local_send_mss(mtu),
+        rcv_wnd: recv_buffer_size,
+        rcv_wnd_scale: window_scale_for(recv_buffer_size)
+      },
+      recv_buffer_size: recv_buffer_size,
+      fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(data)
+    }
   end
 
   defp put_child(listen_data, child, ref, status) do
@@ -2135,17 +1968,17 @@ defmodule Tricep.Socket do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     options =
-      if state.window_scaling_negotiated do
-        [mss: state.rcv_mss, window_scale: state.rcv_wnd_scale]
+      if state.tcb.window_scaling_negotiated do
+        [mss: state.tcb.rcv_mss, window_scale: state.tcb.rcv_wnd_scale]
       else
-        [mss: state.rcv_mss]
+        [mss: state.tcb.rcv_mss]
       end
 
     tcp_segment =
       Tcp.build_segment(
         state.pair,
-        state.iss,
-        state.rcv_nxt,
+        state.tcb.iss,
+        state.tcb.rcv_nxt,
         [:syn, :ack],
         advertised_syn_window(state),
         options
@@ -2180,9 +2013,9 @@ defmodule Tricep.Socket do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(state.pair, state.iss, 0, [:syn], advertised_syn_window(state),
-        mss: state.rcv_mss,
-        window_scale: state.rcv_wnd_scale
+      Tcp.build_segment(state.pair, state.tcb.iss, 0, [:syn], advertised_syn_window(state),
+        mss: state.tcb.rcv_mss,
+        window_scale: state.tcb.rcv_wnd_scale
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
@@ -2196,6 +2029,7 @@ defmodule Tricep.Socket do
     {:keep_state, new_state, actions}
   end
 
+  # Preserve legacy retry-exhaustion teardown behavior; bug #122 owns its fix.
   defp do_retransmit(%__MODULE__{unacked_segments: []} = state) do
     # Nothing to retransmit, clear timer state
     {:keep_state, %{state | rto_timer_active: false}}
@@ -2247,9 +2081,9 @@ defmodule Tricep.Socket do
         Tcp.build_segment(
           state.pair,
           seq,
-          state.rcv_nxt,
+          state.tcb.rcv_nxt,
           [:ack, :psh],
-          advertised_receive_window(state),
+          Tcb.advertised_receive_window(state.tcb),
           payload: payload
         )
 
@@ -2257,7 +2091,7 @@ defmodule Tricep.Socket do
       Tricep.Link.send(state.link, packet)
 
       # Update segment with incremented retransmit count
-      updated_entry = {seq, wrap_seq(seq + byte_size(payload)), payload, count + 1}
+      updated_entry = {seq, Sequence.wrap(seq + byte_size(payload)), payload, count + 1}
       new_unacked = [updated_entry | rest]
 
       # Exponential backoff
@@ -2405,7 +2239,7 @@ defmodule Tricep.Socket do
   end
 
   defp do_flush_send_buffer(%__MODULE__{} = state) do
-    available = send_window_available(state)
+    available = Tcb.send_window_available(state.tcb)
 
     cond do
       DataBuffer.empty?(state.send_buffer) ->
@@ -2416,13 +2250,13 @@ defmodule Tricep.Socket do
 
       true ->
         # Take only bytes the peer's advertised receive window currently permits.
-        mss = state.snd_mss || @default_mss
+        mss = state.tcb.snd_mss || @default_mss
         send_len = min(mss, available)
         {payload_iodata, new_send_buffer} = DataBuffer.take(state.send_buffer, send_len)
         payload = IO.iodata_to_binary(payload_iodata)
 
-        seq_start = state.snd_nxt
-        seq_end = wrap_seq(seq_start + byte_size(payload))
+        seq_start = state.tcb.snd_nxt
+        seq_end = Sequence.wrap(seq_start + byte_size(payload))
 
         {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
@@ -2430,9 +2264,9 @@ defmodule Tricep.Socket do
           Tcp.build_segment(
             state.pair,
             seq_start,
-            state.rcv_nxt,
+            state.tcb.rcv_nxt,
             [:ack, :psh],
-            advertised_receive_window(state),
+            Tcb.advertised_receive_window(state.tcb),
             payload: payload
           )
 
@@ -2445,8 +2279,8 @@ defmodule Tricep.Socket do
 
         new_state = %{
           state
-          | send_buffer: new_send_buffer,
-            snd_nxt: seq_end,
+          | tcb: Tcb.advance_send(state.tcb, byte_size(payload)),
+            send_buffer: new_send_buffer,
             unacked_segments: new_unacked
         }
 
@@ -2472,6 +2306,164 @@ defmodule Tricep.Socket do
 
   defp reset_state(%__MODULE__{} = state) do
     Application.deregister_socket_pair(state.pair)
+  end
+
+  defp reset_connection(%__MODULE__{} = state, error, timer_actions \\ []) do
+    reset_state(state)
+    actions = timer_actions ++ notify_waiters_error(state, error)
+    {:next_state, :closed, nil, actions}
+  end
+
+  defp synchronized_rejection(state, outcome, reset \\ :connection)
+
+  defp synchronized_rejection(_state, :malformed, _reset), do: :keep_state_and_data
+
+  defp synchronized_rejection(state, :acceptable_reset, :connection) do
+    reset_connection(state, :econnreset)
+  end
+
+  defp synchronized_rejection(state, :acceptable_reset, {:connection, timer_actions}) do
+    reset_connection(state, :econnreset, timer_actions)
+  end
+
+  defp synchronized_rejection(state, :acceptable_reset, :close) do
+    reset_state(state)
+    {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
+  end
+
+  defp synchronized_rejection(state, :unacceptable_reset, _reset),
+    do: reject_unacceptable_rst(state)
+
+  defp synchronized_rejection(state, :unacceptable_segment, _reset),
+    do: reject_unacceptable_segment(state)
+
+  defp synchronized_rejection(state, :invalid_ack, _reset), do: reject_invalid_ack(state)
+
+  defp syn_sent_segment(state, segment) do
+    case Tcp.parse_segment(segment) do
+      %{flags: flags, ack: acknowledgment} = parsed ->
+        syn_sent_outcome(state, parsed, flags, acknowledgment)
+
+      _ ->
+        :ignore
+    end
+  end
+
+  defp syn_sent_outcome(state, parsed, flags, acknowledgment) do
+    case {:rst in flags, :syn in flags, :ack in flags, acknowledgment == state.tcb.snd_nxt} do
+      {true, _syn?, _ack?, _expected_ack?} -> :reset
+      {false, true, true, true} -> {:established, establish_after_syn_ack(state, parsed)}
+      {false, _syn?, true, false} -> {:bad_ack, acknowledgment}
+      _ -> :ignore
+    end
+  end
+
+  defp syn_received_segment(state, segment) do
+    case Tcp.parse_segment(segment) do
+      %{flags: flags, seq: sequence, ack: acknowledgment, window: window, payload: payload} ->
+        syn_received_outcome(state, flags, sequence, acknowledgment, window, payload)
+
+      _ ->
+        :ignore
+    end
+  end
+
+  defp syn_received_outcome(state, flags, sequence, acknowledgment, window, payload) do
+    reset? = :rst in flags
+    acceptable_reset? = Tcb.acceptable_reset?(state.tcb, sequence)
+
+    valid_ack? =
+      :ack in flags and acknowledgment == state.tcb.snd_nxt and sequence == state.tcb.rcv_nxt
+
+    case {reset?, acceptable_reset?, valid_ack?, :ack in flags, :syn in flags,
+          sequence == state.tcb.irs} do
+      {true, true, _valid_ack?, _ack?, _syn?, _same_initial_receive?} ->
+        :acceptable_reset
+
+      {true, false, _valid_ack?, _ack?, _syn?, _same_initial_receive?} ->
+        :unacceptable_reset
+
+      {false, _acceptable_reset?, true, _ack?, _syn?, _same_initial_receive?} ->
+        {:established, establish_after_syn_received(state, acknowledgment, window, payload)}
+
+      {false, _acceptable_reset?, false, true, _syn?, _same_initial_receive?} ->
+        {:bad_ack, acknowledgment}
+
+      {false, _acceptable_reset?, false, false, true, true} ->
+        :retransmit_syn_ack
+
+      _ ->
+        :ignore
+    end
+  end
+
+  defp establish_after_syn_received(state, acknowledgment, window, payload) do
+    base_state =
+      %{
+        state
+        | tcb: Tcb.acknowledge(state.tcb, acknowledgment, window),
+          syn_retransmit_count: 0,
+          rto_ms: @initial_rto_ms,
+          passive_listener: nil
+      }
+      |> open_receive_window()
+
+    receive_syn_received_payload(base_state, payload)
+  end
+
+  defp establish_after_syn_ack(state, %{
+         seq: sequence,
+         ack: acknowledgment,
+         window: window,
+         options: options
+       }) do
+    send_mss = peer_send_mss(options, state.tcb.rcv_mss)
+
+    {receive_window_scale, send_window_scale, window_scaling_negotiated} =
+      negotiated_window_scaling(options, state.tcb.rcv_wnd_scale)
+
+    %{
+      state
+      | tcb:
+          Tcb.establish_active(
+            state.tcb,
+            %{
+              initial_receive_sequence: sequence,
+              acknowledgment: acknowledgment,
+              send_window: window,
+              send_mss: send_mss,
+              receive_window_scale: receive_window_scale,
+              send_window_scale: send_window_scale,
+              window_scaling_negotiated: window_scaling_negotiated
+            }
+          ),
+        syn_retransmit_count: 0,
+        rto_ms: @initial_rto_ms
+    }
+    |> open_receive_window()
+  end
+
+  defp receive_syn_received_payload(state, <<>>), do: state
+
+  defp receive_syn_received_payload(state, payload) do
+    {receive_state, _accepted_length} = receive_payload(state, payload)
+    send_ack(receive_state.tcb.rcv_nxt, receive_state)
+    receive_state
+  end
+
+  defp maybe_deliver_payload(state, sequence, payload)
+       when sequence == state.tcb.rcv_nxt and payload != <<>> do
+    deliver_received_payload(state, payload)
+  end
+
+  defp maybe_deliver_payload(state, _sequence, _payload), do: {state, 0, []}
+
+  defp transition_after_peer_fin(state, next_state, actions, extra_actions \\ []) do
+    state = %{state | tcb: Tcb.advance_receive(state.tcb, 1)}
+    {new_state, eof_actions} = deliver_receive_eof(state)
+
+    send_ack(new_state.tcb.rcv_nxt, new_state)
+    {:next_state, next_state, new_state, actions ++ eof_actions ++ extra_actions}
   end
 
   defp peer_send_mss(options, local_mss) do
@@ -2507,10 +2499,10 @@ defmodule Tricep.Socket do
     tcp_segment =
       Tcp.build_segment(
         state.pair,
-        state.snd_nxt,
+        state.tcb.snd_nxt,
         ack_num,
         [:ack],
-        advertised_receive_window(state)
+        Tcb.advertised_receive_window(state.tcb)
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
@@ -2527,14 +2519,14 @@ defmodule Tricep.Socket do
   end
 
   defp send_fin_and_track(%__MODULE__{} = state) do
-    seq_start = state.snd_nxt
-    seq_end = wrap_seq(seq_start + 1)
+    seq_start = state.tcb.snd_nxt
+    seq_end = Sequence.wrap(seq_start + 1)
 
     send_fin_segment(state, seq_start)
 
     new_state = %{
       state
-      | snd_nxt: seq_end,
+      | tcb: Tcb.advance_send(state.tcb, 1),
         unacked_segments: state.unacked_segments ++ [{seq_start, seq_end, :fin, 0}]
     }
 
@@ -2586,9 +2578,9 @@ defmodule Tricep.Socket do
       Tcp.build_segment(
         state.pair,
         seq,
-        state.rcv_nxt,
+        state.tcb.rcv_nxt,
         [:fin, :ack],
-        advertised_receive_window(state)
+        Tcb.advertised_receive_window(state.tcb)
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
@@ -2683,21 +2675,8 @@ defmodule Tricep.Socket do
     ArgumentError -> {:error, :einval}
   end
 
-  # Wrap sequence number at 32 bits
-  defp wrap_seq(n), do: n &&& 0xFFFFFFFF
-
-  # Sequence number comparison (handles 32-bit wrap-around)
-  # Returns true if a > b in sequence space
-  defp seq_gt(a, b) do
-    diff = a - b &&& 0xFFFFFFFF
-    diff > 0 and diff < 0x80000000
-  end
-
-  # Returns true if a <= b in sequence space
-  defp seq_leq(a, b), do: not seq_gt(a, b)
-  defp seq_lt(a, b), do: seq_gt(b, a)
-  defp seq_geq(a, b), do: a == b or seq_gt(a, b)
-
+  # Keep call sites focused on TCP state transitions; modular arithmetic lives
+  # in the independently testable Sequence module.
   defp socket_opts(opts) when is_list(opts), do: Keyword.get(opts, :opts, %{})
   defp socket_opts(opts) when is_map(opts), do: opts
   defp socket_opts(_opts), do: %{}
@@ -2754,20 +2733,11 @@ defmodule Tricep.Socket do
     max(0, state.recv_buffer_size - buffered_bytes)
   end
 
-  defp advertised_receive_window(%__MODULE__{} = state) do
-    state.rcv_adv_wnd >>> receive_window_scale(state)
-  end
-
   defp advertised_syn_window(%__MODULE__{} = state) do
     state
     |> available_receive_window()
-    |> min(@max_tcp_window)
+    |> min(@max_window)
   end
-
-  defp receive_window_scale(%__MODULE__{window_scaling_negotiated: true} = state),
-    do: state.rcv_wnd_scale
-
-  defp receive_window_scale(%__MODULE__{}), do: 0
 
   defp open_receive_window(%__MODULE__{} = state) do
     # Leave one scale quantum of physical headroom for sub-quantum ACK movement.
@@ -2775,66 +2745,17 @@ defmodule Tricep.Socket do
   end
 
   defp refresh_receive_window(%__MODULE__{} = state, opts \\ []) do
-    available_window = available_receive_window(state)
-    scale = receive_window_scale(state)
-
-    reserve =
-      if Keyword.get(opts, :reserve_scale_headroom?, false), do: (1 <<< scale) - 1, else: 0
-
-    advertised_window =
-      state
-      |> representable_receive_window(max(0, available_window - reserve))
-
-    # Flooring never promises bytes beyond physical capacity. When RCV.NXT
-    # advances in order, quantization can retract the on-wire edge by at most
-    # one scale quantum minus one. Out-of-order buffering can retract it by the
-    # consumed capacity because RCV.NXT does not advance.
-    advertised_right_edge = wrap_seq(state.rcv_nxt + advertised_window)
-
-    # Retain the logical offered edge so entitlement can be restored as capacity
-    # permits. Effective admission below remains capped by current buffer space;
-    # bytes that cannot physically fit are rejected rather than truncated.
-    authorized_right_edge = later_right_edge(state.rcv_right_edge, advertised_right_edge)
-
-    receive_window =
-      state.rcv_nxt
-      |> window_to_right_edge(authorized_right_edge)
-      |> min(available_window)
-
-    %{
-      state
-      | rcv_wnd: receive_window,
-        rcv_adv_wnd: advertised_window,
-        rcv_right_edge: authorized_right_edge
-    }
-  end
-
-  defp representable_receive_window(%__MODULE__{} = state, available_window) do
-    scale = receive_window_scale(state)
-
-    available_window
-    |> then(&(&1 >>> scale))
-    |> min(@max_tcp_window)
-    |> then(&(&1 <<< scale))
-  end
-
-  defp later_right_edge(nil, candidate), do: candidate
-
-  defp later_right_edge(current, candidate) do
-    if seq_gt(candidate, current), do: candidate, else: current
-  end
-
-  defp window_to_right_edge(rcv_nxt, right_edge) do
-    if seq_lt(rcv_nxt, right_edge), do: sequence_distance(rcv_nxt, right_edge), else: 0
+    %{state | tcb: Tcb.refresh_receive_window(state.tcb, available_receive_window(state), opts)}
   end
 
   defp receive_window(%__MODULE__{} = state) do
-    min(state.rcv_wnd, available_receive_window(state))
+    Tcb.receive_window(state.tcb, available_receive_window(state))
   end
 
   defp maybe_send_window_update(%__MODULE__{} = new_state, %__MODULE__{} = old_state) do
-    if advertised_receive_window(new_state) > advertised_receive_window(old_state) do
-      send_ack(new_state.rcv_nxt, new_state)
+    if Tcb.advertised_receive_window(new_state.tcb) >
+         Tcb.advertised_receive_window(old_state.tcb) do
+      send_ack(new_state.tcb.rcv_nxt, new_state)
     end
 
     new_state
@@ -2844,12 +2765,9 @@ defmodule Tricep.Socket do
     accepted_len = min(byte_size(payload), receive_window(state))
     {accepted_payload, _overflow} = split_binary(payload, accepted_len)
 
-    new_state =
-      state
-      |> Map.put(:recv_buffer, state.recv_buffer <> accepted_payload)
-      |> Map.put(:rcv_nxt, wrap_seq(state.rcv_nxt + accepted_len))
-      |> drain_out_of_order_segments()
-      |> refresh_receive_window()
+    new_state = %{state | recv_buffer: state.recv_buffer <> accepted_payload}
+    new_state = %{new_state | tcb: Tcb.advance_receive(new_state.tcb, accepted_len)}
+    new_state = new_state |> drain_out_of_order_segments() |> refresh_receive_window()
 
     {new_state, accepted_len}
   end
@@ -2894,17 +2812,17 @@ defmodule Tricep.Socket do
 
   defp buffer_out_of_order_payload(%__MODULE__{} = state, seq, payload)
        when byte_size(payload) > 0 do
-    if seq_gt(seq, state.rcv_nxt) do
-      offset = sequence_distance(state.rcv_nxt, seq)
+    if Sequence.gt?(seq, state.tcb.rcv_nxt) do
+      offset = Sequence.distance(state.tcb.rcv_nxt, seq)
       accepted_len = min(byte_size(payload), max(0, receive_window(state) - offset))
 
       if accepted_len > 0 do
         {accepted_payload, _overflow} = split_binary(payload, accepted_len)
-        seq_end = wrap_seq(seq + accepted_len)
+        seq_end = Sequence.wrap(seq + accepted_len)
 
         segments =
           [{seq, seq_end, accepted_payload} | state.out_of_order_segments]
-          |> sort_out_of_order_segments(state.rcv_nxt)
+          |> sort_out_of_order_segments(state.tcb.rcv_nxt)
           |> merge_out_of_order_segments()
 
         %{state | out_of_order_segments: segments}
@@ -2921,7 +2839,7 @@ defmodule Tricep.Socket do
 
   defp sort_out_of_order_segments(segments, rcv_nxt) do
     Enum.sort_by(segments, fn {seq, _seq_end, _payload} ->
-      sequence_distance(rcv_nxt, seq)
+      Sequence.distance(rcv_nxt, seq)
     end)
   end
 
@@ -2937,11 +2855,11 @@ defmodule Tricep.Socket do
          {current_seq, current_end, current_payload} | rest
        ]) do
     cond do
-      seq_gt(seq, current_end) ->
+      Sequence.gt?(seq, current_end) ->
         [{seq, seq_end, payload}, {current_seq, current_end, current_payload} | rest]
 
-      seq_gt(seq_end, current_end) ->
-        overlap = sequence_distance(seq, current_end)
+      Sequence.gt?(seq_end, current_end) ->
+        overlap = Sequence.distance(seq, current_end)
         tail_len = byte_size(payload) - overlap
         tail = binary_part(payload, overlap, tail_len)
         [{current_seq, seq_end, current_payload <> tail} | rest]
@@ -2954,13 +2872,16 @@ defmodule Tricep.Socket do
   defp drain_out_of_order_segments(%__MODULE__{} = state) do
     {drained_state, remaining} =
       Enum.reduce(state.out_of_order_segments, {state, []}, fn
-        {seq, seq_end, payload}, {%__MODULE__{rcv_nxt: rcv_nxt} = acc_state, remaining} ->
+        {seq, seq_end, payload},
+        {%__MODULE__{tcb: %Tcb{rcv_nxt: rcv_nxt}} = acc_state, remaining} ->
           if seq == rcv_nxt do
-            {%{
-               acc_state
-               | recv_buffer: acc_state.recv_buffer <> payload,
-                 rcv_nxt: seq_end
-             }, remaining}
+            new_state = %{
+              acc_state
+              | recv_buffer: acc_state.recv_buffer <> payload,
+                tcb: Tcb.receive_next(acc_state.tcb, seq_end)
+            }
+
+            {new_state, remaining}
           else
             {acc_state, [{seq, seq_end, payload} | remaining]}
           end
@@ -2969,11 +2890,9 @@ defmodule Tricep.Socket do
     %{drained_state | out_of_order_segments: Enum.reverse(remaining)}
   end
 
-  defp sequence_distance(from, to), do: wrap_seq(to - from)
-
-  defp window_scale_for(size) when is_integer(size) and size > @max_tcp_window do
+  defp window_scale_for(size) when is_integer(size) and size > @max_window do
     Enum.find(1..@max_window_scale, @max_window_scale, fn scale ->
-      size <= @max_tcp_window <<< scale
+      size <= @max_window <<< scale
     end)
   end
 
@@ -2998,14 +2917,6 @@ defmodule Tricep.Socket do
   end
 
   defp normalize_window_scale(_scale), do: 0
-
-  defp scale_peer_window(%__MODULE__{} = state, window) do
-    scale_window(window, state.snd_wnd_scale)
-  end
-
-  defp scale_window(window, scale) when is_integer(window) and is_integer(scale) do
-    window <<< scale
-  end
 
   defp notify_recv_select(%__MODULE__{} = state, :eof) do
     notify_selects(state.recv_selects)
@@ -3053,7 +2964,7 @@ defmodule Tricep.Socket do
 
   defp cancel_persist_timer_action(%__MODULE__{}), do: []
 
-  defp persist_needed?(%__MODULE__{snd_wnd: 0} = state), do: has_persist_data?(state)
+  defp persist_needed?(%__MODULE__{tcb: %Tcb{snd_wnd: 0}} = state), do: has_persist_data?(state)
   defp persist_needed?(%__MODULE__{}), do: false
 
   defp has_persist_data?(%__MODULE__{} = state) do
@@ -3074,15 +2985,15 @@ defmodule Tricep.Socket do
 
       payload ->
         {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
-        seq = wrap_seq(state.snd_nxt - 1)
+        seq = Sequence.wrap(state.tcb.snd_nxt - 1)
 
         tcp_segment =
           Tcp.build_segment(
             state.pair,
             seq,
-            state.rcv_nxt,
+            state.tcb.rcv_nxt,
             [:ack, :psh],
-            advertised_receive_window(state),
+            Tcb.advertised_receive_window(state.tcb),
             payload: payload
           )
 
@@ -3110,19 +3021,20 @@ defmodule Tricep.Socket do
 
   defp apply_path_mtu(%__MODULE__{} = state, mtu) when is_integer(mtu) and mtu > 0 do
     new_mss = path_mtu_mss(mtu)
-    current_mss = state.snd_mss || @default_mss
 
-    if new_mss < current_mss do
-      new_state = %{
-        state
-        | snd_mss: new_mss,
-          unacked_segments: resegment_unacked_segments(state.unacked_segments, new_mss)
-      }
+    case Tcb.update_send_mss_for_path_mtu(state.tcb, new_mss, @default_mss) do
+      {:reduced, tcb} ->
+        new_state = %{
+          state
+          | tcb: tcb,
+            unacked_segments: resegment_unacked_segments(state.unacked_segments, new_mss)
+        }
 
-      actions = schedule_flush_send_buffer(new_state, [])
-      {new_state, actions}
-    else
-      {state, []}
+        actions = schedule_flush_send_buffer(new_state, [])
+        {new_state, actions}
+
+      :unchanged ->
+        {state, []}
     end
   end
 
@@ -3143,20 +3055,14 @@ defmodule Tricep.Socket do
   defp resegment_payload(_seq, <<>>, _count, _mss), do: []
 
   defp resegment_payload(seq, payload, count, mss) when byte_size(payload) <= mss do
-    [{seq, wrap_seq(seq + byte_size(payload)), payload, count}]
+    [{seq, Sequence.wrap(seq + byte_size(payload)), payload, count}]
   end
 
   defp resegment_payload(seq, payload, count, mss) do
     {chunk, rest} = split_binary(payload, mss)
-    next_seq = wrap_seq(seq + byte_size(chunk))
+    next_seq = Sequence.wrap(seq + byte_size(chunk))
 
     [{seq, next_seq, chunk, count} | resegment_payload(next_seq, rest, count, mss)]
-  end
-
-  # Calculate available send window (for backpressure detection)
-  defp send_window_available(state) do
-    bytes_in_flight = wrap_seq(state.snd_nxt - state.snd_una)
-    max(0, state.snd_wnd - bytes_in_flight)
   end
 
   # Send select notification to caller
@@ -3174,99 +3080,49 @@ defmodule Tricep.Socket do
   # Process ACK and update retransmission queue
   # Returns {new_state, timer_actions}
   defp process_ack_if_present(state, false, _ack, window) do
-    state
-    |> Map.put(:snd_wnd, scale_peer_window(state, window))
+    %{state | tcb: Tcb.update_send_window(state.tcb, window)}
     |> sync_persist_timer([])
   end
 
   defp process_ack_if_present(state, true, ack, window), do: process_ack(state, ack, window)
 
-  defp invalid_ack?(state, true, ack), do: seq_gt(ack, state.snd_nxt)
-  defp invalid_ack?(_state, false, _ack), do: false
-
-  defp segment_acceptable?(state, %{seq: seq} = segment) do
-    window = state.rcv_wnd
-    segment_len = segment_sequence_length(segment)
-
-    cond do
-      # A peer can legitimately send FIN after filling the exact advertised
-      # data window. Accept only that control byte at RCV.NXT so a zero-window
-      # connection can still make progress without admitting any payload.
-      window == 0 and zero_window_fin_at_rcv_nxt?(segment, seq, state.rcv_nxt) ->
-        true
-
-      window == 0 and segment_len == 0 ->
-        seq == state.rcv_nxt
-
-      window == 0 ->
-        false
-
-      segment_len == 0 ->
-        seq_in_receive_window?(seq, state.rcv_nxt, window)
-
-      true ->
-        last_seq = wrap_seq(seq + segment_len - 1)
-
-        seq_in_receive_window?(seq, state.rcv_nxt, window) or
-          seq_in_receive_window?(last_seq, state.rcv_nxt, window)
-    end
-  end
-
-  defp zero_window_fin_at_rcv_nxt?(segment, seq, rcv_nxt) do
-    seq == rcv_nxt and segment.payload == <<>> and :ack in segment.flags and
-      :fin in segment.flags and
-      :syn not in segment.flags
-  end
-
-  defp acceptable_rst?(state, seq) do
-    seq_in_receive_window?(seq, state.rcv_nxt, state.rcv_wnd)
-  end
-
-  defp seq_in_receive_window?(seq, rcv_nxt, 0), do: seq == rcv_nxt
-
-  defp seq_in_receive_window?(seq, rcv_nxt, window) do
-    window_end = wrap_seq(rcv_nxt + window)
-    seq_geq(seq, rcv_nxt) and seq_lt(seq, window_end)
-  end
-
   defp reject_invalid_ack(state) do
-    send_ack(state.rcv_nxt, state)
+    send_ack(state.tcb.rcv_nxt, state)
     {:keep_state, state, []}
   end
 
   defp reject_unacceptable_rst(state) do
-    send_ack(state.rcv_nxt, state)
+    send_ack(state.tcb.rcv_nxt, state)
     {:keep_state, state, []}
   end
 
   defp reject_unacceptable_segment(state) do
-    send_ack(state.rcv_nxt, state)
+    send_ack(state.tcb.rcv_nxt, state)
     {:keep_state, state, []}
   end
 
   defp ack_unacceptable_segment(state, ack?, ack, window) do
     {new_state, actions} = process_ack_if_present(state, ack?, ack, window)
-    send_ack(new_state.rcv_nxt, new_state)
+    send_ack(new_state.tcb.rcv_nxt, new_state)
     {:keep_state, new_state, actions}
   end
 
   defp process_ack(state, ack, window) do
     cond do
-      seq_gt(ack, state.snd_nxt) ->
-        send_ack(state.rcv_nxt, state)
+      Sequence.gt?(ack, state.tcb.snd_nxt) ->
+        send_ack(state.tcb.rcv_nxt, state)
         {state, []}
 
-      seq_gt(ack, state.snd_una) ->
+      Sequence.gt?(ack, state.tcb.snd_una) ->
         # ACK acknowledges new data - remove acknowledged segments from queue
         new_unacked =
           Enum.drop_while(state.unacked_segments, fn {_seq_start, seq_end, _payload, _count} ->
-            seq_leq(seq_end, ack)
+            Sequence.lte?(seq_end, ack)
           end)
 
         base_state = %{
           state
-          | snd_una: ack,
-            snd_wnd: scale_peer_window(state, window),
+          | tcb: Tcb.acknowledge(state.tcb, ack, window),
             unacked_segments: new_unacked,
             rto_ms: @initial_rto_ms
         }
@@ -3290,7 +3146,7 @@ defmodule Tricep.Socket do
 
       true ->
         # Duplicate or old ACK - just update window (but still check send waiters)
-        base_state = %{state | snd_wnd: scale_peer_window(state, window)}
+        base_state = %{state | tcb: Tcb.update_send_window(state.tcb, window)}
         {new_state, send_waiter_actions} = process_send_waiters(base_state)
         send_waiter_actions = schedule_flush_send_buffer(new_state, send_waiter_actions)
         sync_persist_timer(new_state, send_waiter_actions)
@@ -3300,7 +3156,7 @@ defmodule Tricep.Socket do
   defp schedule_flush_send_buffer(state, actions) do
     flush_action = {:next_event, :internal, :flush_send_buffer}
 
-    if not DataBuffer.empty?(state.send_buffer) and send_window_available(state) > 0 and
+    if not DataBuffer.empty?(state.send_buffer) and Tcb.send_window_available(state.tcb) > 0 and
          flush_action not in actions do
       actions ++ [flush_action]
     else
@@ -3341,7 +3197,7 @@ defmodule Tricep.Socket do
   end
 
   defp send_waiter_capacity(state) do
-    max(0, send_window_available(state) - DataBuffer.size(state.send_buffer))
+    max(0, Tcb.send_window_available(state.tcb) - DataBuffer.size(state.send_buffer))
   end
 
   defp take_select_for_pid(selects, caller_pid) do
