@@ -3629,6 +3629,149 @@ defmodule Tricep.SocketTest do
       assert state_after_ack.rto_timer_active == state_before_ack.rto_timer_active
     end
 
+    test "ACK-less in-order data is acknowledged without waking receivers", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack_packet}, 1000
+
+      assert {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, 5_000) end)
+      wait_for_recv_waiters(socket)
+      assert {:select, {:select_info, :recv, ref}} = Tricep.recv(socket, 0, :nowait)
+
+      assert {:established, before_state} = :sys.get_state(socket)
+      assert length(before_state.recv_waiters) == 1
+      assert length(before_state.recv_selects) == 1
+
+      ackless_data =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
+          [:psh],
+          0,
+          payload: "must not deliver"
+        )
+
+      DummyLink.inject_packet(link, ackless_data)
+      assert_receive {:dummy_link_packet, ^link, ack_packet}, 1000
+      <<_::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert ack.flags == [:ack]
+      assert ack.payload == <<>>
+      assert ack.seq == before_state.tcb.snd_nxt
+      assert ack.ack == before_state.tcb.rcv_nxt
+      assert ack.window == before_state.tcb.rcv_adv_wnd
+      refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+      refute_receive {:"$socket", ^socket, :select, ^ref}, 100
+      assert Task.yield(recv_task, 50) == nil
+
+      assert {:established, after_state} = :sys.get_state(socket)
+      assert after_state.tcb.rcv_nxt == before_state.tcb.rcv_nxt
+      assert after_state.recv_buffer == before_state.recv_buffer
+      assert after_state.out_of_order_segments == before_state.out_of_order_segments
+      assert after_state.out_of_order_fin == before_state.out_of_order_fin
+      assert after_state.recv_waiters == before_state.recv_waiters
+      assert after_state.recv_selects == before_state.recv_selects
+      assert after_state.tcb.snd_wnd == 0
+      assert after_state.tcb.snd_una == before_state.tcb.snd_una
+      assert after_state.tcb.snd_nxt == before_state.tcb.snd_nxt
+      refute after_state.persist_timer_active
+
+      Task.shutdown(recv_task, :brutal_kill)
+    end
+
+    test "ACK-less left-overlapping data is acknowledged without waking receivers", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack_packet}, 1000
+
+      assert {:established, state} = :sys.get_state(socket)
+
+      assert_ackless_payloads_preserve_receive_state(
+        socket,
+        link,
+        local_addr,
+        remote_addr,
+        :established,
+        [
+          {wrap_seq(state.tcb.rcv_nxt - 1), [:psh], "ab"},
+          {wrap_seq(state.tcb.rcv_nxt - 2), [:psh, :fin], "abcd"}
+        ]
+      )
+    end
+
+    test "ACK-less left-overlapping data is rejected across sequence wrap", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, server_seq: 0xFFFFFFFD)
+      on_exit(fn -> stop_socket(socket) end)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack_packet}, 1000
+
+      assert {:established, %{tcb: %{rcv_nxt: 0xFFFFFFFE}} = state} = :sys.get_state(socket)
+
+      assert_ackless_payloads_preserve_receive_state(
+        socket,
+        link,
+        local_addr,
+        remote_addr,
+        :established,
+        [
+          {wrap_seq(state.tcb.rcv_nxt - 1), [:psh], "ab"},
+          {wrap_seq(state.tcb.rcv_nxt - 2), [:psh, :fin], "abcd"}
+        ]
+      )
+    end
+
+    test "does not latch an ACK-less out-of-order bare or payload FIN", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack_packet}, 1000
+
+      assert_ackless_out_of_order_fin_does_not_close(
+        socket,
+        link,
+        local_addr,
+        remote_addr,
+        :established
+      )
+    end
+
+    test "ACK-less future payload invalidates an advisory FIN", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack_packet}, 1000
+
+      assert_ackless_future_payload_invalidates_advisory_fin(
+        socket,
+        link,
+        local_addr,
+        remote_addr,
+        :established
+      )
+    end
+
     test "buffers out of order packets until the gap arrives", %{
       link: link,
       local_addr: local_addr,
@@ -4077,7 +4220,7 @@ defmodule Tricep.SocketTest do
       assert Tricep.recv(socket, 0, 1000) == {:ok, <<>>}
     end
 
-    test "rejects a FIN that conflicts with already queued data", %{
+    test "rejects a first FIN marker strictly inside queued data", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -4127,7 +4270,7 @@ defmodule Tricep.SocketTest do
       assert fin_ack.flags == [:ack]
       assert fin_ack.seq == state.tcb.snd_nxt
       assert fin_ack.ack == state.tcb.rcv_nxt
-      assert fin_ack.window == queued_ack.window
+      assert fin_ack.window == state.tcb.rcv_adv_wnd - byte_size("world")
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
       assert {:established, queued_state} = :sys.get_state(socket)
@@ -4161,11 +4304,35 @@ defmodule Tricep.SocketTest do
 
       assert {:established, final_state} = :sys.get_state(socket)
       refute final_state.fin_received
-      assert Tricep.recv(socket, 0, 1000) == {:ok, "helloworld"}
-      assert Tricep.recv(socket, 0, 50) == {:error, :timeout}
+      assert final_state.recv_buffer == "helloworld"
+
+      genuine_fin =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          final_state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
+          [:ack, :fin],
+          32_768
+        )
+
+      DummyLink.inject_packet(link, genuine_fin)
+      assert_receive {:dummy_link_packet, ^link, genuine_fin_ack_packet}, 1000
+      <<_::binary-size(40), genuine_fin_ack_segment::binary>> = genuine_fin_ack_packet
+      genuine_fin_ack = Tcp.parse_segment(genuine_fin_ack_segment)
+
+      assert genuine_fin_ack.flags == [:ack]
+      assert genuine_fin_ack.seq == state.tcb.snd_nxt
+      assert genuine_fin_ack.ack == wrap_seq(state.tcb.rcv_nxt + 11)
+      assert genuine_fin_ack.window == state.tcb.rcv_adv_wnd - byte_size("helloworld")
+      refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+
+      assert {:close_wait, close_wait_state} = :sys.get_state(socket)
+      assert close_wait_state.fin_received
+      assert Tricep.recv(socket, 20, 1000) == {:ok, "helloworld"}
+      assert Tricep.recv(socket, 0, 1000) == {:ok, <<>>}
     end
 
-    test "revokes a pending FIN when later payload occupies its marker", %{
+    test "full data stream revokes an advisory FIN before a genuine FIN closes", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -4182,8 +4349,9 @@ defmodule Tricep.SocketTest do
           {{local_addr, @port}, {remote_addr, src_port}},
           wrap_seq(state.tcb.rcv_nxt + 5),
           state.tcb.snd_nxt,
-          [:ack, :fin],
-          32_768
+          [:ack, :psh, :fin],
+          32_768,
+          payload: "world"
         )
 
       DummyLink.inject_packet(link, pending_fin)
@@ -4194,13 +4362,13 @@ defmodule Tricep.SocketTest do
       assert pending_fin_ack.flags == [:ack]
       assert pending_fin_ack.seq == state.tcb.snd_nxt
       assert pending_fin_ack.ack == state.tcb.rcv_nxt
-      assert pending_fin_ack.window == state.tcb.rcv_adv_wnd
+      assert pending_fin_ack.window == state.tcb.rcv_adv_wnd - 5
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
       assert {:established, pending_state} = :sys.get_state(socket)
-      assert pending_state.out_of_order_fin == wrap_seq(state.tcb.rcv_nxt + 5)
+      assert pending_state.out_of_order_fin == wrap_seq(state.tcb.rcv_nxt + 10)
 
-      payload = "helloworld"
+      payload = "helloworld!"
 
       data_across_fin =
         Tcp.build_segment(
@@ -4226,11 +4394,35 @@ defmodule Tricep.SocketTest do
       assert {:established, final_state} = :sys.get_state(socket)
       refute final_state.fin_received
       assert final_state.out_of_order_fin == nil
-      assert Tricep.recv(socket, 0, 1000) == {:ok, payload}
-      assert Tricep.recv(socket, 0, 50) == {:error, :timeout}
+      assert final_state.recv_buffer == payload
+
+      genuine_fin =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          final_state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
+          [:ack, :fin],
+          32_768
+        )
+
+      DummyLink.inject_packet(link, genuine_fin)
+      assert_receive {:dummy_link_packet, ^link, genuine_fin_ack_packet}, 1000
+      <<_::binary-size(40), genuine_fin_ack_segment::binary>> = genuine_fin_ack_packet
+      genuine_fin_ack = Tcp.parse_segment(genuine_fin_ack_segment)
+
+      assert genuine_fin_ack.flags == [:ack]
+      assert genuine_fin_ack.seq == state.tcb.snd_nxt
+      assert genuine_fin_ack.ack == wrap_seq(state.tcb.rcv_nxt + byte_size(payload) + 1)
+      assert genuine_fin_ack.window == state.tcb.rcv_adv_wnd - byte_size(payload)
+      refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+
+      assert {:close_wait, close_wait_state} = :sys.get_state(socket)
+      assert close_wait_state.fin_received
+      assert Tricep.recv(socket, 20, 1000) == {:ok, payload}
+      assert Tricep.recv(socket, 0, 1000) == {:ok, <<>>}
     end
 
-    test "an in-order FIN supersedes a stale queued FIN marker", %{
+    test "an in-order FIN supersedes a stale advisory FIN marker", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -4245,10 +4437,11 @@ defmodule Tricep.SocketTest do
       stale_fin =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          wrap_seq(state.tcb.rcv_nxt + 10),
+          wrap_seq(state.tcb.rcv_nxt + 4),
           state.tcb.snd_nxt,
-          [:ack, :fin],
-          32_768
+          [:ack, :psh, :fin],
+          32_768,
+          payload: "o"
         )
 
       DummyLink.inject_packet(link, stale_fin)
@@ -4259,40 +4452,20 @@ defmodule Tricep.SocketTest do
       assert stale_fin_ack.flags == [:ack]
       assert stale_fin_ack.seq == state.tcb.snd_nxt
       assert stale_fin_ack.ack == state.tcb.rcv_nxt
-      assert stale_fin_ack.window == state.tcb.rcv_adv_wnd
+      assert stale_fin_ack.window == state.tcb.rcv_adv_wnd - 1
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
-      gap_data =
-        Tcp.build_segment(
-          {{local_addr, @port}, {remote_addr, src_port}},
-          state.tcb.rcv_nxt,
-          state.tcb.snd_nxt,
-          [:ack, :psh],
-          32_768,
-          payload: "hello"
-        )
-
-      DummyLink.inject_packet(link, gap_data)
-      assert_receive {:dummy_link_packet, ^link, gap_data_ack_packet}, 1000
-      <<_::binary-size(40), gap_data_ack_segment::binary>> = gap_data_ack_packet
-      gap_data_ack = Tcp.parse_segment(gap_data_ack_segment)
-
-      assert gap_data_ack.flags == [:ack]
-      assert gap_data_ack.seq == state.tcb.snd_nxt
-      assert gap_data_ack.ack == wrap_seq(state.tcb.rcv_nxt + 5)
-      assert gap_data_ack.window == state.tcb.rcv_adv_wnd - 5
-      refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
-
-      assert {:established, drained_state} = :sys.get_state(socket)
-      assert drained_state.out_of_order_fin == wrap_seq(state.tcb.rcv_nxt + 10)
+      assert {:established, stale_state} = :sys.get_state(socket)
+      assert stale_state.out_of_order_fin == wrap_seq(state.tcb.rcv_nxt + 5)
 
       real_fin =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          drained_state.tcb.rcv_nxt,
+          state.tcb.rcv_nxt,
           state.tcb.snd_nxt,
-          [:ack, :fin],
-          32_768
+          [:ack, :psh, :fin],
+          32_768,
+          payload: "helloworld"
         )
 
       DummyLink.inject_packet(link, real_fin)
@@ -4302,18 +4475,18 @@ defmodule Tricep.SocketTest do
 
       assert real_fin_ack.flags == [:ack]
       assert real_fin_ack.seq == state.tcb.snd_nxt
-      assert real_fin_ack.ack == wrap_seq(drained_state.tcb.rcv_nxt + 1)
-      assert real_fin_ack.window == state.tcb.rcv_adv_wnd - 5
+      assert real_fin_ack.ack == wrap_seq(state.tcb.rcv_nxt + 11)
+      assert real_fin_ack.window == state.tcb.rcv_adv_wnd - 10
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
       assert {:close_wait, final_state} = :sys.get_state(socket)
       assert final_state.fin_received
       assert final_state.out_of_order_fin == nil
-      assert Tricep.recv(socket, 0, 1000) == {:ok, "hello"}
+      assert Tricep.recv(socket, 20, 1000) == {:ok, "helloworld"}
       assert Tricep.recv(socket, 0, 1000) == {:ok, <<>>}
     end
 
-    test "defers a FIN at the receive-window edge until it is retransmitted", %{
+    test "accepts a FIN at the receive-window edge and wakes an oversized recv", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -4326,6 +4499,9 @@ defmodule Tricep.SocketTest do
 
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
+
+      recv_task = Task.async(fn -> Tricep.recv(socket, 10, 5_000) end)
+      wait_for_recv_waiters(socket)
 
       data = "hello"
 
@@ -4346,37 +4522,15 @@ defmodule Tricep.SocketTest do
 
       assert data_ack.flags == [:ack]
       assert data_ack.seq == state.tcb.snd_nxt
-      assert data_ack.ack == wrap_seq(state.tcb.rcv_nxt + byte_size(data))
-      assert data_ack.window == 0
-      refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
-
-      assert {:established, full_window_state} = :sys.get_state(socket)
-      refute full_window_state.fin_received
-      assert full_window_state.out_of_order_fin == nil
-
-      retransmitted_fin =
-        Tcp.build_segment(
-          {{local_addr, @port}, {remote_addr, src_port}},
-          full_window_state.tcb.rcv_nxt,
-          state.tcb.snd_nxt,
-          [:ack, :fin],
-          32_768
-        )
-
-      DummyLink.inject_packet(link, retransmitted_fin)
-      assert_receive {:dummy_link_packet, ^link, fin_ack_packet}, 1000
-      <<_::binary-size(40), fin_ack_segment::binary>> = fin_ack_packet
-      fin_ack = Tcp.parse_segment(fin_ack_segment)
-
-      assert fin_ack.flags == [:ack]
-      assert fin_ack.seq == state.tcb.snd_nxt
-      assert fin_ack.ack == wrap_seq(full_window_state.tcb.rcv_nxt + 1)
-      assert fin_ack.window == 0
+      assert data_ack.ack == wrap_seq(state.tcb.rcv_nxt + byte_size(data) + 1)
+      assert data_ack.window == byte_size(data)
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
       assert {:close_wait, close_wait_state} = :sys.get_state(socket)
       assert close_wait_state.fin_received
-      assert Tricep.recv(socket, 0, 1000) == {:ok, data}
+      assert close_wait_state.out_of_order_fin == nil
+      refute close_wait_state.rto_timer_active
+      assert Task.await(recv_task, 1000) == {:ok, data}
       assert Tricep.recv(socket, 0, 1000) == {:ok, <<>>}
     end
 
@@ -4404,8 +4558,9 @@ defmodule Tricep.SocketTest do
           {{local_addr, @port}, {remote_addr, src_port}},
           wrap_seq(state.tcb.rcv_nxt + 5),
           state.tcb.snd_una,
-          [:ack, :fin],
-          32_768
+          [:ack, :psh, :fin],
+          32_768,
+          payload: "world"
         )
 
       DummyLink.inject_packet(link, queued_fin)
@@ -4416,7 +4571,7 @@ defmodule Tricep.SocketTest do
       assert queued_fin_ack.flags == [:ack]
       assert queued_fin_ack.seq == state.tcb.snd_nxt
       assert queued_fin_ack.ack == state.tcb.rcv_nxt
-      assert queued_fin_ack.window == state.tcb.rcv_adv_wnd
+      assert queued_fin_ack.window == state.tcb.rcv_adv_wnd - 5
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
       gap_and_full_ack =
@@ -4436,8 +4591,8 @@ defmodule Tricep.SocketTest do
 
       assert final_ack.flags == [:ack]
       assert final_ack.seq == state.tcb.snd_nxt
-      assert final_ack.ack == wrap_seq(state.tcb.rcv_nxt + 6)
-      assert final_ack.window == state.tcb.rcv_adv_wnd - 5
+      assert final_ack.ack == wrap_seq(state.tcb.rcv_nxt + 11)
+      assert final_ack.window == state.tcb.rcv_adv_wnd - 10
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
       assert {:close_wait, final_state} = :sys.get_state(socket)
@@ -4447,11 +4602,11 @@ defmodule Tricep.SocketTest do
       refute final_state.rto_timer_active
       assert final_state.send_waiters == []
       refute final_state.persist_timer_active
-      assert Tricep.recv(socket, 0, 1000) == {:ok, "hello"}
+      assert Tricep.recv(socket, 0, 1000) == {:ok, "helloworld"}
       assert Tricep.recv(socket, 0, 1000) == {:ok, <<>>}
     end
 
-    test "drains a queued bare FIN after its missing data arrives", %{
+    test "drops a queued bare FIN until it is retransmitted in order", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -4483,8 +4638,7 @@ defmodule Tricep.SocketTest do
       assert queued_ack.window == state.tcb.rcv_adv_wnd
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
-      assert {:established, %{out_of_order_fin: fin_sequence}} = :sys.get_state(socket)
-      assert fin_sequence == state.tcb.rcv_nxt + 5
+      assert {:established, %{out_of_order_fin: nil}} = :sys.get_state(socket)
 
       gap_segment =
         Tcp.build_segment(
@@ -4503,12 +4657,36 @@ defmodule Tricep.SocketTest do
 
       assert fin_ack.flags == [:ack]
       assert fin_ack.seq == state.tcb.snd_nxt
-      assert fin_ack.ack == wrap_seq(state.tcb.rcv_nxt + 6)
+      assert fin_ack.ack == wrap_seq(state.tcb.rcv_nxt + 5)
       assert fin_ack.window == state.tcb.rcv_adv_wnd - 5
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
-      assert {:close_wait, _} = :sys.get_state(socket)
+      assert {:established, _} = :sys.get_state(socket)
       assert Tricep.recv(socket, 0, 1000) == {:ok, "hello"}
+
+      assert_receive {:dummy_link_packet, ^link, window_update_packet}, 1000
+      <<_::binary-size(40), window_update_segment::binary>> = window_update_packet
+      window_update = Tcp.parse_segment(window_update_segment)
+      assert window_update.flags == [:ack]
+      assert window_update.ack == wrap_seq(state.tcb.rcv_nxt + 5)
+
+      retransmitted_fin =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(state.tcb.rcv_nxt + 5),
+          state.tcb.snd_nxt,
+          [:ack, :fin],
+          32_768
+        )
+
+      DummyLink.inject_packet(link, retransmitted_fin)
+      assert_receive {:dummy_link_packet, ^link, retransmitted_ack_packet}, 1000
+      <<_::binary-size(40), retransmitted_ack_segment::binary>> = retransmitted_ack_packet
+      retransmitted_ack = Tcp.parse_segment(retransmitted_ack_segment)
+
+      assert retransmitted_ack.flags == [:ack]
+      assert retransmitted_ack.ack == wrap_seq(state.tcb.rcv_nxt + 6)
+      assert {:close_wait, _} = :sys.get_state(socket)
       assert Tricep.recv(socket, 0, 1000) == {:ok, <<>>}
     end
 
@@ -4851,7 +5029,7 @@ defmodule Tricep.SocketTest do
       assert ack.ack == state.tcb.rcv_nxt
     end
 
-    test "recv returns buffered data then EOF after receiving FIN", %{
+    test "public recv returns a short final explicit-length read then EOF", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -4865,7 +5043,10 @@ defmodule Tricep.SocketTest do
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
 
-      # Send data with FIN
+      final_data = "Final data"
+      requested_length = byte_size(final_data) + 1
+
+      # Send data with FIN before any recv call, so the final data is buffered.
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
@@ -4873,16 +5054,19 @@ defmodule Tricep.SocketTest do
           state.tcb.snd_nxt,
           [:fin, :ack],
           32768,
-          payload: "Final data"
+          payload: final_data
         )
 
       DummyLink.inject_packet(link, fin_segment)
 
-      # First recv gets the data
-      assert Tricep.recv(socket, 0, 100) == {:ok, "Final data"}
+      # An explicit length normally waits for exactly n bytes, but EOF returns
+      # the buffered tail and the caller can identify the short final read.
+      assert {:ok, received} = Tricep.recv(socket, requested_length, 100)
+      assert received == final_data
+      assert byte_size(received) < requested_length
 
-      # Second recv gets EOF
-      assert Tricep.recv(socket, 0, 100) == {:ok, <<>>}
+      # A subsequent call distinguishes EOF from the short final read.
+      assert Tricep.recv(socket, requested_length, 100) == {:ok, <<>>}
     end
 
     test "close on non-established socket returns error" do
@@ -5229,8 +5413,8 @@ defmodule Tricep.SocketTest do
 
       assert response.flags == [:ack]
       assert response.seq == before_state.tcb.snd_nxt
-      assert response.ack == wrap_seq(before_state.tcb.rcv_nxt + byte_size(payload))
-      assert response.window == before_state.tcb.rcv_adv_wnd - byte_size(payload)
+      assert response.ack == before_state.tcb.rcv_nxt
+      assert response.window == before_state.tcb.rcv_adv_wnd
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
       assert {:fin_wait_1, after_state} = :sys.get_state(socket)
@@ -5241,7 +5425,7 @@ defmodule Tricep.SocketTest do
       assert after_state.persist_timeout_ms == before_state.persist_timeout_ms
     end
 
-    test "fabricated FIN_WAIT_1 persist state is canceled after delivery", %{
+    test "ACK-less in-order payload cannot drain queued data or notify receivers", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -5253,41 +5437,55 @@ defmodule Tricep.SocketTest do
       {:established, established_state} = :sys.get_state(socket)
       {{_, src_port}, _} = established_state.pair
 
-      recv_task = Task.async(fn -> Tricep.recv(socket, 0, 5_000) end)
-      wait_for_recv_waiters(socket)
-
       assert Tricep.shutdown(socket, :write) == :ok
       assert_receive {:dummy_link_packet, ^link, _our_fin}, 1000
 
-      :sys.replace_state(socket, fn
-        {:fin_wait_1, state} ->
-          pending = Tricep.DataBuffer.append(state.send_buffer, "pending")
-
-          # A reachable FIN_WAIT_1 has drained its send buffer before sending
-          # the FIN. Fabricate this defense-in-depth state to prove that the
-          # scheduled persist action is canceled instead of probing at FIN.
-          {:fin_wait_1,
-           %{
-             state
-             | send_buffer: pending,
-               unacked_segments: [],
-               rto_timer_active: false,
-               persist_timer_active: false,
-               persist_timeout_ms: 50
-           }}
-      end)
-
       assert {:fin_wait_1, before_state} = :sys.get_state(socket)
-      payload = "delivered"
+
+      queued_data =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(before_state.tcb.rcv_nxt + 5),
+          before_state.tcb.snd_una,
+          [:ack, :psh],
+          32_768,
+          payload: "world"
+        )
+
+      DummyLink.inject_packet(link, queued_data)
+      assert_receive {:dummy_link_packet, ^link, queued_ack_packet}, 1000
+      <<_::binary-size(40), queued_ack_segment::binary>> = queued_ack_packet
+      queued_ack = Tcp.parse_segment(queued_ack_segment)
+
+      assert queued_ack.flags == [:ack]
+      assert queued_ack.seq == before_state.tcb.snd_nxt
+      assert queued_ack.ack == before_state.tcb.rcv_nxt
+      assert queued_ack.window == before_state.tcb.rcv_adv_wnd - byte_size("world")
+      refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+
+      assert {:fin_wait_1, queued_state} = :sys.get_state(socket)
+
+      assert queued_state.out_of_order_segments == [
+               {wrap_seq(before_state.tcb.rcv_nxt + 5), wrap_seq(before_state.tcb.rcv_nxt + 10),
+                "world"}
+             ]
+
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, 5_000) end)
+      wait_for_recv_waiters(socket)
+      assert {:select, {:select_info, :recv, ref}} = Tricep.recv(socket, 0, :nowait)
+
+      assert {:fin_wait_1, waiting_state} = :sys.get_state(socket)
+      assert length(waiting_state.recv_waiters) == 1
+      assert length(waiting_state.recv_selects) == 1
 
       ackless_payload =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          before_state.tcb.rcv_nxt,
+          waiting_state.tcb.rcv_nxt,
           0,
           [:psh],
           0,
-          payload: payload
+          payload: "hello"
         )
 
       DummyLink.inject_packet(link, ackless_payload)
@@ -5297,24 +5495,23 @@ defmodule Tricep.SocketTest do
       response = Tcp.parse_segment(response_segment)
 
       assert response.flags == [:ack]
-      assert response.seq == before_state.tcb.snd_nxt
-      assert response.ack == wrap_seq(before_state.tcb.rcv_nxt + byte_size(payload))
-      assert response.window == before_state.tcb.rcv_adv_wnd
-
-      assert Task.await(recv_task, 1000) == {:ok, payload}
-      assert {:fin_wait_1, after_state} = :sys.get_state(socket)
-      assert after_state.tcb.rcv_nxt == wrap_seq(before_state.tcb.rcv_nxt + byte_size(payload))
-      assert after_state.recv_buffer == <<>>
-      assert after_state.recv_waiters == []
-      assert after_state.tcb.snd_wnd == 0
-      assert after_state.persist_timer_active
-
-      wait_for_socket(socket, fn
-        {:fin_wait_1, %{persist_timer_active: false, persist_timeout_ms: 1_000}} -> true
-        _ -> false
-      end)
-
+      assert response.seq == waiting_state.tcb.snd_nxt
+      assert response.ack == waiting_state.tcb.rcv_nxt
+      assert response.window == waiting_state.tcb.rcv_adv_wnd
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+      refute_receive {:"$socket", ^socket, :select, ^ref}, 100
+      assert Task.yield(recv_task, 50) == nil
+
+      assert {:fin_wait_1, after_state} = :sys.get_state(socket)
+      assert after_state.tcb.rcv_nxt == waiting_state.tcb.rcv_nxt
+      assert after_state.recv_buffer == <<>>
+      assert after_state.out_of_order_segments == waiting_state.out_of_order_segments
+      assert after_state.out_of_order_fin == waiting_state.out_of_order_fin
+      assert after_state.recv_waiters == waiting_state.recv_waiters
+      assert after_state.recv_selects == waiting_state.recv_selects
+      assert after_state.tcb.snd_wnd == waiting_state.tcb.snd_wnd
+
+      Task.shutdown(recv_task, :brutal_kill)
     end
 
     test "queued FIN and gap-fill ACK of our FIN transition directly to TIME_WAIT", %{
@@ -5340,8 +5537,9 @@ defmodule Tricep.SocketTest do
           {{local_addr, @port}, {remote_addr, src_port}},
           wrap_seq(state.tcb.rcv_nxt + 5),
           state.tcb.snd_una,
-          [:ack, :fin],
-          32_768
+          [:ack, :psh, :fin],
+          32_768,
+          payload: "world"
         )
 
       DummyLink.inject_packet(link, queued_fin)
@@ -5352,11 +5550,11 @@ defmodule Tricep.SocketTest do
       assert queued_fin_ack.flags == [:ack]
       assert queued_fin_ack.seq == state.tcb.snd_nxt
       assert queued_fin_ack.ack == state.tcb.rcv_nxt
-      assert queued_fin_ack.window == state.tcb.rcv_adv_wnd
+      assert queued_fin_ack.window == state.tcb.rcv_adv_wnd - 5
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
       assert {:fin_wait_1, queued_state} = :sys.get_state(socket)
-      assert queued_state.out_of_order_fin == wrap_seq(state.tcb.rcv_nxt + 5)
+      assert queued_state.out_of_order_fin == wrap_seq(state.tcb.rcv_nxt + 10)
       assert queued_state.unacked_segments != []
       assert queued_state.rto_timer_active
 
@@ -5377,8 +5575,8 @@ defmodule Tricep.SocketTest do
 
       assert final_ack.flags == [:ack]
       assert final_ack.seq == state.tcb.snd_nxt
-      assert final_ack.ack == wrap_seq(state.tcb.rcv_nxt + 6)
-      assert final_ack.window == state.tcb.rcv_adv_wnd - 5
+      assert final_ack.ack == wrap_seq(state.tcb.rcv_nxt + 11)
+      assert final_ack.window == state.tcb.rcv_adv_wnd - 10
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
 
       assert {:time_wait, time_wait_state} = :sys.get_state(socket)
@@ -5386,7 +5584,7 @@ defmodule Tricep.SocketTest do
       assert time_wait_state.unacked_segments == []
       refute time_wait_state.rto_timer_active
       assert time_wait_state.out_of_order_fin == nil
-      assert Tricep.recv(socket, 0, 1000) == {:ok, "hello"}
+      assert Tricep.recv(socket, 0, 1000) == {:ok, "helloworld"}
       assert Tricep.recv(socket, 0, 1000) == {:ok, <<>>}
     end
 
@@ -5690,6 +5888,151 @@ defmodule Tricep.SocketTest do
       {:fin_wait_2, _} = :sys.get_state(socket)
     end
 
+    test "ACK-less in-order data is acknowledged without waking receivers", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+
+      {_established_state, _src_port} =
+        shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr)
+
+      assert {:fin_wait_2, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      recv_task = Task.async(fn -> Tricep.recv(socket, 0, 5_000) end)
+      wait_for_recv_waiters(socket)
+      assert {:select, {:select_info, :recv, ref}} = Tricep.recv(socket, 0, :nowait)
+
+      assert {:fin_wait_2, before_state} = :sys.get_state(socket)
+      assert length(before_state.recv_waiters) == 1
+      assert length(before_state.recv_selects) == 1
+
+      ackless_data =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
+          [:psh],
+          0,
+          payload: "must not deliver"
+        )
+
+      DummyLink.inject_packet(link, ackless_data)
+      assert_receive {:dummy_link_packet, ^link, ack_packet}, 1000
+      <<_::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert ack.flags == [:ack]
+      assert ack.payload == <<>>
+      assert ack.seq == before_state.tcb.snd_nxt
+      assert ack.ack == before_state.tcb.rcv_nxt
+      assert ack.window == before_state.tcb.rcv_adv_wnd
+      refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+      refute_receive {:"$socket", ^socket, :select, ^ref}, 100
+      assert Task.yield(recv_task, 50) == nil
+
+      assert {:fin_wait_2, after_state} = :sys.get_state(socket)
+      assert after_state.tcb.rcv_nxt == before_state.tcb.rcv_nxt
+      assert after_state.recv_buffer == before_state.recv_buffer
+      assert after_state.out_of_order_segments == before_state.out_of_order_segments
+      assert after_state.out_of_order_fin == before_state.out_of_order_fin
+      assert after_state.recv_waiters == before_state.recv_waiters
+      assert after_state.recv_selects == before_state.recv_selects
+      assert after_state.tcb.snd_wnd == 0
+      assert after_state.tcb.snd_una == before_state.tcb.snd_una
+      assert after_state.tcb.snd_nxt == before_state.tcb.snd_nxt
+      refute after_state.persist_timer_active
+
+      Task.shutdown(recv_task, :brutal_kill)
+    end
+
+    test "ACK-less left-overlapping data is acknowledged without waking receivers", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr)
+
+      assert {:fin_wait_2, state} = :sys.get_state(socket)
+
+      assert_ackless_payloads_preserve_receive_state(
+        socket,
+        link,
+        local_addr,
+        remote_addr,
+        :fin_wait_2,
+        [
+          {wrap_seq(state.tcb.rcv_nxt - 1), [:psh], "ab"},
+          {wrap_seq(state.tcb.rcv_nxt - 2), [:psh, :fin], "abcd"}
+        ]
+      )
+    end
+
+    test "ACK-less left-overlapping data is rejected across sequence wrap", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, server_seq: 0xFFFFFFFD)
+      on_exit(fn -> stop_socket(socket) end)
+      shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr)
+
+      assert {:fin_wait_2, %{tcb: %{rcv_nxt: 0xFFFFFFFE}} = state} = :sys.get_state(socket)
+
+      assert_ackless_payloads_preserve_receive_state(
+        socket,
+        link,
+        local_addr,
+        remote_addr,
+        :fin_wait_2,
+        [
+          {wrap_seq(state.tcb.rcv_nxt - 1), [:psh], "ab"},
+          {wrap_seq(state.tcb.rcv_nxt - 2), [:psh, :fin], "abcd"}
+        ]
+      )
+    end
+
+    test "does not latch an ACK-less out-of-order bare or payload FIN", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr)
+
+      assert_ackless_out_of_order_fin_does_not_close(
+        socket,
+        link,
+        local_addr,
+        remote_addr,
+        :fin_wait_2
+      )
+    end
+
+    test "ACK-less future payload invalidates an advisory FIN across sequence wrap", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, server_seq: 0xFFFFFFFD)
+      on_exit(fn -> stop_socket(socket) end)
+      shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr)
+
+      assert_ackless_future_payload_invalidates_advisory_fin(
+        socket,
+        link,
+        local_addr,
+        remote_addr,
+        :fin_wait_2
+      )
+    end
+
     test "queues sequence-acceptable data in FIN_WAIT_2 until its gap arrives", %{
       link: link,
       local_addr: local_addr,
@@ -5813,7 +6156,7 @@ defmodule Tricep.SocketTest do
       assert {:time_wait, time_wait_state} = :sys.get_state(socket)
       assert time_wait_state.out_of_order_segments == []
       assert time_wait_state.out_of_order_fin == nil
-      assert Tricep.recv(socket, 0, 1000) == {:ok, "helloworld"}
+      assert Tricep.recv(socket, 20, 1000) == {:ok, "helloworld"}
       assert Tricep.recv(socket, 0, 1000) == {:ok, <<>>}
     end
   end
@@ -8689,6 +9032,298 @@ defmodule Tricep.SocketTest do
 
     {:fin_wait_2, _state} = :sys.get_state(socket)
     {state, src_port}
+  end
+
+  defp assert_ackless_payloads_preserve_receive_state(
+         socket,
+         link,
+         local_addr,
+         remote_addr,
+         state_name,
+         payloads
+       ) do
+    assert {^state_name, state} = :sys.get_state(socket)
+    {{_, src_port}, _} = state.pair
+
+    recv_task = Task.async(fn -> Tricep.recv(socket, 0, 5_000) end)
+    wait_for_recv_waiters(socket)
+    assert {:select, {:select_info, :recv, ref}} = Tricep.recv(socket, 0, :nowait)
+
+    assert {^state_name, before_state} = :sys.get_state(socket)
+    assert length(before_state.recv_waiters) == 1
+    assert length(before_state.recv_selects) == 1
+
+    Enum.each(payloads, fn {sequence, flags, payload} ->
+      segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          sequence,
+          before_state.tcb.snd_nxt,
+          flags,
+          0,
+          payload: payload
+        )
+
+      DummyLink.inject_packet(link, segment)
+      assert_receive {:dummy_link_packet, ^link, ack_packet}, 1000
+      <<_::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert ack.flags == [:ack]
+      assert ack.payload == <<>>
+      assert ack.seq == before_state.tcb.snd_nxt
+      assert ack.ack == before_state.tcb.rcv_nxt
+      assert ack.window == before_state.tcb.rcv_adv_wnd
+    end)
+
+    refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+    refute_receive {:"$socket", ^socket, :select, ^ref}, 100
+    assert Task.yield(recv_task, 50) == nil
+
+    assert {^state_name, after_state} = :sys.get_state(socket)
+    assert after_state.tcb.rcv_nxt == before_state.tcb.rcv_nxt
+    assert after_state.recv_buffer == before_state.recv_buffer
+    assert after_state.out_of_order_segments == before_state.out_of_order_segments
+    assert after_state.out_of_order_fin == before_state.out_of_order_fin
+    assert after_state.fin_received == before_state.fin_received
+    assert after_state.recv_waiters == before_state.recv_waiters
+    assert after_state.recv_selects == before_state.recv_selects
+    assert after_state.tcb.snd_wnd == 0
+    assert after_state.tcb.snd_una == before_state.tcb.snd_una
+    assert after_state.tcb.snd_nxt == before_state.tcb.snd_nxt
+    refute after_state.persist_timer_active
+
+    Task.shutdown(recv_task, :brutal_kill)
+  end
+
+  defp assert_ackless_out_of_order_fin_does_not_close(
+         socket,
+         link,
+         local_addr,
+         remote_addr,
+         state_name
+       ) do
+    assert {^state_name, state} = :sys.get_state(socket)
+    {{_, src_port}, _} = state.pair
+
+    out_of_order_fin =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        wrap_seq(state.tcb.rcv_nxt + 10),
+        state.tcb.snd_nxt,
+        [:fin],
+        0
+      )
+
+    DummyLink.inject_packet(link, out_of_order_fin)
+    assert_receive {:dummy_link_packet, ^link, fin_ack_packet}, 1000
+    <<_::binary-size(40), fin_ack_segment::binary>> = fin_ack_packet
+    fin_ack = Tcp.parse_segment(fin_ack_segment)
+
+    assert fin_ack.flags == [:ack]
+    assert fin_ack.payload == <<>>
+    assert fin_ack.seq == state.tcb.snd_nxt
+    assert fin_ack.ack == state.tcb.rcv_nxt
+    assert fin_ack.window == state.tcb.rcv_adv_wnd
+    refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+
+    assert {^state_name, fin_state} = :sys.get_state(socket)
+    assert fin_state.tcb.rcv_nxt == state.tcb.rcv_nxt
+    assert fin_state.recv_buffer == <<>>
+    assert fin_state.out_of_order_segments == []
+    assert fin_state.out_of_order_fin == nil
+    refute fin_state.fin_received
+    assert fin_state.tcb.snd_wnd == 0
+
+    out_of_order_payload_fin =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        wrap_seq(state.tcb.rcv_nxt + 5),
+        state.tcb.snd_nxt,
+        [:psh, :fin],
+        0,
+        payload: "world"
+      )
+
+    DummyLink.inject_packet(link, out_of_order_payload_fin)
+    assert_receive {:dummy_link_packet, ^link, payload_ack_packet}, 1000
+    <<_::binary-size(40), payload_ack_segment::binary>> = payload_ack_packet
+    payload_ack = Tcp.parse_segment(payload_ack_segment)
+
+    assert payload_ack.flags == [:ack]
+    assert payload_ack.payload == <<>>
+    assert payload_ack.seq == state.tcb.snd_nxt
+    assert payload_ack.ack == state.tcb.rcv_nxt
+    refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+
+    assert {^state_name, queued_state} = :sys.get_state(socket)
+
+    assert queued_state.out_of_order_segments == [
+             {wrap_seq(state.tcb.rcv_nxt + 5), wrap_seq(state.tcb.rcv_nxt + 10), "world"}
+           ]
+
+    assert queued_state.out_of_order_fin == nil
+    refute queued_state.fin_received
+
+    gap_fill =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        state.tcb.rcv_nxt,
+        state.tcb.snd_nxt,
+        [:ack, :psh],
+        32_768,
+        payload: "hello"
+      )
+
+    DummyLink.inject_packet(link, gap_fill)
+    assert_receive {:dummy_link_packet, ^link, data_ack_packet}, 1000
+    <<_::binary-size(40), data_ack_segment::binary>> = data_ack_packet
+    data_ack = Tcp.parse_segment(data_ack_segment)
+
+    assert data_ack.flags == [:ack]
+    assert data_ack.seq == state.tcb.snd_nxt
+    assert data_ack.ack == wrap_seq(state.tcb.rcv_nxt + 10)
+    refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+
+    assert {^state_name, after_state} = :sys.get_state(socket)
+    assert after_state.recv_buffer == "helloworld"
+    assert after_state.out_of_order_fin == nil
+    refute after_state.fin_received
+  end
+
+  defp assert_ackless_future_payload_invalidates_advisory_fin(
+         socket,
+         link,
+         local_addr,
+         remote_addr,
+         state_name
+       ) do
+    assert {^state_name, state} = :sys.get_state(socket)
+    {{_, src_port}, _} = state.pair
+
+    recv_task = Task.async(fn -> Tricep.recv(socket, 0, 5_000) end)
+    wait_for_recv_waiters(socket)
+    assert {:select, {:select_info, :recv, ref}} = Tricep.recv(socket, 0, :nowait)
+
+    queued_fin =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        wrap_seq(state.tcb.rcv_nxt + 5),
+        state.tcb.snd_nxt,
+        [:ack, :psh, :fin],
+        32_768,
+        payload: "world"
+      )
+
+    DummyLink.inject_packet(link, queued_fin)
+    assert_receive {:dummy_link_packet, ^link, queued_fin_ack_packet}, 1000
+    <<_::binary-size(40), queued_fin_ack_segment::binary>> = queued_fin_ack_packet
+    queued_fin_ack = Tcp.parse_segment(queued_fin_ack_segment)
+
+    assert queued_fin_ack.flags == [:ack]
+    assert queued_fin_ack.payload == <<>>
+    assert queued_fin_ack.seq == state.tcb.snd_nxt
+    assert queued_fin_ack.ack == state.tcb.rcv_nxt
+    assert queued_fin_ack.window == state.tcb.rcv_adv_wnd - 5
+    refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+
+    assert {^state_name, pending_state} = :sys.get_state(socket)
+
+    assert pending_state.out_of_order_segments == [
+             {wrap_seq(state.tcb.rcv_nxt + 5), wrap_seq(state.tcb.rcv_nxt + 10), "world"}
+           ]
+
+    assert pending_state.out_of_order_fin == wrap_seq(state.tcb.rcv_nxt + 10)
+
+    ackless_payload =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        wrap_seq(state.tcb.rcv_nxt + 10),
+        state.tcb.snd_nxt,
+        [:psh],
+        0,
+        payload: "WXYZ"
+      )
+
+    DummyLink.inject_packet(link, ackless_payload)
+    assert_receive {:dummy_link_packet, ^link, ackless_ack_packet}, 1000
+    <<_::binary-size(40), ackless_ack_segment::binary>> = ackless_ack_packet
+    ackless_ack = Tcp.parse_segment(ackless_ack_segment)
+
+    assert ackless_ack.flags == [:ack]
+    assert ackless_ack.payload == <<>>
+    assert ackless_ack.seq == state.tcb.snd_nxt
+    assert ackless_ack.ack == state.tcb.rcv_nxt
+    assert ackless_ack.window == state.tcb.rcv_adv_wnd - 9
+    refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+    refute_receive {:"$socket", ^socket, :select, ^ref}, 100
+    assert Task.yield(recv_task, 50) == nil
+
+    assert {^state_name, attacked_state} = :sys.get_state(socket)
+    assert attacked_state.tcb.rcv_nxt == state.tcb.rcv_nxt
+    assert attacked_state.recv_buffer == <<>>
+
+    assert attacked_state.out_of_order_segments == [
+             {wrap_seq(state.tcb.rcv_nxt + 5), wrap_seq(state.tcb.rcv_nxt + 14), "worldWXYZ"}
+           ]
+
+    assert attacked_state.out_of_order_fin == nil
+    assert attacked_state.tcb.snd_wnd == 0
+
+    gap_fill =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        state.tcb.rcv_nxt,
+        state.tcb.snd_nxt,
+        [:ack, :psh],
+        32_768,
+        payload: "hello"
+      )
+
+    DummyLink.inject_packet(link, gap_fill)
+    assert_receive {:dummy_link_packet, ^link, fin_ack_packet}, 1000
+    <<_::binary-size(40), fin_ack_segment::binary>> = fin_ack_packet
+    fin_ack = Tcp.parse_segment(fin_ack_segment)
+
+    assert fin_ack.flags == [:ack]
+    assert fin_ack.payload == <<>>
+    assert fin_ack.seq == state.tcb.snd_nxt
+    assert fin_ack.ack == wrap_seq(state.tcb.rcv_nxt + 14)
+    assert fin_ack.window == state.tcb.rcv_adv_wnd
+    refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+    assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+    assert Task.await(recv_task, 1000) == {:ok, "helloworldWXYZ"}
+
+    assert {^state_name, streamed_state} = :sys.get_state(socket)
+    assert streamed_state.out_of_order_segments == []
+    assert streamed_state.out_of_order_fin == nil
+    refute streamed_state.fin_received
+
+    genuine_fin =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        streamed_state.tcb.rcv_nxt,
+        state.tcb.snd_nxt,
+        [:ack, :fin],
+        32_768
+      )
+
+    DummyLink.inject_packet(link, genuine_fin)
+    assert_receive {:dummy_link_packet, ^link, genuine_fin_ack_packet}, 1000
+    <<_::binary-size(40), genuine_fin_ack_segment::binary>> = genuine_fin_ack_packet
+    genuine_fin_ack = Tcp.parse_segment(genuine_fin_ack_segment)
+
+    assert genuine_fin_ack.flags == [:ack]
+    assert genuine_fin_ack.payload == <<>>
+    assert genuine_fin_ack.seq == state.tcb.snd_nxt
+    assert genuine_fin_ack.ack == wrap_seq(state.tcb.rcv_nxt + 15)
+    assert genuine_fin_ack.window == state.tcb.rcv_adv_wnd
+    refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
+
+    expected_state = if state_name == :established, do: :close_wait, else: :time_wait
+    assert {^expected_state, final_state} = :sys.get_state(socket)
+    assert final_state.fin_received
+    assert Tricep.recv(socket, 0, 1000) == {:ok, <<>>}
   end
 
   defp wait_for_recv_waiters(socket, count \\ 1) do

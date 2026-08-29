@@ -328,7 +328,11 @@ defmodule Tricep do
     * `socket` - The socket pid returned by `open/3`
     * `length` - Number of bytes to receive (default: `0`)
       * `0` - Return all available data
-      * `n` - Return exactly `n` bytes (blocks until available)
+      * `n` - Normally return exactly `n` bytes (blocks until available).
+        If the peer sends FIN with fewer bytes remaining, returns those bytes
+        as a short final read; the next `recv/3` returns `{:ok, <<>>}`. Callers
+        can distinguish the final short read by checking
+        `byte_size(data) < n`.
     * `timeout` - How long to wait for data (default: `:infinity`)
 
   ## Returns
