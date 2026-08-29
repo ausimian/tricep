@@ -41,33 +41,42 @@ defmodule Tricep.Tcp.ReceiveReassemblyTest do
     assert result.out_of_order_segments == []
   end
 
-  test "queues a FIN carried by out-of-order payload until its gap arrives" do
+  test "commits an out-of-order payload-carried FIN once its gap arrives" do
     queued = receive([], nil, 100, 32, 105, "world", [:ack, :fin])
 
     assert queued.out_of_order_segments == [{105, 110, "world"}]
+    assert queued.pending_fin == {110, 105}
     assert queued.fin_sequence == 110
     refute queued.fin?
 
-    result = receive(queued.out_of_order_segments, queued.fin_sequence, 100, 32, 100, "hello")
+    result = receive(queued.out_of_order_segments, queued.pending_fin, 100, 32, 100, "hello")
 
     assert result.delivered == "helloworld"
     assert result.rcv_nxt == 111
     assert result.fin?
     assert result.fin_sequence == nil
+    assert result.pending_fin == nil
     assert result.out_of_order_segments == []
   end
 
-  test "queues a bare out-of-order FIN and consumes it after queued data drains" do
-    queued = receive([], nil, 100, 32, 105, <<>>, [:ack, :fin])
+  test "drops a bare out-of-order FIN until it is retransmitted in order" do
+    bare_fin = receive([], nil, 100, 32, 105, <<>>, [:ack, :fin])
 
-    assert queued.out_of_order_segments == []
-    assert queued.fin_sequence == 105
+    assert bare_fin.out_of_order_segments == []
+    assert bare_fin.pending_fin == nil
+    assert bare_fin.fin_sequence == nil
 
-    result = receive([], queued.fin_sequence, 100, 32, 100, "hello")
+    data = receive([], bare_fin.pending_fin, 100, 32, 100, "hello")
 
-    assert result.delivered == "hello"
-    assert result.rcv_nxt == 106
-    assert result.fin?
+    assert data.delivered == "hello"
+    assert data.rcv_nxt == 105
+    refute data.fin?
+    assert data.pending_fin == nil
+
+    retransmitted = receive([], nil, data.rcv_nxt, 32, data.rcv_nxt, <<>>, [:ack, :fin])
+
+    assert retransmitted.fin?
+    assert retransmitted.rcv_nxt == 106
   end
 
   test "trims duplicated payload before an overlapping FIN marker" do
@@ -79,13 +88,13 @@ defmodule Tricep.Tcp.ReceiveReassemblyTest do
     assert result.fin_sequence == nil
   end
 
-  test "does not duplicate queued data or a queued FIN on retransmission" do
+  test "does not duplicate queued data or a queued payload-carried FIN on retransmission" do
     first = receive([], nil, 100, 32, 105, "world", [:ack, :fin])
 
     duplicate =
       receive(
         first.out_of_order_segments,
-        first.fin_sequence,
+        first.pending_fin,
         100,
         32,
         105,
@@ -94,216 +103,137 @@ defmodule Tricep.Tcp.ReceiveReassemblyTest do
       )
 
     assert duplicate.out_of_order_segments == [{105, 110, "world"}]
-    assert duplicate.fin_sequence == 110
+    assert duplicate.pending_fin == {110, 105}
 
     result =
-      receive(
-        duplicate.out_of_order_segments,
-        duplicate.fin_sequence,
-        100,
-        32,
-        100,
-        "hello"
-      )
+      receive(duplicate.out_of_order_segments, duplicate.pending_fin, 100, 32, 100, "hello")
 
     assert result.delivered == "helloworld"
     assert result.rcv_nxt == 111
     assert result.fin?
   end
 
-  test "revokes a queued FIN when later data occupies its marker" do
-    pending_fin = receive([], nil, 100, 32, 105, <<>>, [:ack, :fin])
+  test "payload extending past a FIN marker invalidates its hint in either arrival order" do
+    hinted = receive([], nil, 100, 32, 105, "world", [:ack, :fin])
 
-    assert pending_fin.fin_sequence == 105
+    after_hint =
+      receive(hinted.out_of_order_segments, hinted.pending_fin, 100, 32, 110, "suffix")
 
-    result =
+    assert after_hint.pending_fin == nil
+
+    first_data = receive([], nil, 100, 32, 110, "suffix")
+
+    after_data =
       receive(
-        pending_fin.out_of_order_segments,
-        pending_fin.fin_sequence,
+        first_data.out_of_order_segments,
+        first_data.pending_fin,
         100,
         32,
-        100,
-        "helloworld"
+        105,
+        "world",
+        [:ack, :fin]
       )
 
-    assert result.delivered == "helloworld"
-    assert result.rcv_nxt == 110
-    assert result.fin_sequence == nil
-    refute result.fin?
-    assert result.out_of_order_segments == []
+    assert after_data.pending_fin == nil
   end
 
-  test "rejects a FIN whose sequence number is already occupied by queued data" do
+  test "rejects a first payload-carried FIN marker before or inside queued data" do
     queued = receive([], nil, 100, 32, 105, "world")
 
-    conflicting_fin =
-      receive(queued.out_of_order_segments, nil, 100, 32, 107, <<>>, [:ack, :fin])
+    for marker <- [103, 105, 107] do
+      rejected =
+        receive(
+          queued.out_of_order_segments,
+          nil,
+          100,
+          32,
+          marker - 1,
+          "x",
+          [:ack, :fin]
+        )
 
-    assert conflicting_fin.fin_sequence == nil
-    assert conflicting_fin.out_of_order_segments == [{105, 110, "world"}]
+      assert rejected.pending_fin == nil
+    end
 
-    result = receive(conflicting_fin.out_of_order_segments, nil, 100, 32, 100, "hello")
+    accepted =
+      receive(queued.out_of_order_segments, nil, 100, 32, 109, "d", [:ack, :fin])
 
-    assert result.delivered == "helloworld"
-    assert result.rcv_nxt == 110
-    refute result.fin?
+    assert accepted.pending_fin == {110, 109}
   end
 
-  test "retains post-FIN queued data until the FIN commits and purges it" do
-    queued = receive([], nil, 100, 32, 105, "world")
-
-    pending_fin =
-      receive(queued.out_of_order_segments, nil, 100, 32, 103, <<>>, [:ack, :fin])
-
-    assert pending_fin.fin_sequence == 103
-    assert pending_fin.out_of_order_segments == [{105, 110, "world"}]
-
-    result =
-      receive(
-        pending_fin.out_of_order_segments,
-        pending_fin.fin_sequence,
-        100,
-        32,
-        100,
-        "abc"
-      )
-
-    assert result.delivered == "abc"
-    assert result.rcv_nxt == 104
-    assert result.fin?
-    assert result.out_of_order_segments == []
-  end
-
-  test "an accepted FIN at a queued range end drains the preceding data first" do
-    queued = receive([], nil, 100, 32, 105, "world")
-
-    pending_fin =
-      receive(queued.out_of_order_segments, nil, 100, 32, 110, <<>>, [:ack, :fin])
-
-    assert pending_fin.fin_sequence == 110
-    assert pending_fin.out_of_order_segments == [{105, 110, "world"}]
-
-    result =
-      receive(
-        pending_fin.out_of_order_segments,
-        pending_fin.fin_sequence,
-        100,
-        32,
-        100,
-        "hello"
-      )
-
-    assert result.delivered == "helloworld"
-    assert result.rcv_nxt == 111
-    assert result.fin?
-  end
-
-  test "enforces queued FIN boundaries across sequence wrap" do
+  test "uses the same queued-end boundary across sequence wrap" do
     queued = receive([], nil, 0xFFFFFFFC, 16, 0xFFFFFFFE, "wxyz")
 
-    pending_fin =
-      receive(
-        queued.out_of_order_segments,
-        nil,
-        0xFFFFFFFC,
-        16,
-        2,
-        <<>>,
-        [:ack, :fin]
-      )
+    assert wrap(-1) == 0xFFFFFFFF
+
+    for marker <- [0xFFFFFFFD, 0xFFFFFFFE, 0] do
+      rejected =
+        receive(
+          queued.out_of_order_segments,
+          nil,
+          0xFFFFFFFC,
+          16,
+          wrap(marker - 1),
+          "x",
+          [:ack, :fin]
+        )
+
+      assert rejected.pending_fin == nil
+    end
+
+    accepted =
+      receive(queued.out_of_order_segments, nil, 0xFFFFFFFC, 16, 1, "z", [:ack, :fin])
+
+    assert accepted.pending_fin == {2, 1}
+  end
+
+  test "a current payload-carried FIN supersedes a stale hint and closes immediately" do
+    stale = receive([], nil, 100, 32, 104, "o", [:ack, :fin])
 
     result =
       receive(
-        pending_fin.out_of_order_segments,
-        pending_fin.fin_sequence,
-        0xFFFFFFFC,
-        16,
-        0xFFFFFFFC,
-        "ab"
-      )
-
-    assert result.delivered == "abwxyz"
-    assert result.rcv_nxt == 3
-    assert result.fin?
-  end
-
-  test "keeps the first accepted FIN when a duplicate or conflicting FIN arrives" do
-    first = receive([], nil, 100, 32, 105, <<>>, [:ack, :fin])
-
-    duplicate = receive([], first.fin_sequence, 100, 32, 105, <<>>, [:ack, :fin])
-    conflict = receive([], duplicate.fin_sequence, 100, 32, 106, <<>>, [:ack, :fin])
-
-    assert duplicate.fin_sequence == 105
-    assert conflict.fin_sequence == 105
-    assert conflict.out_of_order_segments == []
-  end
-
-  test "an in-order FIN supersedes a stale speculative FIN marker" do
-    stale = receive([], nil, 100, 32, 110, <<>>, [:ack, :fin])
-    duplicate = receive([], stale.fin_sequence, 100, 32, 110, <<>>, [:ack, :fin])
-
-    assert duplicate.fin_sequence == 110
-
-    drained = receive([], duplicate.fin_sequence, 100, 32, 100, "hello")
-
-    assert drained.rcv_nxt == 105
-    assert drained.fin_sequence == 110
-
-    real_fin =
-      receive(
-        drained.out_of_order_segments,
-        drained.fin_sequence,
-        drained.rcv_nxt,
+        stale.out_of_order_segments,
+        stale.pending_fin,
+        100,
         32,
-        drained.rcv_nxt,
-        <<>>,
+        100,
+        "helloworld",
         [:ack, :fin]
       )
 
-    assert real_fin.delivered == <<>>
-    assert real_fin.rcv_nxt == 106
-    assert real_fin.fin?
-    assert real_fin.fin_sequence == nil
+    assert result.delivered == "helloworld"
+    assert result.rcv_nxt == 111
+    assert result.fin?
+    assert result.pending_fin == nil
   end
 
-  test "an in-order FIN supersedes a speculative marker across sequence wrap" do
-    stale = receive([], nil, 0xFFFFFFFC, 16, 2, <<>>, [:ack, :fin])
-    duplicate = receive([], stale.fin_sequence, 0xFFFFFFFC, 16, 2, <<>>, [:ack, :fin])
+  test "a current payload-carried FIN supersedes a stale hint across sequence wrap" do
+    stale = receive([], nil, 0xFFFFFFFC, 16, 0xFFFFFFFD, "b", [:ack, :fin])
 
-    drained = receive([], duplicate.fin_sequence, 0xFFFFFFFC, 16, 0xFFFFFFFC, "ab")
-
-    assert drained.rcv_nxt == 0xFFFFFFFE
-    assert drained.fin_sequence == 2
-
-    real_fin =
+    result =
       receive(
-        drained.out_of_order_segments,
-        drained.fin_sequence,
-        drained.rcv_nxt,
+        stale.out_of_order_segments,
+        stale.pending_fin,
+        0xFFFFFFFC,
         16,
-        drained.rcv_nxt,
-        <<>>,
+        0xFFFFFFFC,
+        "abcd",
         [:ack, :fin]
       )
 
-    assert real_fin.rcv_nxt == 0xFFFFFFFF
-    assert real_fin.fin?
-    assert real_fin.fin_sequence == nil
+    assert result.delivered == "abcd"
+    assert result.rcv_nxt == 1
+    assert result.fin?
+    assert result.pending_fin == nil
   end
 
-  test "defers a FIN at the right receive-window edge until it is retransmitted" do
+  test "accepts a FIN at the right receive-window edge with its payload" do
     data_and_fin = receive([], nil, 100, 5, 100, "hello", [:ack, :fin])
 
     assert data_and_fin.delivered == "hello"
-    assert data_and_fin.rcv_nxt == 105
-    refute data_and_fin.fin?
+    assert data_and_fin.rcv_nxt == 106
+    assert data_and_fin.fin?
     assert data_and_fin.fin_sequence == nil
-
-    fin = receive([], nil, data_and_fin.rcv_nxt, 0, 105, <<>>, [:ack, :fin])
-
-    assert fin.delivered == <<>>
-    assert fin.rcv_nxt == 106
-    assert fin.fin?
   end
 
   test "accepts a bare FIN at RCV.NXT when the receive window is zero" do
@@ -321,4 +251,6 @@ defmodule Tricep.Tcp.ReceiveReassemblyTest do
       seq: sequence
     })
   end
+
+  defp wrap(sequence), do: Integer.mod(sequence, 0x1_0000_0000)
 end

@@ -10,23 +10,28 @@ defmodule Tricep.Tcp.ReceiveReassembly do
 
   @type sequence :: Sequence.sequence_number()
   @type queued_segment :: {sequence(), sequence(), binary()}
+  # An out-of-order FIN is only a hint while the payload that carried it stays
+  # queued. The payload start is provenance: data which merely happens to end
+  # at the FIN marker must not manufacture EOF.
+  @type pending_fin :: {sequence(), sequence()} | nil
 
   @type result :: %{
           delivered: binary(),
           fin?: boolean(),
           fin_sequence: sequence() | nil,
+          pending_fin: pending_fin(),
           out_of_order_segments: [queued_segment()],
           rcv_nxt: sequence()
         }
 
-  @spec receive([queued_segment()], sequence() | nil, sequence(), non_neg_integer(), map()) ::
+  @spec receive([queued_segment()], pending_fin(), sequence(), non_neg_integer(), map()) ::
           result()
   def receive(segments, pending_fin, rcv_nxt, receive_window, %{
         flags: flags,
         payload: payload,
         seq: sequence
       }) do
-    segments =
+    {segments, accepted_payload} =
       segments
       |> normalize(rcv_nxt)
       |> insert_payload(rcv_nxt, receive_window, sequence, payload)
@@ -34,7 +39,16 @@ defmodule Tricep.Tcp.ReceiveReassembly do
     pending_fin = revoke_conflicting_fin(segments, pending_fin, rcv_nxt)
 
     {segments, pending_fin} =
-      insert_fin(segments, pending_fin, rcv_nxt, receive_window, sequence, payload, flags)
+      insert_fin(
+        segments,
+        pending_fin,
+        rcv_nxt,
+        receive_window,
+        sequence,
+        payload,
+        flags,
+        accepted_payload
+      )
 
     drain(segments, pending_fin, rcv_nxt)
   end
@@ -71,28 +85,34 @@ defmodule Tricep.Tcp.ReceiveReassembly do
   end
 
   defp insert_payload(segments, _rcv_nxt, _receive_window, _sequence, <<>>),
-    do: segments
+    do: {segments, nil}
 
   defp insert_payload(segments, rcv_nxt, receive_window, sequence, payload) do
     case clip_payload(rcv_nxt, receive_window, sequence, payload) do
       nil ->
-        segments
+        {segments, nil}
 
       {offset, clipped_payload} ->
         fragments = subtract_queued([{offset, clipped_payload}], segments, rcv_nxt)
 
-        (segments ++
-           Enum.map(fragments, fn {fragment_offset, fragment_payload} ->
-             fragment_sequence = Sequence.wrap(rcv_nxt + fragment_offset)
+        reassembled =
+          (segments ++
+             Enum.map(fragments, fn {fragment_offset, fragment_payload} ->
+               fragment_sequence = Sequence.wrap(rcv_nxt + fragment_offset)
 
-             {
-               fragment_sequence,
-               Sequence.wrap(fragment_sequence + byte_size(fragment_payload)),
-               fragment_payload
-             }
-           end))
-        |> sort(rcv_nxt)
-        |> merge()
+               {
+                 fragment_sequence,
+                 Sequence.wrap(fragment_sequence + byte_size(fragment_payload)),
+                 fragment_payload
+               }
+             end))
+          |> sort(rcv_nxt)
+          |> merge()
+
+        clipped_sequence = Sequence.wrap(rcv_nxt + offset)
+
+        {reassembled,
+         {clipped_sequence, Sequence.wrap(clipped_sequence + byte_size(clipped_payload))}}
     end
   end
 
@@ -148,11 +168,19 @@ defmodule Tricep.Tcp.ReceiveReassembly do
     end
   end
 
-  # RFC 9293 §3.10.7.4 reconstructs overlaps so only new sequence space is
-  # processed. A queued FIN is therefore provisional until RCV.NXT reaches
-  # its marker: later accepted data at that marker revokes the FIN. Data after
-  # an uncontradicted marker remains queued until commit, when it is purged.
-  defp insert_fin(segments, pending_fin, rcv_nxt, receive_window, sequence, payload, flags) do
+  # A bare out-of-order FIN is advisory but uncorroborated, so it is discarded
+  # until retransmitted in order. An out-of-order FIN carried by accepted data
+  # is retained only while no accepted payload extends beyond its marker.
+  defp insert_fin(
+         segments,
+         pending_fin,
+         rcv_nxt,
+         receive_window,
+         sequence,
+         payload,
+         flags,
+         accepted_payload
+       ) do
     if :fin in flags do
       fin_sequence = Sequence.wrap(sequence + byte_size(payload))
       fin_offset = signed_offset(fin_sequence, rcv_nxt)
@@ -161,54 +189,62 @@ defmodule Tricep.Tcp.ReceiveReassembly do
         not accepted_fin?(fin_offset, receive_window) ->
           {segments, pending_fin}
 
-        occupied?(segments, fin_offset, rcv_nxt) ->
+        fin_offset == 0 ->
+          # A current FIN supersedes every stale out-of-order hint.
+          {segments, {fin_sequence, fin_sequence}}
+
+        accepted_payload == nil ->
+          # A peer must retransmit a bare FIN when it reaches RCV.NXT.
           {segments, pending_fin}
 
-        fin_offset == 0 ->
-          # An in-order FIN is ready to commit now and supersedes any
-          # speculative out-of-order marker, regardless of marker order.
-          {segments, fin_sequence}
+        payload_end(accepted_payload) != fin_sequence ->
+          {segments, pending_fin}
 
-        pending_fin != nil ->
+        payload_extends_past_fin?(segments, fin_offset, rcv_nxt) ->
           {segments, pending_fin}
 
         true ->
-          {segments, fin_sequence}
+          # A valid current FIN replaces a stale hint when the queued data is
+          # consistent with its boundary.
+          {segments, {fin_sequence, payload_start(accepted_payload)}}
       end
     else
       {segments, pending_fin}
     end
   end
 
-  defp occupied?(segments, offset, rcv_nxt) do
+  defp payload_extends_past_fin?(segments, offset, rcv_nxt) do
     Enum.any?(segments, fn {sequence, _sequence_end, payload} ->
       start_offset = signed_offset(sequence, rcv_nxt)
-      start_offset <= offset and offset < start_offset + byte_size(payload)
+      offset < start_offset + byte_size(payload)
     end)
   end
 
   defp revoke_conflicting_fin(_segments, nil, _rcv_nxt), do: nil
 
-  defp revoke_conflicting_fin(segments, pending_fin, rcv_nxt) do
-    if occupied?(segments, signed_offset(pending_fin, rcv_nxt), rcv_nxt),
-      do: nil,
-      else: pending_fin
+  defp revoke_conflicting_fin(segments, {fin_sequence, _payload_start} = pending_fin, rcv_nxt) do
+    fin_offset = signed_offset(fin_sequence, rcv_nxt)
+
+    case payload_extends_past_fin?(segments, fin_offset, rcv_nxt) do
+      true -> nil
+      false -> pending_fin
+    end
   end
 
-  # RFC 9293 §3.10.7.4 trims portions outside the receive window, including
-  # SYN and FIN controls. Thus offset == receive_window is outside; only a
-  # bare FIN at RCV.NXT is accepted when the advertised window is zero.
-  defp accepted_fin?(0, 0), do: true
-  defp accepted_fin?(offset, receive_window), do: offset >= 0 and offset < receive_window
+  # A segment admitted at the left edge may carry a FIN exactly at the right
+  # receive-window edge. The payload fills the window and the FIN then commits
+  # immediately, avoiding a zero-window EOF deadlock.
+  defp accepted_fin?(offset, receive_window), do: offset >= 0 and offset <= receive_window
 
   defp drain(segments, pending_fin, rcv_nxt) do
-    {delivered, segments, rcv_nxt} = drain_payload(segments, rcv_nxt, [])
+    {delivered, segments, rcv_nxt, drained} = drain_payload(segments, rcv_nxt, [], [])
 
-    if pending_fin == rcv_nxt do
+    if fin_committable?(pending_fin, rcv_nxt, drained) do
       %{
         delivered: IO.iodata_to_binary(Enum.reverse(delivered)),
         fin?: true,
         fin_sequence: nil,
+        pending_fin: nil,
         out_of_order_segments: [],
         rcv_nxt: Sequence.wrap(rcv_nxt + 1)
       }
@@ -216,18 +252,37 @@ defmodule Tricep.Tcp.ReceiveReassembly do
       %{
         delivered: IO.iodata_to_binary(Enum.reverse(delivered)),
         fin?: false,
-        fin_sequence: pending_fin,
+        fin_sequence: fin_sequence(pending_fin),
+        pending_fin: pending_fin,
         out_of_order_segments: segments,
         rcv_nxt: rcv_nxt
       }
     end
   end
 
-  defp drain_payload([{sequence, sequence_end, payload} | rest], sequence, delivered) do
-    drain_payload(rest, sequence_end, [payload | delivered])
+  # Admission/revocation plus the merge invariant enforce the FIN boundary.
+  # This is defense in depth: commit only if the original FIN-carrying range
+  # itself drained contiguously, not merely because unrelated data ends there.
+  defp fin_committable?({fin_sequence, payload_start}, fin_sequence, drained) do
+    payload_start == fin_sequence or
+      Enum.any?(drained, fn {start, ending} ->
+        Sequence.lte?(start, payload_start) and Sequence.gte?(ending, fin_sequence)
+      end)
   end
 
-  defp drain_payload(segments, rcv_nxt, delivered), do: {delivered, segments, rcv_nxt}
+  defp fin_committable?(_, _rcv_nxt, _drained), do: false
+
+  defp drain_payload([{sequence, sequence_end, payload} | rest], sequence, delivered, drained) do
+    drain_payload(rest, sequence_end, [payload | delivered], [{sequence, sequence_end} | drained])
+  end
+
+  defp drain_payload(segments, rcv_nxt, delivered, drained),
+    do: {delivered, segments, rcv_nxt, drained}
+
+  defp payload_start({start, _ending}), do: start
+  defp payload_end({_start, ending}), do: ending
+  defp fin_sequence(nil), do: nil
+  defp fin_sequence({sequence, _payload_start}), do: sequence
 
   defp sort(segments, rcv_nxt) do
     Enum.sort_by(segments, fn {sequence, _sequence_end, _payload} ->
