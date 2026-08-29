@@ -1,6 +1,8 @@
 defmodule Tricep.SocketTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Tricep.DummyLink
   alias Tricep.Tcp
 
@@ -2100,6 +2102,138 @@ defmodule Tricep.SocketTest do
   end
 
   describe "SYN_RECEIVED admission" do
+    test "keeps applicable ICMPv6 hard errors soft during the passive handshake", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, state: state} =
+        start_passive_child(link, local_addr, remote_addr)
+
+      send(child, {
+        :icmpv6_error,
+        {:hard, :enetunreach},
+        %{seq: state.tcb.snd_nxt, syn?: true}
+      })
+
+      assert {:syn_received, %{syn_retransmit_count: 0, soft_error: nil}} = :sys.get_state(child)
+
+      send(child, {:icmpv6_error, {:hard, :enetunreach}, %{seq: state.tcb.iss, syn?: true}})
+
+      wait_for_socket(child, fn
+        {:syn_received, %{syn_retransmit_count: 0, soft_error: :enetunreach}} -> true
+        _state -> false
+      end)
+
+      assert_receive {:dummy_link_packet, ^link, _syn_ack_retransmission}, 1500
+
+      assert {:syn_received, %{syn_retransmit_count: 1, soft_error: :enetunreach}} =
+               :sys.get_state(child)
+
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "reports a valid passive-handshake ICMP error after SYN-ACK retries exhaust", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, state: state, syn_ack_timer_ref: timer_ref} =
+        start_passive_child_with_syn_ack_timer(link, local_addr, remote_addr)
+
+      child_ref = Process.monitor(child)
+
+      log =
+        capture_log([level: :debug], fn ->
+          exhaust_syn_ack_retries(child, timer_ref, {:hard, :enetunreach}, %{
+            seq: state.tcb.iss,
+            syn?: true
+          })
+
+          assert_receive {:DOWN, ^child_ref, :process, ^child, :normal}, 1_500
+          refute Process.alive?(child)
+
+          wait_for_socket(listener, fn
+            {:listen, %{children: children, pending_count: 0, accept_queue: []}} ->
+              children == %{}
+
+            _state ->
+              false
+          end)
+        end)
+
+      assert log =~ "[debug] Passive TCP handshake failed after SYN-ACK retry exhaustion"
+      assert log =~ ":enetunreach"
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "does not retain an invalid passive-handshake ICMP error for retry exhaustion", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, state: state, syn_ack_timer_ref: timer_ref} =
+        start_passive_child_with_syn_ack_timer(link, local_addr, remote_addr)
+
+      child_ref = Process.monitor(child)
+
+      log =
+        capture_log([level: :debug], fn ->
+          exhaust_syn_ack_retries(child, timer_ref, {:hard, :enetunreach}, %{
+            seq: state.tcb.snd_nxt,
+            syn?: true
+          })
+
+          assert_receive {:DOWN, ^child_ref, :process, ^child, :normal}, 1_500
+          refute Process.alive?(child)
+
+          wait_for_socket(listener, fn
+            {:listen, %{children: children, pending_count: 0, accept_queue: []}} ->
+              children == %{}
+
+            _state ->
+              false
+          end)
+        end)
+
+      assert log =~ "[debug] Passive TCP handshake failed after SYN-ACK retry exhaustion"
+      assert log =~ ":etimedout"
+      refute log =~ "retry exhaustion: :enetunreach"
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "terminates a pending child on an acceptable reset", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, client_port: client_port, state: state} =
+        start_passive_child(link, local_addr, remote_addr)
+
+      child_ref = Process.monitor(child)
+
+      reset =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      send(child, reset)
+
+      assert_receive {:DOWN, ^child_ref, :process, ^child, :normal}, 1_000
+      refute Process.alive?(child)
+
+      wait_for_socket(listener, fn
+        {:listen, %{children: children, pending_count: 0, accept_queue: []}} -> children == %{}
+        _state -> false
+      end)
+
+      assert Tricep.close(listener) == :ok
+    end
+
     test "queues sequence-acceptable reordered data while completing the handshake", %{
       link: link,
       local_addr: local_addr,
@@ -7085,7 +7219,7 @@ defmodule Tricep.SocketTest do
 
       assert parsed1.payload == data
 
-      send(socket, {:icmpv6_error, {:packet_too_big, 1300}})
+      send(socket, {:icmpv6_error, {:packet_too_big, 1300}, %{seq: parsed1.seq, syn?: false}})
 
       wait_for_socket(socket, fn
         {:established, %{tcb: %{snd_mss: 1240}, unacked_segments: segments}} ->
@@ -7119,7 +7253,12 @@ defmodule Tricep.SocketTest do
       # Drain the ACK packet from handshake
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
 
-      send(socket, {:icmpv6_error, {:packet_too_big, 1200}})
+      assert Tricep.send(socket, "x") == :ok
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+      <<_ip_header::binary-size(40), data_segment::binary>> = data_packet
+      %{seq: sequence} = Tcp.parse_segment(data_segment)
+
+      send(socket, {:icmpv6_error, {:packet_too_big, 1200}, %{seq: sequence, syn?: false}})
 
       wait_for_socket(socket, fn
         {:established, %{tcb: %{snd_mss: 1220}}} -> true
@@ -7197,7 +7336,87 @@ defmodule Tricep.SocketTest do
       wait_for_state_name(socket, :closed, 35_000)
     end
 
-    test "data retransmission failure notifies blocking send waiters", %{
+    test "data retransmission failure reports the retained soft ICMP error", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 1)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "a") == :ok
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+      <<_ipv6_header::binary-size(40), data_segment::binary>> = data_packet
+      %{seq: sequence} = Tcp.parse_segment(data_segment)
+
+      send(socket, {:icmpv6_error, {:hard, :enetunreach}, %{seq: sequence, syn?: false}})
+
+      wait_for_socket(socket, fn
+        {:established, %{soft_error: :enetunreach}} -> true
+        _state -> false
+      end)
+
+      send_task = Task.async(fn -> Tricep.send(socket, "blocked", :infinity) end)
+      wait_for_send_waiters(socket)
+
+      :sys.replace_state(socket, fn
+        {:established, state} ->
+          unacked_segments =
+            Enum.map(state.unacked_segments, fn {seq_start, seq_end, payload, _count} ->
+              {seq_start, seq_end, payload, 5}
+            end)
+
+          {:established, %{state | unacked_segments: unacked_segments}}
+      end)
+
+      assert Task.await(send_task, 1500) == {:error, :enetunreach}
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+    end
+
+    test "an advancing ACK clears the retained soft ICMP error", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      assert Tricep.send(socket, "Hello") == :ok
+      assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+      <<_ipv6_header::binary-size(40), data_segment::binary>> = data_packet
+      %{seq: sequence, payload: payload} = Tcp.parse_segment(data_segment)
+
+      send(socket, {:icmpv6_error, {:hard, :enetunreach}, %{seq: sequence, syn?: false}})
+
+      wait_for_socket(socket, fn
+        {:established, %{soft_error: :enetunreach}} -> true
+        _state -> false
+      end)
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      inject_ack(
+        link,
+        local_addr,
+        remote_addr,
+        src_port,
+        state.tcb.rcv_nxt,
+        sequence + byte_size(payload)
+      )
+
+      wait_for_socket(socket, fn
+        {:established, %{soft_error: nil, tcb: %{snd_una: send_unacknowledged}}} ->
+          send_unacknowledged == sequence + byte_size(payload)
+
+        _state ->
+          false
+      end)
+    end
+
+    test "data retry exhaustion without a soft error reports timeout", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -7223,7 +7442,7 @@ defmodule Tricep.SocketTest do
       end)
 
       assert Task.await(send_task, 1500) == {:error, :etimedout}
-      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "duplicate ACK leaves retransmission state intact", %{
@@ -7496,7 +7715,52 @@ defmodule Tricep.SocketTest do
     end
   end
 
-  # Helper to establish a connection and return the socket
+  # Preserve gen_statem's timer reference so the tests can inject the named
+  # timeout event while the child is suspended, without racing the live RTO.
+  defp start_passive_child_with_syn_ack_timer(link, local_addr, remote_addr) do
+    :erlang.trace(self(), true, [:call, :set_on_spawn, {:tracer, self()}])
+
+    :erlang.trace_pattern(
+      {:erlang, :start_timer, 4},
+      [{[:_, :_, :_, :_], [], [{:return_trace}]}],
+      [:local]
+    )
+
+    try do
+      passive = start_passive_child(link, local_addr, remote_addr)
+      timer_ref = receive_syn_ack_timer_ref(passive.child)
+
+      :ok = :sys.suspend(passive.child)
+
+      :erlang.trace(passive.listener, false, [:call, :set_on_spawn])
+      :erlang.trace(passive.child, false, [:call, :set_on_spawn])
+
+      Map.put(passive, :syn_ack_timer_ref, timer_ref)
+    after
+      :erlang.trace(self(), false, [:call, :set_on_spawn])
+      :erlang.trace_pattern({:erlang, :start_timer, 4}, false, [:local])
+    end
+  end
+
+  defp receive_syn_ack_timer_ref(child) do
+    receive do
+      {:trace, ^child, :return_from, {:erlang, :start_timer, 4}, timer_ref} -> timer_ref
+    after
+      1_000 -> flunk("did not observe SYN-ACK RTO timer")
+    end
+  end
+
+  defp exhaust_syn_ack_retries(child, timer_ref, event, quoted_tcp) do
+    :sys.replace_state(child, fn {:syn_received, state} ->
+      {:syn_received, %{state | syn_retransmit_count: 5}}
+    end)
+
+    :erlang.cancel_timer(timer_ref)
+    send(child, {:icmpv6_error, event, quoted_tcp})
+    send(child, {:timeout, timer_ref, {:timeout, :rto}})
+    :ok = :sys.resume(child)
+  end
+
   defp start_passive_child(link, local_addr, remote_addr, opts \\ []) do
     socket_opts = Keyword.get(opts, :socket_opts, %{})
     client_port = Keyword.get(opts, :client_port, 40_020)

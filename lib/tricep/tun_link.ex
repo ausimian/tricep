@@ -376,11 +376,11 @@ defmodule Tricep.TunLink do
           @read_tun_again
 
         {:error, reason} ->
-          Logger.warning("Ignoring malformed ICMPv6 packet: #{reason}")
+          Logger.debug("Ignoring malformed ICMPv6 packet: #{reason}")
           @read_tun_again
       end
     else
-      Logger.warning("Ignoring ICMPv6 packet with invalid checksum")
+      Logger.debug("Ignoring ICMPv6 packet with invalid checksum")
       @read_tun_again
     end
   end
@@ -399,7 +399,7 @@ defmodule Tricep.TunLink do
   defp valid_icmpv6_checksum?(_src, _dst, _data), do: false
 
   defp parse_icmpv6_error(<<1, code, _checksum::16, _unused::32, quoted_packet::binary>>) do
-    {:ok, {:hard, destination_unreachable_reason(code)}, quoted_packet}
+    {:ok, destination_unreachable_event(code), quoted_packet}
   end
 
   defp parse_icmpv6_error(<<2, 0, _checksum::16, mtu::32, quoted_packet::binary>>) do
@@ -407,15 +407,23 @@ defmodule Tricep.TunLink do
   end
 
   defp parse_icmpv6_error(<<3, _code, _checksum::16, _unused::32, quoted_packet::binary>>) do
-    {:ok, {:hard, :etimedout}, quoted_packet}
+    {:ok, {:soft, :etimedout}, quoted_packet}
   end
 
   defp parse_icmpv6_error(<<4, _code, _checksum::16, _pointer::32, quoted_packet::binary>>) do
-    {:ok, {:hard, :eproto}, quoted_packet}
+    {:ok, {:soft, :eproto}, quoted_packet}
   end
 
   defp parse_icmpv6_error(<<_type, _rest::binary>>), do: :ignore
   defp parse_icmpv6_error(_data), do: {:error, :truncated}
+
+  # RFC 1122 section 4.2.3.9 treats no-route reports as soft, while the
+  # ICMPv6 administrative, address, and port-unreachable variants are hard.
+  defp destination_unreachable_event(code) when code in [1, 3, 4] do
+    {:hard, destination_unreachable_reason(code)}
+  end
+
+  defp destination_unreachable_event(code), do: {:soft, destination_unreachable_reason(code)}
 
   defp destination_unreachable_reason(0), do: :enetunreach
   defp destination_unreachable_reason(1), do: :eacces
@@ -425,13 +433,13 @@ defmodule Tricep.TunLink do
 
   defp handle_icmpv6_error(event, quoted_packet, src, dst, _state) do
     with {:ok, %{next_header: next_header, payload: payload, src: inner_src, dst: inner_dst}} <-
-           Tricep.Ip.parse(quoted_packet),
+           Tricep.Ip.parse_quoted(quoted_packet),
          {:ok, 6, tcp_segment} <- unwrap_ipv6_payload(next_header, payload) do
       log_icmpv6_error(event, src, dst, inner_src, inner_dst, tcp_segment)
       Tricep.Socket.handle_icmpv6_error(inner_src, inner_dst, tcp_segment, event)
     else
       _ ->
-        Logger.warning("Ignoring ICMPv6 error without quoted TCP packet")
+        Logger.debug("Ignoring ICMPv6 error without quoted TCP packet")
     end
 
     @read_tun_again
@@ -447,16 +455,24 @@ defmodule Tricep.TunLink do
        ) do
     {src_port, dst_port} = tcp_ports(tcp_segment)
 
-    Logger.warning(
+    Logger.debug(
       "ICMPv6 Packet Too Big mtu=#{mtu} from #{format_addr(src)} to #{format_addr(dst)} for TCP #{format_addr(inner_src)}:#{src_port} -> #{format_addr(inner_dst)}:#{dst_port}"
     )
   end
 
-  defp log_icmpv6_error({:hard, reason}, src, dst, inner_src, inner_dst, tcp_segment) do
+  defp log_icmpv6_error(
+         {classification, reason},
+         src,
+         dst,
+         inner_src,
+         inner_dst,
+         tcp_segment
+       )
+       when classification in [:hard, :soft] do
     {src_port, dst_port} = tcp_ports(tcp_segment)
 
-    Logger.warning(
-      "ICMPv6 #{reason} from #{format_addr(src)} to #{format_addr(dst)} for TCP #{format_addr(inner_src)}:#{src_port} -> #{format_addr(inner_dst)}:#{dst_port}"
+    Logger.debug(
+      "ICMPv6 #{classification} #{reason} from #{format_addr(src)} to #{format_addr(dst)} for TCP #{format_addr(inner_src)}:#{src_port} -> #{format_addr(inner_dst)}:#{dst_port}"
     )
   end
 

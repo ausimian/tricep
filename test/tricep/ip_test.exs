@@ -151,4 +151,23 @@ defmodule Tricep.IpTest do
       assert Ip.parse(packet) == {:error, :invalid_payload_length}
     end
   end
+
+  describe "parse_quoted/1" do
+    test "accepts a truncated quoted payload while retaining its original length" do
+      payload = :binary.copy(<<0xAA>>, 1_400)
+      packet = Ip.wrap(@src_addr, @dst_addr, :tcp, payload)
+      quoted_packet = binary_part(packet, 0, 1_232)
+
+      assert Ip.parse(quoted_packet) == {:error, :invalid_payload_length}
+      assert {:ok, parsed} = Ip.parse_quoted(quoted_packet)
+      assert parsed.payload_length == 1_400
+      assert parsed.payload == binary_part(payload, 0, 1_192)
+    end
+
+    test "rejects a quote containing more bytes than its declared payload" do
+      packet = Ip.wrap(@src_addr, @dst_addr, :tcp, <<1, 2, 3, 4>>) <> <<5>>
+
+      assert Ip.parse_quoted(packet) == {:error, :invalid_payload_length}
+    end
+  end
 end

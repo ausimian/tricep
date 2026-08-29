@@ -89,4 +89,41 @@ defmodule Tricep.Ip do
 
   def parse(<<version::4, _::bits>>) when version != 6, do: {:error, :unsupported_version}
   def parse(_packet), do: {:error, :truncated_header}
+
+  @doc false
+  # RFC 4443 ICMPv6 errors quote as much of the invoking IPv6 packet as fits
+  # within the minimum IPv6 MTU. The quoted packet therefore retains its
+  # original payload-length field even when its copied payload is truncated.
+  # Keep this relaxed path separate so normal received IPv6 packets remain
+  # subject to the strict length check in parse/1.
+  @spec parse_quoted(binary()) :: {:ok, parsed_packet()} | {:error, atom()}
+  def parse_quoted(
+        <<6::4, traffic_class::8, flow_label::20, payload_length::16, next_header::8,
+          hop_limit::8, src::binary-size(16), dst::binary-size(16), payload::binary>>
+      )
+      when byte_size(payload) <= payload_length do
+    {:ok,
+     %{
+       version: 6,
+       traffic_class: traffic_class,
+       flow_label: flow_label,
+       payload_length: payload_length,
+       next_header: next_header,
+       hop_limit: hop_limit,
+       src: src,
+       dst: dst,
+       payload: payload
+     }}
+  end
+
+  def parse_quoted(
+        <<6::4, _traffic_class::8, _flow_label::20, payload_length::16, _next_header::8,
+          _hop_limit::8, _src::binary-size(16), _dst::binary-size(16), payload::binary>>
+      )
+      when byte_size(payload) > payload_length do
+    {:error, :invalid_payload_length}
+  end
+
+  def parse_quoted(<<version::4, _::bits>>) when version != 6, do: {:error, :unsupported_version}
+  def parse_quoted(_packet), do: {:error, :truncated_header}
 end
