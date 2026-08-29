@@ -17,6 +17,18 @@ defmodule Tricep.DummyLinkTest do
     assert DummyLink.get_packets(link) == [packet]
   end
 
+  test "drop waits for a link process to terminate" do
+    link =
+      spawn(fn ->
+        receive do
+          {:stop, :shutdown} -> :ok
+        end
+      end)
+
+    assert Tricep.Link.drop(link) == :ok
+    refute Process.alive?(link)
+  end
+
   defp stop_link(link) do
     if Process.alive?(link) do
       GenServer.stop(link)
