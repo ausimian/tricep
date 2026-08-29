@@ -39,9 +39,15 @@ defmodule Tricep.Tcp.Tcb do
 
   def invalid_ack?(%__MODULE__{}, false, _acknowledgment), do: false
 
+  # Classifies reset sequence numbers for the RFC 5961 receive path.
   # Requires initialized RCV.NXT and RCV.WND fields.
-  def acceptable_reset?(%__MODULE__{rcv_nxt: receive_next, rcv_wnd: receive_window}, sequence) do
-    Sequence.in_window?(sequence, receive_next, receive_window)
+  @spec reset_validation(t(), sequence()) :: :exact | :in_window | :out_of_window
+  def reset_validation(%__MODULE__{rcv_nxt: receive_next, rcv_wnd: receive_window}, sequence) do
+    cond do
+      sequence == receive_next -> :exact
+      Sequence.in_window?(sequence, receive_next, receive_window) -> :in_window
+      true -> :out_of_window
+    end
   end
 
   # Requires initialized RCV.NXT and RCV.WND fields.

@@ -35,16 +35,28 @@ defmodule Tricep.Tcp.SynchronizedTest do
              Synchronized.process(tcb, segment, validate_ack?: true)
   end
 
-  test "gives an acceptable reset precedence over ACK validation", %{tcb: tcb} do
+  test "gives an exact reset precedence over ACK validation", %{tcb: tcb} do
     segment = Tcp.build_segment(@pair, 0xFFFFFFFF, 111, [:rst, :ack], 1024)
 
     assert Synchronized.process(tcb, segment, validate_ack?: true) == :acceptable_reset
   end
 
-  test "rejects resets outside the receive window", %{tcb: tcb} do
+  test "challenges an in-window reset that is not exactly RCV.NXT", %{tcb: tcb} do
+    segment = Tcp.build_segment(@pair, 0, 0, [:rst], 1024)
+
+    assert Synchronized.process(tcb, segment) == :challenge_ack
+  end
+
+  test "silently drops a reset outside the receive window", %{tcb: tcb} do
     segment = Tcp.build_segment(@pair, 32, 0, [:rst], 1024)
 
-    assert Synchronized.process(tcb, segment) == :unacceptable_reset
+    assert Synchronized.process(tcb, segment) == :silent_drop
+  end
+
+  test "challenges SYN regardless of its sequence number", %{tcb: tcb} do
+    segment = Tcp.build_segment(@pair, 32, 0, [:syn], 1024)
+
+    assert Synchronized.process(tcb, segment) == :challenge_ack
   end
 
   test "rejects ACKs that acknowledge unsent data when requested", %{tcb: tcb} do

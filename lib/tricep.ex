@@ -61,11 +61,16 @@ defmodule Tricep do
         before TCP window scaling (default: 65535, capped at 65535)
       * `:fin_wait_2_timeout_ms` - Milliseconds to wait in `FIN_WAIT_2` for the peer FIN
         before closing locally (default: 60000)
+      * `:challenge_ack_limit` - When supplied, must be a positive maximum RFC 5961 challenge
+        ACK count per socket interval; omitted defaults to 10
+      * `:challenge_ack_interval_ms` - When supplied, must be a positive RFC 5961 challenge-ACK
+        interval in milliseconds; omitted defaults to 5000
 
   ## Returns
 
     * `{:ok, socket}` - A socket pid on success
     * `{:error, :unsupported}` - If the domain/type/protocol combination is not supported
+    * `{:error, :einval}` - If a supplied challenge-ACK option is not a positive integer
 
   ## Examples
 
@@ -73,7 +78,8 @@ defmodule Tricep do
       {:ok, socket} = Tricep.open(:inet6, :stream, :default)
       {:ok, socket} = Tricep.open(:inet6, :stream, %{})
   """
-  @spec open(:inet6, :stream, :tcp | :default | map()) :: {:ok, pid()} | {:error, :unsupported}
+  @spec open(:inet6, :stream, :tcp | :default | map()) ::
+          {:ok, pid()} | {:error, :unsupported | :einval}
   def open(domain, type, protocol)
 
   def open(:inet6, :stream, protocol) when protocol in [:tcp, :default] do
@@ -103,13 +109,19 @@ defmodule Tricep do
         before TCP window scaling (default: 65535, capped at 65535)
       * `:fin_wait_2_timeout_ms` - Milliseconds to wait in `FIN_WAIT_2` for the peer FIN
         before closing locally (default: 60000)
+      * `:challenge_ack_limit` - When supplied, must be a positive maximum RFC 5961 challenge
+        ACK count per socket interval; omitted defaults to 10
+      * `:challenge_ack_interval_ms` - When supplied, must be a positive RFC 5961 challenge-ACK
+        interval in milliseconds; omitted defaults to 5000
 
   ## Returns
 
     * `{:ok, socket}` - A socket pid on success
     * `{:error, :unsupported}` - If the domain/type/protocol combination is not supported
+    * `{:error, :einval}` - If a supplied challenge-ACK option is not a positive integer
   """
-  @spec open(:inet6, :stream, :tcp | :default, map()) :: {:ok, pid()} | {:error, :unsupported}
+  @spec open(:inet6, :stream, :tcp | :default, map()) ::
+          {:ok, pid()} | {:error, :unsupported | :einval}
   def open(domain, type, protocol, opts)
 
   def open(:inet6, :stream, :default, opts) do
