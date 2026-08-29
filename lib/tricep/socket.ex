@@ -9,6 +9,7 @@ defmodule Tricep.Socket do
   alias Tricep.DataBuffer
   alias Tricep.Tcp
   alias Tricep.Tcp.ChallengeAckLimiter
+  alias Tricep.Tcp.ReceiveReassembly
   alias Tricep.Tcp.Sequence
   alias Tricep.Tcp.Synchronized
   alias Tricep.Tcp.Tcb
@@ -198,6 +199,9 @@ defmodule Tricep.Socket do
     field :send_buffer, DataBuffer.t(), default: DataBuffer.new()
     field :recv_buffer, binary(), default: <<>>
     field :out_of_order_segments, list(), default: []
+    # The FIN sequence-space marker may arrive before the queued data that
+    # precedes it. It is not a buffered byte, but must survive reassembly.
+    field :out_of_order_fin, Sequence.sequence_number() | nil, default: nil
     field :recv_buffer_size, pos_integer(), default: @default_recv_buffer_size
     # Callers waiting on recv (list of {from, length, timer_ref})
     field :recv_waiters, list(), default: []
@@ -646,9 +650,9 @@ defmodule Tricep.Socket do
       :unacceptable_segment ->
         reject_unacceptable_segment(state)
 
-      {:established, new_state} ->
+      {:established, next_state, new_state, receive_actions} ->
         notify_passive_listener(state, :passive_established)
-        {:next_state, :established, new_state, {{:timeout, :rto}, :cancel}}
+        {:next_state, next_state, new_state, receive_actions ++ [{{:timeout, :rto}, :cancel}]}
 
       {:bad_ack, acknowledgment} ->
         send_rst(acknowledgment, state)
@@ -887,6 +891,18 @@ defmodule Tricep.Socket do
 
   def handle_event({:timeout, :rto}, :retransmit, :last_ack, %__MODULE__{} = state) do
     do_retransmit(state)
+  end
+
+  def handle_event({:timeout, :persist}, :persist_probe, :fin_wait_1, %__MODULE__{} = state) do
+    # A FIN consumes the next sequence number, so a persist probe here would
+    # put payload at that FIN sequence. FIN_WAIT_1 cannot retain send data.
+    new_state = %{
+      state
+      | persist_timer_active: false,
+        persist_timeout_ms: @initial_persist_timeout_ms
+    }
+
+    {:keep_state, new_state, cancel_persist_timer_action(state)}
   end
 
   def handle_event({:timeout, :persist}, :persist_probe, state_name, %__MODULE__{} = state)
@@ -1380,113 +1396,84 @@ defmodule Tricep.Socket do
        }) do
     fin? = :fin in flags
     ack? = :ack in flags
-    expected_sequence? = seq == state.tcb.rcv_nxt
     payload? = payload != <<>>
+    fin_at_entry? = fin? and seq == state.tcb.rcv_nxt
 
-    case {fin?, ack?, expected_sequence?, payload?} do
-      {true, _ack?, true, _payload?} ->
-        handle_established_fin(state, ack?, ack, window, payload)
+    if payload? or fin? do
+      {receive_state, _delivered_length, fin_ready?, recv_actions} =
+        deliver_received_segment(state, seq, payload, flags)
 
-      {_fin?, true, true, true} ->
-        handle_established_payload(state, ack, window, payload)
-
-      {_fin?, true, _expected_sequence?, false} ->
-        {new_state, timer_actions} = process_ack(state, ack, window)
-        {:keep_state, new_state, timer_actions}
-
-      {_fin?, _ack?, _expected_sequence?, true} ->
-        receive_state = buffer_out_of_order_payload(state, seq, payload)
+      if fin_ready? do
+        handle_established_fin_ready(
+          receive_state,
+          fin_at_entry?,
+          ack?,
+          ack,
+          window,
+          recv_actions
+        )
+      else
         {new_state, timer_actions} = process_ack_if_present(receive_state, ack?, ack, window)
         send_ack(new_state.tcb.rcv_nxt, new_state)
-        {:keep_state, new_state, timer_actions}
-
-      {true, _ack?, _expected_sequence?, false} ->
-        ack_unacceptable_segment(state, ack?, ack, window)
-
-      _ ->
-        :keep_state_and_data
-    end
-  end
-
-  defp handle_established_fin(state, ack?, ack, window, payload) do
-    data_length = byte_size(payload)
-    {receive_state, accepted_length} = receive_payload(state, payload)
-
-    if accepted_length == data_length do
-      send_unacknowledged =
-        if ack? and Sequence.gt?(ack, state.tcb.snd_una) and
-             Sequence.lte?(ack, state.tcb.snd_nxt),
-           do: ack,
-           else: state.tcb.snd_una
-
-      fin_state = %{receive_state | tcb: Tcb.advance_receive(receive_state.tcb, 1)}
-
-      receive_state =
-        fin_state
-        |> notify_recv_select(:eof)
-
-      # Preserve legacy FIN-carried ACK bookkeeping; bug #121 owns its fix.
-      receive_state = %{
-        receive_state
-        | tcb: Tcb.acknowledge(receive_state.tcb, send_unacknowledged, window)
-      }
-
-      {recv_buffer, recv_waiters, replies} =
-        process_waiters_eof(receive_state.recv_buffer, receive_state.recv_waiters)
-
-      new_state =
-        receive_state
-        |> Map.put(:recv_buffer, recv_buffer)
-        |> Map.put(:recv_waiters, recv_waiters)
-        |> Map.put(:fin_received, true)
-        |> refresh_receive_window()
-
-      send_ack(new_state.tcb.rcv_nxt, new_state)
-      {:next_state, :close_wait, new_state, replies}
-    else
-      handle_partially_accepted_fin(receive_state, ack?, ack, window, accepted_length)
-    end
-  end
-
-  defp handle_partially_accepted_fin(receive_state, ack?, ack, window, accepted_length) do
-    receive_state = notify_recv_select(receive_state, accepted_length)
-
-    {recv_buffer, recv_waiters, replies} =
-      process_waiters(receive_state.recv_buffer, receive_state.recv_waiters)
-
-    receive_state =
-      receive_state
-      |> Map.put(:recv_buffer, recv_buffer)
-      |> Map.put(:recv_waiters, recv_waiters)
-      |> refresh_receive_window()
-
-    {new_state, timer_actions} =
-      if ack? do
-        process_ack(receive_state, ack, window)
-      else
-        {%{receive_state | tcb: Tcb.update_send_window(receive_state.tcb, window)}, []}
+        {:keep_state, new_state, recv_actions ++ timer_actions}
       end
-
-    send_ack(new_state.tcb.rcv_nxt, new_state)
-    {:keep_state, new_state, replies ++ timer_actions}
+    else
+      if ack? do
+        {new_state, timer_actions} = process_ack(state, ack, window)
+        {:keep_state, new_state, timer_actions}
+      else
+        :keep_state_and_data
+      end
+    end
   end
 
-  defp handle_established_payload(state, ack, window, payload) do
-    {receive_state, accepted_length} = receive_payload(state, payload)
-    receive_state = notify_recv_select(receive_state, accepted_length)
+  # Bug #121 preserves only an in-order FIN carried by this segment. A FIN
+  # reached while reconstructing an overlap must still process this segment's
+  # ACK through the normal retransmission and persist bookkeeping path.
+  defp handle_established_fin_ready(receive_state, true, ack?, ack, window, recv_actions) do
+    handle_established_received_fin(receive_state, ack?, ack, window, recv_actions)
+  end
+
+  defp handle_established_fin_ready(receive_state, false, ack?, ack, window, recv_actions) do
+    handle_established_drained_fin(receive_state, ack?, ack, window, recv_actions)
+  end
+
+  defp handle_established_received_fin(receive_state, ack?, ack, window, recv_actions) do
+    send_unacknowledged =
+      if ack? and Sequence.gt?(ack, receive_state.tcb.snd_una) and
+           Sequence.lte?(ack, receive_state.tcb.snd_nxt),
+         do: ack,
+         else: receive_state.tcb.snd_una
+
+    # Preserve legacy FIN-carried ACK bookkeeping; bug #121 owns its fix.
+    receive_state = %{
+      receive_state
+      | tcb: Tcb.acknowledge(receive_state.tcb, send_unacknowledged, window)
+    }
+
+    transition_established_after_fin(receive_state, recv_actions)
+  end
+
+  defp handle_established_drained_fin(receive_state, ack?, ack, window, recv_actions) do
+    {ack_state, ack_actions} = process_ack_if_present(receive_state, ack?, ack, window)
+    transition_established_after_fin(ack_state, recv_actions ++ ack_actions)
+  end
+
+  defp transition_established_after_fin(receive_state, actions) do
+    receive_state = notify_recv_select(receive_state, :eof)
 
     {recv_buffer, recv_waiters, replies} =
-      process_waiters(receive_state.recv_buffer, receive_state.recv_waiters)
+      process_waiters_eof(receive_state.recv_buffer, receive_state.recv_waiters)
 
-    receive_state =
+    new_state =
       receive_state
       |> Map.put(:recv_buffer, recv_buffer)
       |> Map.put(:recv_waiters, recv_waiters)
+      |> Map.put(:fin_received, true)
       |> refresh_receive_window()
 
-    {new_state, timer_actions} = process_ack(receive_state, ack, window)
     send_ack(new_state.tcb.rcv_nxt, new_state)
-    {:keep_state, new_state, replies ++ timer_actions}
+    {:next_state, :close_wait, new_state, actions ++ replies}
   end
 
   defp handle_fin_wait_1_segment(state, %{
@@ -1497,32 +1484,59 @@ defmodule Tricep.Socket do
          window: window
        }) do
     ack? = :ack in flags
-    {ack_state, ack_actions} = process_ack_if_present(state, ack?, ack, window)
 
-    {receive_state, accepted_length, recv_actions} =
-      maybe_deliver_payload(ack_state, seq, payload)
+    if ack? do
+      {ack_state, ack_actions} = process_ack(state, ack, window)
 
-    fin_ready? =
-      :fin in flags and seq == ack_state.tcb.rcv_nxt and accepted_length == byte_size(payload)
+      {receive_state, _delivered_length, fin_ready?, recv_actions} =
+        deliver_received_segment(ack_state, seq, payload, flags)
 
-    if accepted_length > 0 and not fin_ready?,
-      do: send_ack(receive_state.tcb.rcv_nxt, receive_state)
+      if (payload != <<>> or :fin in flags) and not fin_ready? do
+        send_ack(receive_state.tcb.rcv_nxt, receive_state)
+      end
+
+      transition =
+        fin_wait_1_transition(%{
+          ack?: true,
+          ack_of_fin?: ack == state.tcb.snd_nxt,
+          fin?: :fin in flags,
+          fin_ready?: fin_ready?,
+          recv_actions: recv_actions
+        })
+
+      handle_fin_wait_1_transition(receive_state, transition, ack_actions, recv_actions)
+    else
+      handle_fin_wait_1_ackless_segment(state, flags, seq, payload, window)
+    end
+  end
+
+  # Bug #120 owns the broader ACK-less FIN_WAIT_1 receive behavior. Retain
+  # its historical commit/discard boundary while allowing an in-order FIN to
+  # progress the close state as before.
+  defp handle_fin_wait_1_ackless_segment(state, flags, seq, payload, window) do
+    {ack_state, ack_actions} = process_ack_if_present(state, false, 0, window)
+
+    {receive_state, delivered_length, fin_ready?, recv_actions} =
+      if seq == ack_state.tcb.rcv_nxt do
+        deliver_received_segment(ack_state, seq, payload, flags)
+      else
+        {ack_state, 0, false, []}
+      end
+
+    if delivered_length > 0 and not fin_ready? do
+      send_ack(receive_state.tcb.rcv_nxt, receive_state)
+    end
 
     transition =
       fin_wait_1_transition(%{
-        ack?: ack?,
-        ack_of_fin?: ack? and ack == state.tcb.snd_nxt,
+        ack?: false,
+        ack_of_fin?: false,
         fin?: :fin in flags,
         fin_ready?: fin_ready?,
         recv_actions: recv_actions
       })
 
-    handle_fin_wait_1_transition(
-      receive_state,
-      transition,
-      ack_actions,
-      recv_actions
-    )
+    handle_fin_wait_1_transition(receive_state, transition, ack_actions, recv_actions)
   end
 
   defp fin_wait_1_transition(%{} = segment) do
@@ -1538,13 +1552,13 @@ defmodule Tricep.Socket do
   end
 
   defp handle_fin_wait_1_transition(state, :time_wait, ack_actions, recv_actions) do
-    transition_after_peer_fin(state, :time_wait, ack_actions ++ recv_actions, [
+    transition_after_received_fin(state, :time_wait, ack_actions ++ recv_actions, [
       {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}
     ])
   end
 
   defp handle_fin_wait_1_transition(state, :closing, ack_actions, recv_actions) do
-    transition_after_peer_fin(state, :closing, ack_actions ++ recv_actions)
+    transition_after_received_fin(state, :closing, ack_actions ++ recv_actions)
   end
 
   defp handle_fin_wait_1_transition(state, :fin_wait_2, ack_actions, recv_actions) do
@@ -1568,8 +1582,8 @@ defmodule Tricep.Socket do
     :keep_state_and_data
   end
 
-  defp handle_fin_wait_1_transition(state, :receive, _ack_actions, recv_actions) do
-    {:keep_state, state, recv_actions}
+  defp handle_fin_wait_1_transition(state, :receive, ack_actions, recv_actions) do
+    {:keep_state, state, ack_actions ++ recv_actions}
   end
 
   defp handle_fin_wait_2_segment(state, %{
@@ -1581,43 +1595,28 @@ defmodule Tricep.Socket do
        }) do
     ack? = :ack in flags
     fin? = :fin in flags
-    receive_state = %{state | tcb: Tcb.update_send_window(state.tcb, window)}
+    {ack_state, ack_actions} = process_ack_if_present(state, ack?, ack, window)
 
-    cond do
-      fin? and seq == state.tcb.rcv_nxt ->
-        handle_fin_wait_2_fin(receive_state, payload)
+    if payload != <<>> or fin? do
+      {receive_state, _delivered_length, fin_ready?, recv_actions} =
+        deliver_received_segment(ack_state, seq, payload, flags)
 
-      ack? and seq == state.tcb.rcv_nxt and payload != <<>> ->
-        {new_state, _accepted_length, recv_actions} =
-          deliver_received_payload(receive_state, payload)
-
-        send_ack(new_state.tcb.rcv_nxt, new_state)
-        {:keep_state, new_state, recv_actions}
-
-      payload != <<>> or fin? ->
-        ack_unacceptable_segment(state, ack?, ack, window)
-
-      true ->
-        :keep_state_and_data
-    end
-  end
-
-  defp handle_fin_wait_2_fin(state, payload) do
-    {receive_state, accepted_length, recv_actions} = deliver_received_payload(state, payload)
-
-    if accepted_length == byte_size(payload) do
-      transition_after_peer_fin(
-        receive_state,
-        :time_wait,
-        recv_actions,
-        [
-          {{:timeout, :fin_wait_2}, :cancel},
-          {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}
-        ]
-      )
+      if fin_ready? do
+        transition_after_received_fin(
+          receive_state,
+          :time_wait,
+          ack_actions ++ recv_actions,
+          [
+            {{:timeout, :fin_wait_2}, :cancel},
+            {{:timeout, :time_wait}, @time_wait_ms, :time_wait_expired}
+          ]
+        )
+      else
+        send_ack(receive_state.tcb.rcv_nxt, receive_state)
+        {:keep_state, receive_state, ack_actions ++ recv_actions}
+      end
     else
-      send_ack(receive_state.tcb.rcv_nxt, receive_state)
-      {:keep_state, receive_state, recv_actions}
+      {:keep_state, ack_state, ack_actions}
     end
   end
 
@@ -2428,8 +2427,10 @@ defmodule Tricep.Socket do
         :unacceptable_segment
 
       :ack in flags and acknowledges_syn_ack?(state.tcb, acknowledgment) ->
-        {:established,
-         establish_after_syn_received(state, sequence, acknowledgment, window, payload)}
+        {next_state, new_state, receive_actions} =
+          establish_after_syn_received(state, flags, sequence, acknowledgment, window, payload)
+
+        {:established, next_state, new_state, receive_actions}
 
       :ack in flags ->
         {:bad_ack, acknowledgment}
@@ -2439,7 +2440,7 @@ defmodule Tricep.Socket do
     end
   end
 
-  defp establish_after_syn_received(state, sequence, acknowledgment, window, payload) do
+  defp establish_after_syn_received(state, flags, sequence, acknowledgment, window, payload) do
     base_state =
       %{
         state
@@ -2450,7 +2451,7 @@ defmodule Tricep.Socket do
       }
       |> open_receive_window()
 
-    receive_syn_received_payload(base_state, sequence, payload)
+    receive_syn_received_segment(base_state, sequence, payload, flags)
   end
 
   defp establish_after_syn_ack(state, %{
@@ -2497,30 +2498,29 @@ defmodule Tricep.Socket do
       Sequence.lte?(acknowledgment, send_next)
   end
 
-  defp receive_syn_received_payload(state, _sequence, <<>>), do: state
+  defp receive_syn_received_segment(state, sequence, payload, flags) do
+    if payload == <<>> and :fin not in flags do
+      # Preserve the passive handshake's existing ACK scheduling: the final
+      # bare ACK establishes the child without emitting an extra packet.
+      {:established, state, []}
+    else
+      {receive_state, _delivered_length, fin_ready?} =
+        receive_segment(state, sequence, payload, flags)
 
-  defp receive_syn_received_payload(state, sequence, payload) do
-    receive_state =
-      if sequence == state.tcb.rcv_nxt do
-        {receive_state, _accepted_length} = receive_payload(state, payload)
-        receive_state
+      receive_state = refresh_receive_window(receive_state)
+
+      send_ack(receive_state.tcb.rcv_nxt, receive_state)
+
+      if fin_ready? do
+        {receive_state, eof_actions} = deliver_receive_eof(receive_state)
+        {:close_wait, receive_state, eof_actions}
       else
-        buffer_out_of_order_payload(state, sequence, payload)
+        {:established, receive_state, []}
       end
-
-    send_ack(receive_state.tcb.rcv_nxt, receive_state)
-    receive_state
+    end
   end
 
-  defp maybe_deliver_payload(state, sequence, payload)
-       when sequence == state.tcb.rcv_nxt and payload != <<>> do
-    deliver_received_payload(state, payload)
-  end
-
-  defp maybe_deliver_payload(state, _sequence, _payload), do: {state, 0, []}
-
-  defp transition_after_peer_fin(state, next_state, actions, extra_actions \\ []) do
-    state = %{state | tcb: Tcb.advance_receive(state.tcb, 1)}
+  defp transition_after_received_fin(state, next_state, actions, extra_actions \\ []) do
     {new_state, eof_actions} = deliver_receive_eof(state)
 
     send_ack(new_state.tcb.rcv_nxt, new_state)
@@ -2849,20 +2849,36 @@ defmodule Tricep.Socket do
     new_state
   end
 
-  defp receive_payload(%__MODULE__{} = state, payload) do
-    accepted_len = min(byte_size(payload), receive_window(state))
-    {accepted_payload, _overflow} = split_binary(payload, accepted_len)
+  defp receive_segment(%__MODULE__{} = state, sequence, payload, flags) do
+    %{
+      delivered: delivered,
+      fin?: fin?,
+      fin_sequence: pending_fin,
+      out_of_order_segments: segments,
+      rcv_nxt: receive_next
+    } =
+      ReceiveReassembly.receive(
+        state.out_of_order_segments,
+        state.out_of_order_fin,
+        state.tcb.rcv_nxt,
+        receive_window(state),
+        %{flags: flags, payload: payload, seq: sequence}
+      )
 
-    new_state = %{state | recv_buffer: state.recv_buffer <> accepted_payload}
-    new_state = %{new_state | tcb: Tcb.advance_receive(new_state.tcb, accepted_len)}
-    new_state = new_state |> drain_out_of_order_segments() |> refresh_receive_window()
+    new_state = %{
+      state
+      | recv_buffer: state.recv_buffer <> delivered,
+        out_of_order_segments: segments,
+        out_of_order_fin: pending_fin,
+        tcb: Tcb.receive_next(state.tcb, receive_next)
+    }
 
-    {new_state, accepted_len}
+    {new_state, byte_size(delivered), fin?}
   end
 
-  defp deliver_received_payload(%__MODULE__{} = state, payload) do
-    {receive_state, accepted_len} = receive_payload(state, payload)
-    receive_state = notify_recv_select(receive_state, accepted_len)
+  defp deliver_received_segment(%__MODULE__{} = state, sequence, payload, flags) do
+    {receive_state, delivered_length, fin?} = receive_segment(state, sequence, payload, flags)
+    receive_state = notify_recv_select(receive_state, delivered_length)
 
     {recv_buffer, recv_waiters, actions} =
       process_waiters(receive_state.recv_buffer, receive_state.recv_waiters)
@@ -2873,7 +2889,7 @@ defmodule Tricep.Socket do
       |> Map.put(:recv_waiters, recv_waiters)
       |> refresh_receive_window()
 
-    {new_state, accepted_len, actions}
+    {new_state, delivered_length, fin?, actions}
   end
 
   defp deliver_receive_eof(%__MODULE__{} = state) do
@@ -2896,86 +2912,6 @@ defmodule Tricep.Socket do
     Enum.reduce(segments, 0, fn {_seq, _seq_end, payload}, total ->
       total + byte_size(payload)
     end)
-  end
-
-  defp buffer_out_of_order_payload(%__MODULE__{} = state, seq, payload)
-       when byte_size(payload) > 0 do
-    if Sequence.gt?(seq, state.tcb.rcv_nxt) do
-      offset = Sequence.distance(state.tcb.rcv_nxt, seq)
-      accepted_len = min(byte_size(payload), max(0, receive_window(state) - offset))
-
-      if accepted_len > 0 do
-        {accepted_payload, _overflow} = split_binary(payload, accepted_len)
-        seq_end = Sequence.wrap(seq + accepted_len)
-
-        segments =
-          [{seq, seq_end, accepted_payload} | state.out_of_order_segments]
-          |> sort_out_of_order_segments(state.tcb.rcv_nxt)
-          |> merge_out_of_order_segments()
-
-        %{state | out_of_order_segments: segments}
-        |> refresh_receive_window()
-      else
-        state
-      end
-    else
-      state
-    end
-  end
-
-  defp buffer_out_of_order_payload(%__MODULE__{} = state, _seq, _payload), do: state
-
-  defp sort_out_of_order_segments(segments, rcv_nxt) do
-    Enum.sort_by(segments, fn {seq, _seq_end, _payload} ->
-      Sequence.distance(rcv_nxt, seq)
-    end)
-  end
-
-  defp merge_out_of_order_segments([]), do: []
-
-  defp merge_out_of_order_segments([segment | rest]) do
-    rest
-    |> Enum.reduce([segment], &merge_out_of_order_segment/2)
-    |> Enum.reverse()
-  end
-
-  defp merge_out_of_order_segment({seq, seq_end, payload}, [
-         {current_seq, current_end, current_payload} | rest
-       ]) do
-    cond do
-      Sequence.gt?(seq, current_end) ->
-        [{seq, seq_end, payload}, {current_seq, current_end, current_payload} | rest]
-
-      Sequence.gt?(seq_end, current_end) ->
-        overlap = Sequence.distance(seq, current_end)
-        tail_len = byte_size(payload) - overlap
-        tail = binary_part(payload, overlap, tail_len)
-        [{current_seq, seq_end, current_payload <> tail} | rest]
-
-      true ->
-        [{current_seq, current_end, current_payload} | rest]
-    end
-  end
-
-  defp drain_out_of_order_segments(%__MODULE__{} = state) do
-    {drained_state, remaining} =
-      Enum.reduce(state.out_of_order_segments, {state, []}, fn
-        {seq, seq_end, payload},
-        {%__MODULE__{tcb: %Tcb{rcv_nxt: rcv_nxt}} = acc_state, remaining} ->
-          if seq == rcv_nxt do
-            new_state = %{
-              acc_state
-              | recv_buffer: acc_state.recv_buffer <> payload,
-                tcb: Tcb.receive_next(acc_state.tcb, seq_end)
-            }
-
-            {new_state, remaining}
-          else
-            {acc_state, [{seq, seq_end, payload} | remaining]}
-          end
-      end)
-
-    %{drained_state | out_of_order_segments: Enum.reverse(remaining)}
   end
 
   defp window_scale_for(size) when is_integer(size) and size > @max_window do
@@ -3215,12 +3151,6 @@ defmodule Tricep.Socket do
   defp reject_unacceptable_segment(state) do
     send_ack(state.tcb.rcv_nxt, state)
     {:keep_state, state, []}
-  end
-
-  defp ack_unacceptable_segment(state, ack?, ack, window) do
-    {new_state, actions} = process_ack_if_present(state, ack?, ack, window)
-    send_ack(new_state.tcb.rcv_nxt, new_state)
-    {:keep_state, new_state, actions}
   end
 
   defp process_ack(state, ack, window) do
