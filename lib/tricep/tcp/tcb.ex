@@ -171,6 +171,18 @@ defmodule Tricep.Tcp.Tcb do
     max(0, tcb.snd_wnd - bytes_in_flight)
   end
 
+  # Returns whether a quoted TCP sequence number identifies data that is still
+  # in flight. ICMP error handling uses this to reject forged and stale
+  # reports; the comparison is deliberately half-open, as required by RFC
+  # 5927 section 4.1.
+  @spec in_flight?(t(), sequence()) :: boolean()
+  def in_flight?(%__MODULE__{snd_una: send_unacknowledged, snd_nxt: send_next}, sequence)
+      when is_integer(send_unacknowledged) and is_integer(send_next) and is_integer(sequence) do
+    Sequence.gte?(sequence, send_unacknowledged) and Sequence.lt?(sequence, send_next)
+  end
+
+  def in_flight?(%__MODULE__{}, _sequence), do: false
+
   # Requires initialized receive sequence and window fields.
   def refresh_receive_window(%__MODULE__{} = tcb, available_window, opts \\ []) do
     scale = receive_window_scale(tcb)

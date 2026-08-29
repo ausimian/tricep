@@ -14,6 +14,7 @@ defmodule Tricep.Socket do
   alias Tricep.Tcp.Synchronized
   alias Tricep.Tcp.Tcb
 
+  require Logger
   require Tcp
 
   @type socket_timeout :: non_neg_integer() | :infinity | :nowait
@@ -119,19 +120,33 @@ defmodule Tricep.Socket do
   def handle_icmpv6_error(
         src_addr,
         dst_addr,
-        <<src_port::16, dst_port::16, _::binary>>,
+        <<src_port::16, dst_port::16, sequence::32, rest::binary>>,
         event
       ) do
     pair = {{src_addr, src_port}, {dst_addr, dst_port}}
 
     if pid = Application.lookup_socket_pair(pair) do
-      send(pid, {:icmpv6_error, event})
+      send(pid, {:icmpv6_error, event, quoted_tcp_details(sequence, rest)})
+    else
+      Logger.debug("Ignoring ICMPv6 error for an unmatched TCP socket tuple")
     end
 
     :ok
   end
 
   def handle_icmpv6_error(_src_addr, _dst_addr, _segment, _event), do: :ok
+
+  # ICMPv6 quotes normally include the complete TCP header, but RFC 5927 only
+  # needs the sequence number. Handshake errors additionally require the SYN
+  # bit, so a truncated quote can never abort a pending connection.
+  defp quoted_tcp_details(
+         sequence,
+         <<_acknowledgment::32, _data_offset::4, _reserved::4, flags::8, _::binary>>
+       ) do
+    %{seq: sequence, syn?: (flags &&& 0x02) != 0}
+  end
+
+  defp quoted_tcp_details(sequence, _rest), do: %{seq: sequence, syn?: false}
 
   def child_spec(opts) do
     %{
@@ -213,6 +228,9 @@ defmodule Tricep.Socket do
     field :rto_ms, non_neg_integer(), default: 1_000
     # Whether the RTO timer is currently active
     field :rto_timer_active, boolean(), default: false
+    # Applicable ICMPv6 hard errors can be advisory. Keep the latest reason
+    # so retry exhaustion can report useful context.
+    field :soft_error, atom() | nil, default: nil
     # Zero-window persist timer state
     field :persist_timer_active, boolean(), default: false
     field :persist_timeout_ms, non_neg_integer(), default: @initial_persist_timeout_ms
@@ -422,6 +440,14 @@ defmodule Tricep.Socket do
     {:keep_state, remove_listen_child(listen_data, child)}
   end
 
+  def handle_event(:info, {:passive_failed, child, reason}, :listen, listen_data) do
+    Logger.debug(
+      "Passive TCP handshake failed after SYN-ACK retry exhaustion: #{inspect(reason)}"
+    )
+
+    {:keep_state, remove_listen_child(listen_data, child)}
+  end
+
   def handle_event(:info, {:DOWN, ref, :process, child, _reason}, :listen, listen_data) do
     case Map.get(listen_data.children, child) do
       {^ref, _status} ->
@@ -538,7 +564,8 @@ defmodule Tricep.Socket do
       state
       | tcb: Tcb.begin_active_open(state.tcb, iss, syn_window),
         syn_retransmit_count: 0,
-        rto_ms: @initial_rto_ms
+        rto_ms: @initial_rto_ms,
+        soft_error: nil
     }
 
     case timeout do
@@ -639,7 +666,7 @@ defmodule Tricep.Socket do
       :acceptable_reset ->
         reset_state(state)
         notify_passive_listener(state, :passive_failed)
-        {:next_state, :closed, closed_data(state), {{:timeout, :rto}, :cancel}}
+        {:stop, :normal}
 
       :challenge_ack ->
         send_challenge_ack(state)
@@ -669,9 +696,10 @@ defmodule Tricep.Socket do
 
   def handle_event({:timeout, :rto}, :syn_ack_timeout, :syn_received, %__MODULE__{} = state) do
     if state.syn_retransmit_count >= @max_retransmit_count do
+      reason = retry_exhaustion_error(state)
       reset_state(state)
-      notify_passive_listener(state, :passive_failed)
-      {:next_state, :closed, closed_data(state)}
+      notify_passive_listener(state, {:passive_failed, reason})
+      {:stop, :normal}
     else
       retransmit_syn_ack(state)
     end
@@ -688,7 +716,12 @@ defmodule Tricep.Socket do
     if state.syn_retransmit_count >= @max_retransmit_count do
       # Max retries exceeded - connection failure
       reset_state(state)
-      actions = [{{:timeout, :connect_timeout}, :cancel}, {:reply, from, {:error, :etimedout}}]
+
+      actions = [
+        {{:timeout, :connect_timeout}, :cancel},
+        {:reply, from, {:error, retry_exhaustion_error(state)}}
+      ]
+
       {:next_state, :closed, closed_data(state), actions}
     else
       retransmit_syn(state, {:syn_timeout, from})
@@ -705,7 +738,7 @@ defmodule Tricep.Socket do
       ) do
     if state.syn_retransmit_count >= @max_retransmit_count do
       # Max retries exceeded - notify caller so a retry can complete with the stored error.
-      {state_name, state_data} = nowait_connect_failure(state, :etimedout)
+      {state_name, state_data} = nowait_connect_failure(state, retry_exhaustion_error(state))
       {:next_state, state_name, state_data}
     else
       retransmit_syn(state, :syn_timeout_nowait)
@@ -932,71 +965,19 @@ defmodule Tricep.Socket do
 
   def handle_event(
         :info,
-        {:icmpv6_error, {:packet_too_big, mtu}},
+        {:icmpv6_error, event, quoted_tcp},
         state_name,
-        %__MODULE__{} = state
-      )
-      when state_name in [:established, :close_wait] do
-    {new_state, actions} = apply_path_mtu(state, mtu)
-    {:keep_state, new_state, actions}
-  end
-
-  def handle_event(
-        :info,
-        {:icmpv6_error, {:packet_too_big, mtu}},
-        state_name,
-        %__MODULE__{} = state
-      )
-      when state_name in [:fin_wait_1, :fin_wait_2, :closing, :last_ack] do
-    {new_state, _actions} = apply_path_mtu(state, mtu)
-    {:keep_state, new_state}
-  end
-
-  def handle_event(
-        :info,
-        {:icmpv6_error, {:hard, reason}},
-        {:syn_sent, from},
-        %__MODULE__{} = state
-      )
-      when is_tuple(from) do
-    reset_state(state)
-
-    actions = [
-      {{:timeout, :rto}, :cancel},
-      {{:timeout, :connect_timeout}, :cancel},
-      {:reply, from, {:error, reason}}
-    ]
-
-    {:next_state, :closed, closed_data(state), actions}
-  end
-
-  def handle_event(
-        :info,
-        {:icmpv6_error, {:hard, reason}},
-        {:syn_sent, :nowait},
         %__MODULE__{} = state
       ) do
-    {state_name, state_data} = nowait_connect_failure(state, reason)
-    {:next_state, state_name, state_data, {{:timeout, :rto}, :cancel}}
-  end
-
-  def handle_event(
-        :info,
-        {:icmpv6_error, {:hard, reason}},
-        state_name,
-        %__MODULE__{} = state
+    if applicable_icmpv6_quote?(quoted_tcp, state_name, state) do
+      apply_icmpv6_error(event, state_name, state)
+    else
+      Logger.debug(
+        "Ignoring inapplicable ICMPv6 #{inspect(event)} quote in #{inspect(state_name)} state"
       )
-      when state_name in [
-             :established,
-             :close_wait,
-             :fin_wait_1,
-             :fin_wait_2,
-             :closing,
-             :last_ack
-           ] do
-    reset_state(state)
-    actions = notify_waiters_error(state, reason)
-    {:next_state, :closed, closed_data(state), actions}
+
+      :keep_state_and_data
+    end
   end
 
   # --- Active close from established ---
@@ -1439,16 +1420,20 @@ defmodule Tricep.Socket do
   end
 
   defp handle_established_received_fin(receive_state, ack?, ack, window, recv_actions) do
+    acknowledged_new_data? =
+      ack? and Sequence.gt?(ack, receive_state.tcb.snd_una) and
+        Sequence.lte?(ack, receive_state.tcb.snd_nxt)
+
     send_unacknowledged =
-      if ack? and Sequence.gt?(ack, receive_state.tcb.snd_una) and
-           Sequence.lte?(ack, receive_state.tcb.snd_nxt),
-         do: ack,
-         else: receive_state.tcb.snd_una
+      if acknowledged_new_data?,
+        do: ack,
+        else: receive_state.tcb.snd_una
 
     # Preserve legacy FIN-carried ACK bookkeeping; bug #121 owns its fix.
     receive_state = %{
       receive_state
-      | tcb: Tcb.acknowledge(receive_state.tcb, send_unacknowledged, window)
+      | tcb: Tcb.acknowledge(receive_state.tcb, send_unacknowledged, window),
+        soft_error: if(acknowledged_new_data?, do: nil, else: receive_state.soft_error)
     }
 
     transition_established_after_fin(receive_state, recv_actions)
@@ -1743,6 +1728,7 @@ defmodule Tricep.Socket do
       },
       recv_buffer_size: recv_buffer_size,
       rto_ms: @initial_rto_ms,
+      soft_error: nil,
       syn_retransmit_count: 0,
       fin_wait_2_timeout_ms: configured_fin_wait_2_timeout_ms(socket_opts),
       challenge_ack_limiter: configured_challenge_ack_limiter(socket_opts),
@@ -1894,6 +1880,7 @@ defmodule Tricep.Socket do
         rcv_wnd: recv_buffer_size,
         rcv_wnd_scale: window_scale_for(recv_buffer_size)
       },
+      soft_error: nil,
       recv_buffer_size: recv_buffer_size,
       fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(data),
       challenge_ack_limiter: challenge_ack_limiter(data)
@@ -1906,14 +1893,18 @@ defmodule Tricep.Socket do
 
   defp remove_listen_child(listen_data, child) do
     case Map.pop(listen_data.children, child) do
-      {{_ref, :pending}, children} ->
+      {{ref, :pending}, children} ->
+        Process.demonitor(ref, [:flush])
+
         %{
           listen_data
           | children: children,
             pending_count: max(0, listen_data.pending_count - 1)
         }
 
-      {{_ref, :queued}, children} ->
+      {{ref, :queued}, children} ->
+        Process.demonitor(ref, [:flush])
+
         %{
           listen_data
           | children: children,
@@ -2028,6 +2019,14 @@ defmodule Tricep.Socket do
     {:keep_state, new_state, {{:timeout, :rto}, new_rto, :syn_ack_timeout}}
   end
 
+  defp notify_passive_listener(
+         %__MODULE__{passive_listener: listener},
+         {:passive_failed, reason}
+       )
+       when is_pid(listener) do
+    send(listener, {:passive_failed, self(), reason})
+  end
+
   defp notify_passive_listener(%__MODULE__{passive_listener: listener}, message)
        when is_pid(listener) do
     send(listener, {message, self()})
@@ -2065,7 +2064,7 @@ defmodule Tricep.Socket do
     if count >= @max_retransmit_count do
       # Max retries exceeded - connection failure
       reset_state(state)
-      actions = notify_waiters_error(state, :etimedout)
+      actions = notify_waiters_error(state, retry_exhaustion_error(state))
       {:next_state, :closed, closed_data(state), actions}
     else
       send_fin_segment(state, seq)
@@ -2097,7 +2096,7 @@ defmodule Tricep.Socket do
     if count >= @max_retransmit_count do
       # Max retries exceeded - connection failure
       reset_state(state)
-      actions = notify_waiters_error(state, :etimedout)
+      actions = notify_waiters_error(state, retry_exhaustion_error(state))
       {:next_state, :closed, closed_data(state), actions}
     else
       # Retransmit the oldest unacked segment
@@ -2135,6 +2134,12 @@ defmodule Tricep.Socket do
       {:keep_state, new_state, actions}
     end
   end
+
+  defp retry_exhaustion_error(%__MODULE__{soft_error: error})
+       when is_atom(error) and not is_nil(error),
+       do: error
+
+  defp retry_exhaustion_error(%__MODULE__{}), do: :etimedout
 
   defp handle_recv_call(%__MODULE__{} = state, from, length, timeout) do
     case deliver_data(state.recv_buffer, length) do
@@ -2336,6 +2341,106 @@ defmodule Tricep.Socket do
 
   defp closed_data(%__MODULE__{socket_opts: socket_opts}), do: %{socket_opts: socket_opts}
 
+  # RFC 5927 section 4.1 recommends accepting ICMP errors only when their
+  # quoted TCP sequence falls within SND.UNA =< SEG.SEQ < SND.NXT. During the
+  # handshake the only in-flight segment is the SYN or SYN-ACK, so require
+  # both its exact sequence and the SYN control bit.
+  defp applicable_icmpv6_quote?(
+         %{seq: sequence, syn?: true},
+         {:syn_sent, _from},
+         %__MODULE__{tcb: %Tcb{iss: iss} = tcb}
+       ) do
+    sequence == iss and Tcb.in_flight?(tcb, sequence)
+  end
+
+  defp applicable_icmpv6_quote?(
+         %{seq: sequence, syn?: true},
+         :syn_received,
+         %__MODULE__{tcb: %Tcb{iss: iss} = tcb}
+       ) do
+    sequence == iss and Tcb.in_flight?(tcb, sequence)
+  end
+
+  defp applicable_icmpv6_quote?(%{seq: sequence}, state_name, %__MODULE__{tcb: tcb})
+       when state_name in [
+              :established,
+              :close_wait,
+              :fin_wait_1,
+              :fin_wait_2,
+              :closing,
+              :last_ack
+            ] do
+    Tcb.in_flight?(tcb, sequence)
+  end
+
+  defp applicable_icmpv6_quote?(_quoted_tcp, _state_name, _state), do: false
+
+  defp apply_icmpv6_error({:packet_too_big, mtu}, state_name, %__MODULE__{} = state)
+       when state_name in [:established, :close_wait] do
+    {new_state, actions} = apply_path_mtu(state, mtu)
+    {:keep_state, new_state, actions}
+  end
+
+  defp apply_icmpv6_error({:packet_too_big, mtu}, state_name, %__MODULE__{} = state)
+       when state_name in [:fin_wait_1, :fin_wait_2, :closing, :last_ack] do
+    {new_state, _actions} = apply_path_mtu(state, mtu)
+    {:keep_state, new_state}
+  end
+
+  defp apply_icmpv6_error({:hard, reason}, {:syn_sent, from}, %__MODULE__{} = state)
+       when is_tuple(from) do
+    Logger.debug("Applying ICMPv6 hard error #{inspect(reason)} during active handshake")
+    reset_state(state)
+
+    actions = [
+      {{:timeout, :rto}, :cancel},
+      {{:timeout, :connect_timeout}, :cancel},
+      {:reply, from, {:error, reason}}
+    ]
+
+    {:next_state, :closed, closed_data(state), actions}
+  end
+
+  defp apply_icmpv6_error({:hard, reason}, {:syn_sent, :nowait}, %__MODULE__{} = state) do
+    Logger.debug("Applying ICMPv6 hard error #{inspect(reason)} during active handshake")
+    {state_name, state_data} = nowait_connect_failure(state, reason)
+    {:next_state, state_name, state_data, {{:timeout, :rto}, :cancel}}
+  end
+
+  defp apply_icmpv6_error({:soft, reason}, {:syn_sent, _from}, %__MODULE__{} = state) do
+    Logger.debug("Recording ICMPv6 soft error #{inspect(reason)} during active handshake")
+    {:keep_state, %{state | soft_error: reason}}
+  end
+
+  defp apply_icmpv6_error({classification, reason}, :syn_received, %__MODULE__{} = state)
+       when classification in [:hard, :soft] do
+    # The SYN-ACK remains subject to the existing retransmission budget. Do
+    # not let an unauthenticated ICMPv6 error tear down the pending child.
+    Logger.debug("Recording ICMPv6 soft error #{inspect(reason)} during passive handshake")
+    {:keep_state, %{state | soft_error: reason}}
+  end
+
+  defp apply_icmpv6_error({classification, reason}, state_name, %__MODULE__{} = state)
+       when classification in [:hard, :soft] and
+              state_name in [
+                :established,
+                :close_wait,
+                :fin_wait_1,
+                :fin_wait_2,
+                :closing,
+                :last_ack
+              ] do
+    # RFC 5927 section 5.2: synchronized connections treat matching ICMP
+    # destination-unreachable, time-exceeded, and parameter-problem reports
+    # as soft errors. TCP retransmission remains responsible for failure. A
+    # TCP user-timeout/keepalive liveness policy is owned by #130. Idle
+    # connections intentionally do not accept four-tuple-only ICMP errors.
+    Logger.debug("Recording ICMPv6 soft error #{inspect(reason)} in #{state_name} state")
+    {:keep_state, %{state | soft_error: reason}}
+  end
+
+  defp apply_icmpv6_error(_event, _state_name, _state), do: :keep_state_and_data
+
   defp reset_connection(%__MODULE__{} = state, error, timer_actions \\ []) do
     reset_state(state)
     actions = timer_actions ++ notify_waiters_error(state, error)
@@ -2447,6 +2552,7 @@ defmodule Tricep.Socket do
         | tcb: Tcb.acknowledge(state.tcb, acknowledgment, window),
           syn_retransmit_count: 0,
           rto_ms: @initial_rto_ms,
+          soft_error: nil,
           passive_listener: nil
       }
       |> open_receive_window()
@@ -2481,7 +2587,8 @@ defmodule Tricep.Socket do
             }
           ),
         syn_retransmit_count: 0,
-        rto_ms: @initial_rto_ms
+        rto_ms: @initial_rto_ms,
+        soft_error: nil
     }
     |> open_receive_window()
   end
@@ -3048,6 +3155,10 @@ defmodule Tricep.Socket do
 
     case Tcb.update_send_mss_for_path_mtu(state.tcb, new_mss, @default_mss) do
       {:reduced, tcb} ->
+        Logger.info(
+          "ICMPv6 Packet Too Big mtu=#{mtu} reduced TCP send MSS from #{state.tcb.snd_mss} to #{tcb.snd_mss}"
+        )
+
         new_state = %{
           state
           | tcb: tcb,
@@ -3170,7 +3281,8 @@ defmodule Tricep.Socket do
           state
           | tcb: Tcb.acknowledge(state.tcb, ack, window),
             unacked_segments: new_unacked,
-            rto_ms: @initial_rto_ms
+            rto_ms: @initial_rto_ms,
+            soft_error: nil
         }
 
         # Check if window opened and we have send_waiters

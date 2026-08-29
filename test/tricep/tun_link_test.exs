@@ -87,27 +87,42 @@ defmodule Tricep.TunLinkTest do
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
     end
 
-    test "Packet Too Big below IPv6 minimum is logged and clamps TCP send MSS", %{
+    test "a truncated RFC 4443 Packet Too Big quote clamps TCP send MSS", %{
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
       socket = establish_connection(local_addr, remote_addr)
-      {quoted_packet, _state} = quoted_tcp_packet(socket)
 
-      icmp = icmpv6_error(local_addr, remote_addr, 2, 0, 1200, quoted_packet)
+      :sys.replace_state(socket, fn
+        {:established, state} ->
+          {:established, %{state | tcb: %{state.tcb | snd_mss: 1460}}}
+      end)
+
+      original_packet = send_data_and_capture(socket, :binary.copy("x", 1400))
+      quoted_packet = truncate_quoted_packet(original_packet)
+
+      assert byte_size(quoted_packet) == 1232
+      assert Ip.parse(quoted_packet) == {:error, :invalid_payload_length}
+
+      assert {:ok, %{payload_length: 1420, payload: quoted_payload}} =
+               Ip.parse_quoted(quoted_packet)
+
+      assert byte_size(quoted_payload) == 1192
+
+      icmp = icmpv6_error(local_addr, remote_addr, 2, 0, 1300, quoted_packet)
       packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
 
       log =
         capture_log(fn ->
           assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
+
+          wait_for_socket(socket, fn
+            {:established, %{tcb: %{snd_mss: 1240}}} -> true
+            _state -> false
+          end)
         end)
 
-      assert log =~ "ICMPv6 Packet Too Big mtu=1200"
-
-      wait_for_socket(socket, fn
-        {:established, %{tcb: %{snd_mss: 1220}}} -> true
-        _state -> false
-      end)
+      assert log =~ "[info] ICMPv6 Packet Too Big mtu=1300 reduced TCP send MSS from 1460 to 1240"
     end
 
     test "drops ICMPv6 error with invalid checksum without applying it", %{
@@ -129,20 +144,101 @@ defmodule Tricep.TunLinkTest do
 
       packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
 
-      log =
-        capture_log(fn ->
-          assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
-        end)
-
-      assert log =~ "Ignoring ICMPv6 packet with invalid checksum"
+      assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
       assert {:established, %{tcb: %{snd_mss: 1460}}} = :sys.get_state(socket)
     end
 
-    test "Destination Unreachable closes affected TCP socket and notifies waiters", %{
+    test "a forged out-of-flight Packet Too Big leaves send MSS unchanged", %{
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
       socket = establish_connection(local_addr, remote_addr)
+
+      :sys.replace_state(socket, fn
+        {:established, state} ->
+          {:established, %{state | tcb: %{state.tcb | snd_mss: 1460}}}
+      end)
+
+      quoted_packet = send_data_and_capture(socket, :binary.copy("x", 1400))
+      {:established, state} = :sys.get_state(socket)
+
+      forged_quote = replace_quoted_tcp_sequence(quoted_packet, state.tcb.snd_nxt)
+      icmp = icmpv6_error(local_addr, remote_addr, 2, 0, 1300, forged_quote)
+      packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
+
+      log =
+        capture_log([level: :debug], fn ->
+          assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
+          assert {:established, %{tcb: %{snd_mss: 1460}}} = :sys.get_state(socket)
+        end)
+
+      assert log =~ "[debug] Ignoring inapplicable ICMPv6 {:packet_too_big, 1300} quote"
+      refute log =~ "[info] ICMPv6 Packet Too Big"
+      assert {:established, %{tcb: %{snd_mss: 1460}}} = :sys.get_state(socket)
+    end
+
+    test "rejects a stale Packet Too Big quote after its data is acknowledged", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(local_addr, remote_addr)
+
+      :sys.replace_state(socket, fn
+        {:established, state} ->
+          {:established, %{state | tcb: %{state.tcb | snd_mss: 1460}}}
+      end)
+
+      original_packet = send_data_and_capture(socket, :binary.copy("x", 1400))
+      quoted_packet = truncate_quoted_packet(original_packet)
+      {:established, sent_state} = :sys.get_state(socket)
+      acknowledgement = acknowledge_quoted_packet(original_packet, sent_state)
+
+      assert TunLink.handle_ip_packet(acknowledgement, tun_state()) == @read_tun_again
+
+      wait_for_socket(socket, fn
+        {:established, %{tcb: %{snd_una: send_unacknowledged, snd_nxt: send_next}}} ->
+          send_unacknowledged == send_next
+
+        _state ->
+          false
+      end)
+
+      icmp = icmpv6_error(local_addr, remote_addr, 2, 0, 1300, quoted_packet)
+      packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
+
+      assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
+      assert {:established, %{tcb: %{snd_mss: 1460}}} = :sys.get_state(socket)
+    end
+
+    test "a Packet Too Big for an unmatched four-tuple leaves sockets unchanged", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(local_addr, remote_addr)
+
+      :sys.replace_state(socket, fn
+        {:established, state} ->
+          {:established, %{state | tcb: %{state.tcb | snd_mss: 1460}}}
+      end)
+
+      quoted_packet = send_data_and_capture(socket, :binary.copy("x", 1400))
+      unmatched_quote = replace_quoted_tcp_source_port(quoted_packet, 0)
+      icmp = icmpv6_error(local_addr, remote_addr, 2, 0, 1300, unmatched_quote)
+
+      assert TunLink.handle_ip_packet(
+               Ip.wrap(local_addr, remote_addr, :icmpv6, icmp),
+               tun_state()
+             ) == @read_tun_again
+
+      assert {:established, %{tcb: %{snd_mss: 1460}}} = :sys.get_state(socket)
+    end
+
+    test "records applicable ICMPv6 errors as soft after synchronization", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(local_addr, remote_addr)
+      quoted_packet = send_data_and_capture(socket)
 
       recv_task = Task.async(fn -> Tricep.recv(socket, 0, :infinity) end)
 
@@ -151,18 +247,129 @@ defmodule Tricep.TunLinkTest do
         _state -> false
       end)
 
-      {quoted_packet, _state} = quoted_tcp_packet(socket)
-      icmp = icmpv6_error(local_addr, remote_addr, 1, 0, 0, quoted_packet)
-      packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
+      for {type, code, word, reason} <- [
+            {1, 0, 0, :enetunreach},
+            {3, 0, 0, :etimedout},
+            {4, 0, 0, :eproto}
+          ] do
+        icmp = icmpv6_error(local_addr, remote_addr, type, code, word, quoted_packet)
+        packet = Ip.wrap(local_addr, remote_addr, :icmpv6, icmp)
+        assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
 
-      log =
-        capture_log(fn ->
-          assert TunLink.handle_ip_packet(packet, tun_state()) == @read_tun_again
+        wait_for_socket(socket, fn
+          {:established, %{soft_error: ^reason}} -> true
+          _state -> false
+        end)
+      end
+
+      assert {:established, %{soft_error: :eproto}} = :sys.get_state(socket)
+      refute Task.yield(recv_task, 100)
+      Task.shutdown(recv_task, :brutal_kill)
+    end
+
+    test "requires a matching quoted SYN while an active open is pending", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
         end)
 
-      assert log =~ "ICMPv6 enetunreach"
-      assert Task.await(recv_task, 1000) == {:error, :enetunreach}
-      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+
+      forged_quote = replace_quoted_tcp_flags(syn_packet, 0)
+      forged_icmp = icmpv6_error(local_addr, remote_addr, 1, 1, 0, forged_quote)
+
+      assert TunLink.handle_ip_packet(
+               Ip.wrap(local_addr, remote_addr, :icmpv6, forged_icmp),
+               tun_state()
+             ) == @read_tun_again
+
+      refute Task.yield(task, 100)
+
+      valid_icmp = icmpv6_error(local_addr, remote_addr, 1, 1, 0, syn_packet)
+
+      assert TunLink.handle_ip_packet(
+               Ip.wrap(local_addr, remote_addr, :icmpv6, valid_icmp),
+               tun_state()
+             ) == @read_tun_again
+
+      assert Task.await(task, 1000) == {:error, :eacces}
+    end
+
+    test "keeps active open alive for matching soft ICMPv6 errors", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      for {type, code, word, reason} <- [{3, 0, 0, :etimedout}, {4, 0, 0, :eproto}] do
+        {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+        task =
+          Task.async(fn ->
+            Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+          end)
+
+        assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+
+        soft_icmp = icmpv6_error(local_addr, remote_addr, type, code, word, syn_packet)
+
+        assert TunLink.handle_ip_packet(
+                 Ip.wrap(local_addr, remote_addr, :icmpv6, soft_icmp),
+                 tun_state()
+               ) == @read_tun_again
+
+        wait_for_socket(socket, fn
+          {{:syn_sent, _}, %{soft_error: ^reason}} -> true
+          _state -> false
+        end)
+
+        refute Task.yield(task, 100)
+        assert_receive {:dummy_link_packet, _link, _syn_retransmission}, 1_500
+
+        assert {{:syn_sent, _}, %{syn_retransmit_count: 1, soft_error: ^reason}} =
+                 :sys.get_state(socket)
+
+        hard_icmp = icmpv6_error(local_addr, remote_addr, 1, 1, 0, syn_packet)
+
+        assert TunLink.handle_ip_packet(
+                 Ip.wrap(local_addr, remote_addr, :icmpv6, hard_icmp),
+                 tun_state()
+               ) == @read_tun_again
+
+        assert Task.await(task, 1_000) == {:error, :eacces}
+      end
+    end
+
+    test "accepts an in-flight Packet Too Big quote across sequence wrap", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(local_addr, remote_addr)
+
+      :sys.replace_state(socket, fn
+        {:established, state} ->
+          {:established,
+           %{
+             state
+             | tcb: %{state.tcb | snd_una: 0xFFFFFFFE, snd_nxt: 2, snd_mss: 1460}
+           }}
+      end)
+
+      {quoted_packet, _state} = quoted_tcp_packet(socket, 0)
+      icmp = icmpv6_error(local_addr, remote_addr, 2, 0, 1300, quoted_packet)
+
+      assert TunLink.handle_ip_packet(
+               Ip.wrap(local_addr, remote_addr, :icmpv6, icmp),
+               tun_state()
+             ) == @read_tun_again
+
+      wait_for_socket(socket, fn
+        {:established, %{tcb: %{snd_mss: 1240}}} -> true
+        _state -> false
+      end)
     end
 
     test "reassembles fragmented TCP packets before dispatch", %{
@@ -318,20 +525,65 @@ defmodule Tricep.TunLinkTest do
     socket
   end
 
-  defp quoted_tcp_packet(socket) do
+  defp quoted_tcp_packet(socket, sequence \\ nil, flags \\ [:ack]) do
     {:established, state} = :sys.get_state(socket)
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
+
+    sequence = sequence || state.tcb.snd_nxt
 
     tcp_segment =
       Tcp.build_segment(
         state.pair,
-        state.tcb.snd_nxt,
+        sequence,
         state.tcb.rcv_nxt,
-        [:ack],
+        flags,
         32768
       )
 
     {Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment), state}
+  end
+
+  defp send_data_and_capture(socket, data \\ "in-flight") do
+    assert Tricep.send(socket, data) == :ok
+    assert_receive {:dummy_link_packet, _link, data_packet}, 1000
+    data_packet
+  end
+
+  defp truncate_quoted_packet(packet), do: binary_part(packet, 0, 1232)
+
+  defp acknowledge_quoted_packet(quoted_packet, state) do
+    <<_ipv6_header::binary-size(40), tcp_segment::binary>> = quoted_packet
+    %{seq: sequence, payload: payload} = Tcp.parse_segment(tcp_segment)
+    {{src_addr, src_port}, {dst_addr, dst_port}} = state.pair
+
+    acknowledgment =
+      Tcp.build_segment(
+        {{dst_addr, dst_port}, {src_addr, src_port}},
+        state.tcb.rcv_nxt,
+        sequence + byte_size(payload),
+        [:ack],
+        32768
+      )
+
+    Ip.wrap(dst_addr, src_addr, :tcp, acknowledgment)
+  end
+
+  defp replace_quoted_tcp_sequence(
+         <<ipv6_and_ports::binary-size(44), _sequence::32, rest::binary>>,
+         sequence
+       ) do
+    <<ipv6_and_ports::binary, sequence::32, rest::binary>>
+  end
+
+  defp replace_quoted_tcp_source_port(
+         <<ipv6_header::binary-size(40), _source_port::16, rest::binary>>,
+         source_port
+       ) do
+    <<ipv6_header::binary, source_port::16, rest::binary>>
+  end
+
+  defp replace_quoted_tcp_flags(<<prefix::binary-size(53), _flags::8, rest::binary>>, flags) do
+    <<prefix::binary, flags::8, rest::binary>>
   end
 
   defp handle_fragment_packet(state, src, dst, identification, offset, more_fragments?, payload) do

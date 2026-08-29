@@ -60,6 +60,17 @@ defmodule Tricep.Tcp.TcbTest do
     assert Tcb.send_window_available(updated) == 4046
   end
 
+  test "accepts only in-flight sequences across the wrap boundary" do
+    tcb = %Tcb{snd_una: 0xFFFFFFFE, snd_nxt: 2}
+
+    assert Tcb.in_flight?(tcb, 0xFFFFFFFE)
+    assert Tcb.in_flight?(tcb, 0xFFFFFFFF)
+    assert Tcb.in_flight?(tcb, 0)
+    assert Tcb.in_flight?(tcb, 1)
+    refute Tcb.in_flight?(tcb, 2)
+    refute Tcb.in_flight?(tcb, 0xFFFFFFFD)
+  end
+
   test "only reduces send MSS for a smaller path MTU" do
     tcb = %Tcb{snd_mss: 1440}
 
