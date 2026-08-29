@@ -12,6 +12,7 @@ defmodule Tricep.MixProject do
       make_targets: ["all"],
       make_clean: ["clean"],
       deps: deps(),
+      aliases: aliases(),
       test_coverage: [tool: ExCoveralls, ignore_modules: ignored_coverage_modules()]
     ]
   end
@@ -19,6 +20,8 @@ defmodule Tricep.MixProject do
   def cli do
     [
       preferred_envs: [
+        precommit: :test,
+        precommit_checks: :test,
         coveralls: :test,
         "coveralls.detail": :test,
         "coveralls.post": :test,
@@ -56,9 +59,23 @@ defmodule Tricep.MixProject do
       {:typedstruct, "~> 0.5", runtime: false},
       {:elixir_make, "~> 0.9", runtime: false},
       {:castore, "~> 1.0", only: :test},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:excoveralls, "~> 0.18", only: :test},
       {:tundra, "~> 0.4.0"},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false}
+    ]
+  end
+
+  defp aliases do
+    [
+      precommit_checks: [
+        "compile --warnings-as-errors",
+        "deps.unlock --check-unused",
+        "cmd git diff --exit-code -- mix.lock",
+        "format --check-formatted",
+        "credo --strict"
+      ],
+      precommit: ["precommit_checks", "coveralls"]
     ]
   end
 end

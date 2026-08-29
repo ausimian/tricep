@@ -142,6 +142,7 @@ defmodule Tricep.TunLink do
   end
 
   defp handle_ipv6_payload(next_header, payload, src, dst, state) do
+    # credo:disable-for-next-line Credo.Check.Readability.WithSingleClause
     with {:ok, protocol, data} <- unwrap_ipv6_payload(next_header, payload) do
       handle_ipv6_packet(protocol, data, src, dst, state)
     else
@@ -315,6 +316,7 @@ defmodule Tricep.TunLink do
   end
 
   defp handle_reassembled_fragment(next_header, payload, src, dst, state) do
+    # credo:disable-for-next-line Credo.Check.Readability.WithSingleClause
     with {:ok, protocol, data} <- unwrap_ipv6_payload(next_header, payload) do
       handle_ipv6_packet(protocol, data, src, dst, state)
       read_tun_again(state)

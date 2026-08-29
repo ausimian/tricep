@@ -140,6 +140,23 @@ defmodule Tricep.TcpTest do
       assert data == payload
     end
 
+    test "ignores invalid option values" do
+      pair = {{@src_addr, 12345}, {@dst_addr, 80}}
+
+      segment =
+        Tcp.build_segment(pair, 1000, 0, [:syn], 65535,
+          mss: -1,
+          window_scale: 256,
+          timestamp: :invalid,
+          sack_blocks: [:invalid]
+        )
+
+      assert Tcp.parse_segment(segment).options == %{}
+
+      segment = Tcp.build_segment(pair, 1000, 0, [:syn], 65535, sack_blocks: :invalid)
+      assert Tcp.parse_segment(segment).options == %{}
+    end
+
     test "calculates non-zero checksum" do
       segment =
         Tcp.build_segment({{@src_addr, 12345}, {@dst_addr, 80}}, 1000, 0, [:syn], 65535)

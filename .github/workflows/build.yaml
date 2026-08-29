@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: Build and Test
+    name: Build and Test (${{ matrix.elixir }}, ${{ matrix.otp }})
     runs-on: ubuntu-latest
 
     strategy:
@@ -20,6 +20,10 @@ jobs:
             otp: '27.2'
           - elixir: '1.16.3'
             otp: '27.2'
+        include:
+          - elixir: '1.19.5'
+            otp: '28.3'
+            coverage: true
 
     steps:
       - uses: actions/checkout@v6
@@ -40,13 +44,22 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
-      - name: Compile
-        run: mix compile --warnings-as-errors
+      - name: Run compile and lint checks
+        if: ${{ !matrix.coverage }}
+        run: mix precommit_checks
 
-      - name: Check formatting
-        run: mix format --check-formatted
+      - name: Run tests
+        if: ${{ !matrix.coverage }}
+        run: mix test
 
-      - name: Run tests with coverage
+      - name: Run full pre-commit checks with coverage threshold
+        if: matrix.coverage
+        run: mix precommit
+
+      # coveralls.github uploads a fresh run but does not enforce minimum_coverage;
+      # the canonical leg's mix precommit above owns the 80% threshold.
+      - name: Upload coverage
+        if: matrix.coverage
         run: mix coveralls.github
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

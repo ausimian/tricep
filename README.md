@@ -22,6 +22,34 @@ Tricep connects to TUN devices (or other transports) via a Link abstraction and 
 - Linux (macOS support planned)
 - Root or `CAP_NET_ADMIN` for TUN device creation
 
+## Development
+
+Install dependencies and run the complete verification suite before committing:
+
+```console
+mix deps.get
+mix precommit
+```
+
+The preferred development toolchain is pinned in `.tool-versions` at Elixir
+1.19.5 / OTP 28.3. This is also the canonical CI coverage toolchain, so local
+and gated coverage use the same compiler. Both mise and asdf can install these
+versions from that file.
+
+`mix precommit` compiles with warnings treated as errors, verifies that the
+dependency lockfile has no unused entries or unstaged changes, checks
+formatting, runs Credo in strict mode, and runs the test suite with the
+configured minimum coverage threshold. Stage an intentional `mix.lock` update
+before running the gate so it can verify the update will be committed.
+
+`mix precommit_checks` is the compile-and-lint subset used internally by
+non-canonical CI matrix jobs; it is not a replacement for the complete local
+gate. CI enforces the 80% coverage threshold with `mix precommit` on the
+explicitly flagged coverage job, then runs the suite again to publish that
+job's coverage to Coveralls. Other supported Elixir/OTP jobs pair
+`mix precommit_checks` with plain `mix test` so compiler-specific coverage line
+attribution cannot make legacy toolchains fail the canonical coverage gate.
+
 ## Usage
 
 ```elixir
