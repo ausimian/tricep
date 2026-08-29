@@ -288,7 +288,8 @@ defmodule Tricep.SocketTest do
 
       :sys.replace_state(socket, fn
         {{:syn_sent, from}, state} when is_tuple(from) ->
-          {{:syn_sent, from}, %{state | iss: 0xFFFFFFFF, snd_una: 0xFFFFFFFF, snd_nxt: 0}}
+          {{:syn_sent, from},
+           %{state | tcb: %{state.tcb | iss: 0xFFFFFFFF, snd_una: 0xFFFFFFFF, snd_nxt: 0}}}
       end)
 
       server_seq = 5000
@@ -305,7 +306,9 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, syn_ack_segment)
 
       assert Task.await(task, 1000) == :ok
-      assert {:established, %{snd_una: 0, snd_nxt: 0, rcv_nxt: 5001}} = :sys.get_state(socket)
+
+      assert {:established, %{tcb: %{snd_una: 0, snd_nxt: 0, rcv_nxt: 5001}}} =
+               :sys.get_state(socket)
 
       assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
       <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
@@ -543,6 +546,21 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, syn_only)
 
+      # An ACK at the expected number is not a SYN-ACK and is ignored rather
+      # than reset. This characterizes the SYN_SENT distinction between a
+      # malformed handshake response and a bare ACK.
+      ack_only =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          1001,
+          syn_parsed.seq + 1,
+          [:ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, ack_only)
+      refute_receive {:dummy_link_packet, _link, _packet}, 50
+
       # Socket should still be waiting - send proper SYN-ACK
       syn_ack_segment =
         Tcp.build_segment(
@@ -699,7 +717,7 @@ defmodule Tricep.SocketTest do
 
       assert {:established, state} = :sys.get_state(accepted)
       assert state.pair == {{remote_addr, @port}, {local_addr, client_port}}
-      assert state.snd_mss == 1000
+      assert state.tcb.snd_mss == 1000
 
       assert Tricep.send(accepted, "ok") == :ok
       assert_receive {:dummy_link_packet, _link, data_packet}, 1000
@@ -908,8 +926,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.rcv_nxt,
-          state.snd_nxt,
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "corrupt data"
@@ -920,7 +938,7 @@ defmodule Tricep.SocketTest do
       assert Tricep.recv(socket, 0, 20) == {:error, :timeout}
 
       {:established, after_state} = :sys.get_state(socket)
-      assert after_state.rcv_nxt == state.rcv_nxt
+      assert after_state.tcb.rcv_nxt == state.tcb.rcv_nxt
       assert after_state.recv_buffer == <<>>
     end
 
@@ -942,8 +960,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.rcv_nxt,
-          state.snd_nxt,
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
           [:ack],
           32768
         )
@@ -951,7 +969,7 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, corrupt_checksum(ack_segment))
 
       {:established, after_state} = :sys.get_state(socket)
-      assert after_state.snd_una == state.snd_una
+      assert after_state.tcb.snd_una == state.tcb.snd_una
       assert after_state.unacked_segments == state.unacked_segments
     end
 
@@ -1044,8 +1062,8 @@ defmodule Tricep.SocketTest do
       # after the fixed IPv6 and TCP headers.
       # gen_statem returns {state_name, state_data}
       {:established, state} = :sys.get_state(socket)
-      assert state.snd_mss == 1440
-      assert state.rcv_mss == 1440
+      assert state.tcb.snd_mss == 1440
+      assert state.tcb.rcv_mss == 1440
 
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
       assert Tricep.send(socket, :binary.copy("x", 1441)) == :ok
@@ -1093,7 +1111,9 @@ defmodule Tricep.SocketTest do
       assert Task.await(task, 1000) == :ok
 
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
-      assert {:established, %{rcv_mss: 65_515, snd_mss: 65_515}} = :sys.get_state(socket)
+
+      assert {:established, %{tcb: %{rcv_mss: 65_515, snd_mss: 65_515}}} =
+               :sys.get_state(socket)
 
       assert Tricep.send(socket, :binary.copy("x", 65_516)) == :ok
       assert_receive {:dummy_link_packet, _link, packet1}, 1000
@@ -1115,7 +1135,7 @@ defmodule Tricep.SocketTest do
       socket = establish_connection(link, local_addr, remote_addr, mss: 0)
 
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
-      assert {:established, %{snd_mss: 48}} = :sys.get_state(socket)
+      assert {:established, %{tcb: %{snd_mss: 48}}} = :sys.get_state(socket)
 
       payload = :binary.copy("x", 49)
       assert Tricep.send(socket, payload) == :ok
@@ -1144,7 +1164,7 @@ defmodule Tricep.SocketTest do
       socket = establish_connection(link, local_addr, remote_addr, mss: 1)
 
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
-      assert {:established, %{snd_mss: 48}} = :sys.get_state(socket)
+      assert {:established, %{tcb: %{snd_mss: 48}}} = :sys.get_state(socket)
 
       payload = :binary.copy("x", 49)
       assert Tricep.send(socket, payload) == :ok
@@ -1170,7 +1190,7 @@ defmodule Tricep.SocketTest do
         socket = establish_connection(link, local_addr, remote_addr, mss: peer_mss)
 
         assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
-        assert {:established, %{snd_mss: ^expected_mss}} = :sys.get_state(socket)
+        assert {:established, %{tcb: %{snd_mss: ^expected_mss}}} = :sys.get_state(socket)
       end
     end
 
@@ -1193,7 +1213,7 @@ defmodule Tricep.SocketTest do
       assert {:ok, accepted} = Task.await(accept_task, 1000)
       on_exit(fn -> stop_socket(accepted) end)
 
-      assert {:established, %{snd_mss: 48}} = :sys.get_state(accepted)
+      assert {:established, %{tcb: %{snd_mss: 48}}} = :sys.get_state(accepted)
       assert Tricep.close(listener) == :ok
     end
 
@@ -1233,7 +1253,7 @@ defmodule Tricep.SocketTest do
       # Check that the socket defaulted to 1220 (IPv6 min MTU 1280 - 60 headers)
       # gen_statem returns {state_name, state_data}
       {:established, state} = :sys.get_state(socket)
-      assert state.snd_mss == 1220
+      assert state.tcb.snd_mss == 1220
     end
 
     test "SYN advertises an unscaled maximum window with a non-zero scale offer" do
@@ -1291,10 +1311,10 @@ defmodule Tricep.SocketTest do
 
       {:established, state} = :sys.get_state(socket)
 
-      assert state.snd_wnd_scale == 4
-      assert state.rcv_wnd_scale == 4
-      assert state.window_scaling_negotiated
-      assert state.snd_wnd == 65_535
+      assert state.tcb.snd_wnd_scale == 4
+      assert state.tcb.rcv_wnd_scale == 4
+      assert state.tcb.window_scaling_negotiated
+      assert state.tcb.snd_wnd == 65_535
 
       assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
       <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
@@ -1305,14 +1325,14 @@ defmodule Tricep.SocketTest do
       window_update =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.rcv_nxt,
-          state.snd_nxt,
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
           [:ack],
           10
         )
 
       DummyLink.inject_packet(link, window_update)
-      assert {:established, %{snd_wnd: 160}} = :sys.get_state(socket)
+      assert {:established, %{tcb: %{snd_wnd: 160}}} = :sys.get_state(socket)
 
       refute Map.has_key?(state, :peer_sack_permitted)
       refute Map.has_key?(state, :peer_timestamp)
@@ -1358,10 +1378,10 @@ defmodule Tricep.SocketTest do
       assert Tcp.parse_segment(ack_segment).window == 65_535
 
       assert {:established, state} = :sys.get_state(socket)
-      assert state.snd_wnd == 65_535
-      assert state.snd_wnd_scale == 0
-      assert state.rcv_wnd_scale == 0
-      refute state.window_scaling_negotiated
+      assert state.tcb.snd_wnd == 65_535
+      assert state.tcb.snd_wnd_scale == 0
+      assert state.tcb.rcv_wnd_scale == 0
+      refute state.tcb.window_scaling_negotiated
     end
 
     test "blocking active open disables scaling when SYN-ACK omits the option", %{
@@ -1398,10 +1418,10 @@ defmodule Tricep.SocketTest do
       assert Tcp.parse_segment(ack_segment).window == 65_535
 
       assert {:established, state} = :sys.get_state(socket)
-      assert state.rcv_wnd == 65_535
-      assert state.snd_wnd_scale == 0
-      assert state.rcv_wnd_scale == 0
-      refute state.window_scaling_negotiated
+      assert state.tcb.rcv_wnd == 65_535
+      assert state.tcb.snd_wnd_scale == 0
+      assert state.tcb.rcv_wnd_scale == 0
+      refute state.tcb.window_scaling_negotiated
     end
 
     test "nowait active open negotiates scaling and clamps the peer shift", %{
@@ -1441,10 +1461,10 @@ defmodule Tricep.SocketTest do
       assert Tcp.parse_segment(ack_segment).window == 62_499
 
       assert {:established, state} = :sys.get_state(socket)
-      assert state.snd_wnd == 65_535
-      assert state.snd_wnd_scale == 14
-      assert state.rcv_wnd_scale == 4
-      assert state.window_scaling_negotiated
+      assert state.tcb.snd_wnd == 65_535
+      assert state.tcb.snd_wnd_scale == 14
+      assert state.tcb.rcv_wnd_scale == 4
+      assert state.tcb.window_scaling_negotiated
     end
 
     test "passive open advertises and stores negotiated window scale", %{
@@ -1486,7 +1506,7 @@ defmodule Tricep.SocketTest do
       {:listen, listen_state} = :sys.get_state(listener)
       [child] = Map.keys(listen_state.children)
 
-      assert {:syn_received, %{snd_wnd: 65_535, window_scaling_negotiated: true}} =
+      assert {:syn_received, %{tcb: %{snd_wnd: 65_535, window_scaling_negotiated: true}}} =
                :sys.get_state(child)
 
       send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
@@ -1496,10 +1516,10 @@ defmodule Tricep.SocketTest do
 
       {:established, state} = :sys.get_state(accepted)
 
-      assert state.snd_wnd_scale == 3
-      assert state.snd_wnd == 262_144
-      assert state.rcv_adv_wnd == 999_984
-      assert state.rcv_wnd == 999_984
+      assert state.tcb.snd_wnd_scale == 3
+      assert state.tcb.snd_wnd == 262_144
+      assert state.tcb.rcv_adv_wnd == 999_984
+      assert state.tcb.rcv_wnd == 999_984
       refute Map.has_key?(state, :peer_sack_permitted)
       refute Map.has_key?(state, :peer_timestamp)
 
@@ -1541,15 +1561,15 @@ defmodule Tricep.SocketTest do
       on_exit(fn -> stop_socket(accepted) end)
 
       assert {:established, initial_state} = :sys.get_state(accepted)
-      assert initial_state.rcv_adv_wnd == 999_984
-      assert initial_state.rcv_wnd == 999_984
+      assert initial_state.tcb.rcv_adv_wnd == 999_984
+      assert initial_state.tcb.rcv_wnd == 999_984
 
-      initial_offered_edge = wrap_seq(initial_state.rcv_nxt + initial_state.rcv_adv_wnd)
+      initial_offered_edge = wrap_seq(initial_state.tcb.rcv_nxt + initial_state.tcb.rcv_adv_wnd)
 
       {buffered_state, final_offered_edge, saw_retraction, _authorized_edge} =
         Enum.reduce(
           1..66,
-          {initial_state, initial_offered_edge, false, initial_state.rcv_right_edge},
+          {initial_state, initial_offered_edge, false, initial_state.tcb.rcv_right_edge},
           fn _, {state, previous_edge, saw_retraction, previous_authorized_edge} ->
             # 1000 is intentionally not a multiple of the scale-4 quantum.
             payload = :binary.copy("x", 1000)
@@ -1557,8 +1577,8 @@ defmodule Tricep.SocketTest do
             data_segment =
               Tcp.build_segment(
                 {{local_addr, client_port}, {remote_addr, @port}},
-                state.rcv_nxt,
-                state.snd_nxt,
+                state.tcb.rcv_nxt,
+                state.tcb.snd_nxt,
                 [:ack, :psh],
                 32_768,
                 payload: payload
@@ -1571,7 +1591,7 @@ defmodule Tricep.SocketTest do
             data_ack = Tcp.parse_segment(data_ack_segment)
 
             offered_edge =
-              wrap_seq(data_ack.ack + Bitwise.bsl(data_ack.window, state.rcv_wnd_scale))
+              wrap_seq(data_ack.ack + Bitwise.bsl(data_ack.window, state.tcb.rcv_wnd_scale))
 
             forward_delta = Bitwise.band(offered_edge - previous_edge, 0xFFFFFFFF)
             retraction = Bitwise.band(previous_edge - offered_edge, 0xFFFFFFFF)
@@ -1581,23 +1601,26 @@ defmodule Tricep.SocketTest do
 
             assert {:established, new_state} = :sys.get_state(accepted)
 
-            assert new_state.rcv_wnd <=
+            assert new_state.tcb.rcv_wnd <=
                      new_state.recv_buffer_size - byte_size(new_state.recv_buffer)
 
-            assert new_state.rcv_adv_wnd <=
+            assert new_state.tcb.rcv_adv_wnd <=
                      new_state.recv_buffer_size - byte_size(new_state.recv_buffer)
 
-            assert Bitwise.band(new_state.rcv_right_edge - previous_authorized_edge, 0xFFFFFFFF) <
+            assert Bitwise.band(
+                     new_state.tcb.rcv_right_edge - previous_authorized_edge,
+                     0xFFFFFFFF
+                   ) <
                      0x80000000
 
-            {new_state, offered_edge, saw_retraction or retracted?, new_state.rcv_right_edge}
+            {new_state, offered_edge, saw_retraction or retracted?, new_state.tcb.rcv_right_edge}
           end
         )
 
       assert byte_size(buffered_state.recv_buffer) == 66_000
       assert saw_retraction
 
-      assert Bitwise.band(buffered_state.rcv_right_edge - final_offered_edge, 0xFFFFFFFF) <
+      assert Bitwise.band(buffered_state.tcb.rcv_right_edge - final_offered_edge, 0xFFFFFFFF) <
                0x80000000
 
       assert {:ok, drained} = Tricep.recv(accepted, 16, 1000)
@@ -1609,14 +1632,14 @@ defmodule Tricep.SocketTest do
       assert update.window == 58_376
 
       update_edge =
-        wrap_seq(update.ack + Bitwise.bsl(update.window, buffered_state.rcv_wnd_scale))
+        wrap_seq(update.ack + Bitwise.bsl(update.window, buffered_state.tcb.rcv_wnd_scale))
 
       assert Bitwise.band(update_edge - final_offered_edge, 0xFFFFFFFF) < 0x80000000
 
       {:established, reopened_state} = :sys.get_state(accepted)
-      assert reopened_state.rcv_adv_wnd == 934_016
+      assert reopened_state.tcb.rcv_adv_wnd == 934_016
 
-      assert reopened_state.rcv_wnd <=
+      assert reopened_state.tcb.rcv_wnd <=
                reopened_state.recv_buffer_size - byte_size(reopened_state.recv_buffer)
 
       assert Tricep.close(listener) == :ok
@@ -1637,16 +1660,16 @@ defmodule Tricep.SocketTest do
       assert_receive {:dummy_link_packet, _link, _handshake_ack_packet}, 1000
 
       assert {:established, initial_state} = :sys.get_state(socket)
-      assert initial_state.rcv_wnd_scale == 4
+      assert initial_state.tcb.rcv_wnd_scale == 4
       {{_, src_port}, _} = initial_state.pair
 
-      initial_edge = wrap_seq(initial_state.rcv_nxt + initial_state.rcv_adv_wnd)
+      initial_edge = wrap_seq(initial_state.tcb.rcv_nxt + initial_state.tcb.rcv_adv_wnd)
 
       out_of_order_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          wrap_seq(initial_state.rcv_nxt + 500_000),
-          initial_state.snd_nxt,
+          wrap_seq(initial_state.tcb.rcv_nxt + 500_000),
+          initial_state.tcb.snd_nxt,
           [:ack, :psh],
           32_768,
           payload: :binary.copy("o", 1440)
@@ -1656,12 +1679,12 @@ defmodule Tricep.SocketTest do
       assert_receive {:dummy_link_packet, _link, duplicate_ack_packet}, 1000
       <<_ip_header::binary-size(40), duplicate_ack_segment::binary>> = duplicate_ack_packet
       duplicate_ack = Tcp.parse_segment(duplicate_ack_segment)
-      assert duplicate_ack.ack == initial_state.rcv_nxt
+      assert duplicate_ack.ack == initial_state.tcb.rcv_nxt
 
       encoded_edge =
         wrap_seq(
           duplicate_ack.ack +
-            Bitwise.bsl(duplicate_ack.window, initial_state.rcv_wnd_scale)
+            Bitwise.bsl(duplicate_ack.window, initial_state.tcb.rcv_wnd_scale)
         )
 
       retraction = Bitwise.band(initial_edge - encoded_edge, 0xFFFFFFFF)
@@ -1680,9 +1703,9 @@ defmodule Tricep.SocketTest do
           )
 
       assert length(buffered_state.out_of_order_segments) == 1
-      assert buffered_state.rcv_adv_wnd <= available
-      assert buffered_state.rcv_wnd <= available
-      assert buffered_state.rcv_right_edge == initial_state.rcv_right_edge
+      assert buffered_state.tcb.rcv_adv_wnd <= available
+      assert buffered_state.tcb.rcv_wnd <= available
+      assert buffered_state.tcb.rcv_right_edge == initial_state.tcb.rcv_right_edge
     end
 
     test "scaled zero window retains an already-authorized byte and FIN", %{
@@ -1722,16 +1745,16 @@ defmodule Tricep.SocketTest do
 
       almost_closed_state =
         Enum.reduce_while(1..100, initial_state, fn _, state ->
-          if state.rcv_adv_wnd == 2 do
+          if state.tcb.rcv_adv_wnd == 2 do
             {:halt, state}
           else
-            chunk_size = min(1440, state.rcv_adv_wnd - 2)
+            chunk_size = min(1440, state.tcb.rcv_adv_wnd - 2)
 
             data_segment =
               Tcp.build_segment(
                 {{local_addr, client_port}, {remote_addr, @port}},
-                state.rcv_nxt,
-                state.snd_nxt,
+                state.tcb.rcv_nxt,
+                state.tcb.snd_nxt,
                 [:ack, :psh],
                 32_768,
                 payload: :binary.copy("z", chunk_size)
@@ -1746,14 +1769,14 @@ defmodule Tricep.SocketTest do
           end
         end)
 
-      assert almost_closed_state.rcv_adv_wnd == 2
+      assert almost_closed_state.tcb.rcv_adv_wnd == 2
 
       one_byte = fn state ->
         segment =
           Tcp.build_segment(
             {{local_addr, client_port}, {remote_addr, @port}},
-            state.rcv_nxt,
-            state.snd_nxt,
+            state.tcb.rcv_nxt,
+            state.tcb.snd_nxt,
             [:ack, :psh],
             32_768,
             payload: "z"
@@ -1767,15 +1790,17 @@ defmodule Tricep.SocketTest do
 
       {zero_ack, {:established, zero_state}} = one_byte.(almost_closed_state)
       assert zero_ack.window == 0
-      assert zero_state.rcv_adv_wnd == 0
-      assert zero_state.rcv_wnd == 1
-      assert zero_state.rcv_wnd <= zero_state.recv_buffer_size - byte_size(zero_state.recv_buffer)
+      assert zero_state.tcb.rcv_adv_wnd == 0
+      assert zero_state.tcb.rcv_wnd == 1
+
+      assert zero_state.tcb.rcv_wnd <=
+               zero_state.recv_buffer_size - byte_size(zero_state.recv_buffer)
 
       fin_segment =
         Tcp.build_segment(
           {{local_addr, client_port}, {remote_addr, @port}},
-          zero_state.rcv_nxt,
-          zero_state.snd_nxt,
+          zero_state.tcb.rcv_nxt,
+          zero_state.tcb.snd_nxt,
           [:fin, :ack],
           32_768
         )
@@ -1786,8 +1811,8 @@ defmodule Tricep.SocketTest do
       assert Tcp.parse_segment(final_ack_segment).window == 0
 
       assert {:close_wait, final_state} = :sys.get_state(accepted)
-      assert final_state.rcv_adv_wnd == 0
-      assert final_state.rcv_wnd == 0
+      assert final_state.tcb.rcv_adv_wnd == 0
+      assert final_state.tcb.rcv_wnd == 0
       assert final_state.fin_received
       assert byte_size(final_state.recv_buffer) == 65_535
 
@@ -1823,14 +1848,14 @@ defmodule Tricep.SocketTest do
             if remaining == 0 do
               {:halt, state}
             else
-              chunk_size = min(1440, min(remaining, state.rcv_wnd))
+              chunk_size = min(1440, min(remaining, state.tcb.rcv_wnd))
               assert chunk_size > 0
 
               data_segment =
                 Tcp.build_segment(
                   {{local_addr, @port}, {remote_addr, src_port}},
-                  state.rcv_nxt,
-                  state.snd_nxt,
+                  state.tcb.rcv_nxt,
+                  state.tcb.snd_nxt,
                   [:ack, :psh],
                   32_768,
                   payload: :binary.copy("f", chunk_size)
@@ -1839,21 +1864,24 @@ defmodule Tricep.SocketTest do
               DummyLink.inject_packet(link, data_segment)
               assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
               <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
-              assert Tcp.parse_segment(ack_segment).ack == wrap_seq(state.rcv_nxt + chunk_size)
+
+              assert Tcp.parse_segment(ack_segment).ack ==
+                       wrap_seq(state.tcb.rcv_nxt + chunk_size)
+
               assert {:established, next_state} = :sys.get_state(socket)
               {:cont, next_state}
             end
           end)
 
         assert byte_size(full_state.recv_buffer) == buffer_size
-        assert full_state.rcv_wnd == 0
-        assert full_state.rcv_adv_wnd == 0
+        assert full_state.tcb.rcv_wnd == 0
+        assert full_state.tcb.rcv_adv_wnd == 0
 
         rejected_data =
           Tcp.build_segment(
             {{local_addr, @port}, {remote_addr, src_port}},
-            full_state.rcv_nxt,
-            full_state.snd_nxt,
+            full_state.tcb.rcv_nxt,
+            full_state.tcb.snd_nxt,
             [:ack, :psh],
             32_768,
             payload: "x"
@@ -1863,17 +1891,17 @@ defmodule Tricep.SocketTest do
         assert_receive {:dummy_link_packet, _link, zero_window_ack_packet}, 1000
         <<_ip_header::binary-size(40), zero_window_ack_segment::binary>> = zero_window_ack_packet
         zero_window_ack = Tcp.parse_segment(zero_window_ack_segment)
-        assert zero_window_ack.ack == full_state.rcv_nxt
+        assert zero_window_ack.ack == full_state.tcb.rcv_nxt
         assert zero_window_ack.window == 0
         assert {:established, rejected_state} = :sys.get_state(socket)
-        assert rejected_state.rcv_nxt == full_state.rcv_nxt
+        assert rejected_state.tcb.rcv_nxt == full_state.tcb.rcv_nxt
         assert rejected_state.recv_buffer == full_state.recv_buffer
 
         fin_without_ack =
           Tcp.build_segment(
             {{local_addr, @port}, {remote_addr, src_port}},
-            full_state.rcv_nxt,
-            full_state.snd_nxt,
+            full_state.tcb.rcv_nxt,
+            full_state.tcb.snd_nxt,
             [:fin],
             32_768
           )
@@ -1885,7 +1913,7 @@ defmodule Tricep.SocketTest do
           rejected_fin_ack_packet
 
         rejected_fin_ack = Tcp.parse_segment(rejected_fin_ack_segment)
-        assert rejected_fin_ack.ack == full_state.rcv_nxt
+        assert rejected_fin_ack.ack == full_state.tcb.rcv_nxt
         assert rejected_fin_ack.window == 0
         assert {:established, no_ack_fin_state} = :sys.get_state(socket)
         refute no_ack_fin_state.fin_received
@@ -1894,8 +1922,8 @@ defmodule Tricep.SocketTest do
         fin_segment =
           Tcp.build_segment(
             {{local_addr, @port}, {remote_addr, src_port}},
-            full_state.rcv_nxt,
-            full_state.snd_nxt,
+            full_state.tcb.rcv_nxt,
+            full_state.tcb.snd_nxt,
             [:fin, :ack],
             32_768
           )
@@ -1903,7 +1931,7 @@ defmodule Tricep.SocketTest do
         DummyLink.inject_packet(link, fin_segment)
         assert_receive {:dummy_link_packet, _link, fin_ack_packet}, 1000
         <<_ip_header::binary-size(40), fin_ack_segment::binary>> = fin_ack_packet
-        assert Tcp.parse_segment(fin_ack_segment).ack == wrap_seq(full_state.rcv_nxt + 1)
+        assert Tcp.parse_segment(fin_ack_segment).ack == wrap_seq(full_state.tcb.rcv_nxt + 1)
 
         assert {:close_wait, close_wait_state} = :sys.get_state(socket)
         assert close_wait_state.fin_received
@@ -1952,17 +1980,17 @@ defmodule Tricep.SocketTest do
       [child] = Map.keys(listen_state.children)
 
       assert {:syn_received, state} = :sys.get_state(child)
-      assert state.snd_wnd == 65_535
-      assert state.snd_wnd_scale == 0
-      assert state.rcv_wnd_scale == 0
-      refute state.window_scaling_negotiated
+      assert state.tcb.snd_wnd == 65_535
+      assert state.tcb.snd_wnd_scale == 0
+      assert state.tcb.rcv_wnd_scale == 0
+      refute state.tcb.window_scaling_negotiated
 
       send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
 
       assert {:ok, accepted} = Tricep.accept(listener, 1000)
       on_exit(fn -> stop_socket(accepted) end)
 
-      assert {:established, %{snd_wnd: 32_768}} = :sys.get_state(accepted)
+      assert {:established, %{tcb: %{snd_wnd: 32_768}}} = :sys.get_state(accepted)
       assert Tricep.close(listener) == :ok
     end
 
@@ -2129,7 +2157,7 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
+          state.tcb.irs + 1,
           wrap_seq(parsed1.seq + byte_size(parsed1.payload)),
           [:ack],
           2
@@ -2166,8 +2194,8 @@ defmodule Tricep.SocketTest do
       window_update =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack],
           3
         )
@@ -2211,8 +2239,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "Hello from peer"
@@ -2228,7 +2256,7 @@ defmodule Tricep.SocketTest do
       <<_::binary-size(40), ack_seg::binary>> = ack_packet
       ack_parsed = Tcp.parse_segment(ack_seg)
       assert :ack in ack_parsed.flags
-      assert ack_parsed.ack == state.irs + 1 + byte_size("Hello from peer")
+      assert ack_parsed.ack == state.tcb.irs + 1 + byte_size("Hello from peer")
     end
 
     test "advertised receive window shrinks with buffered data and reopens on recv", %{
@@ -2248,8 +2276,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "abcdef"
@@ -2261,11 +2289,11 @@ defmodule Tricep.SocketTest do
       <<_::binary-size(40), ack_segment::binary>> = ack_packet
       ack_parsed = Tcp.parse_segment(ack_segment)
 
-      assert ack_parsed.ack == state.irs + 1 + byte_size("abcdef")
+      assert ack_parsed.ack == state.tcb.irs + 1 + byte_size("abcdef")
       assert ack_parsed.window == 4
 
       {:established, buffered_state} = :sys.get_state(socket)
-      assert buffered_state.rcv_wnd == 4
+      assert buffered_state.tcb.rcv_wnd == 4
       assert buffered_state.recv_buffer == "abcdef"
 
       assert Tricep.recv(socket, 3, 1000) == {:ok, "abc"}
@@ -2278,7 +2306,7 @@ defmodule Tricep.SocketTest do
       assert update_parsed.window == 7
 
       {:established, reopened_state} = :sys.get_state(socket)
-      assert reopened_state.rcv_wnd == 7
+      assert reopened_state.tcb.rcv_wnd == 7
       assert reopened_state.recv_buffer == "def"
     end
 
@@ -2296,14 +2324,14 @@ defmodule Tricep.SocketTest do
 
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
-      assert state.rcv_wnd == 65_535
-      refute state.window_scaling_negotiated
+      assert state.tcb.rcv_wnd == 65_535
+      refute state.tcb.window_scaling_negotiated
 
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.rcv_nxt,
-          state.snd_nxt,
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32_768,
           payload: "ab"
@@ -2321,7 +2349,8 @@ defmodule Tricep.SocketTest do
       assert Tricep.recv(socket, 1, 1000) == {:ok, "b"}
       refute_receive {:dummy_link_packet, _link, _window_update}, 100
 
-      assert {:established, %{rcv_wnd: 65_535, recv_buffer: <<>>}} = :sys.get_state(socket)
+      assert {:established, %{tcb: %{rcv_wnd: 65_535}, recv_buffer: <<>>}} =
+               :sys.get_state(socket)
     end
 
     test "receive buffer caps accepted payload to advertised window", %{
@@ -2341,8 +2370,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "123456789"
@@ -2354,13 +2383,13 @@ defmodule Tricep.SocketTest do
       <<_::binary-size(40), ack_segment::binary>> = ack_packet
       ack_parsed = Tcp.parse_segment(ack_segment)
 
-      assert ack_parsed.ack == state.irs + 1 + 5
+      assert ack_parsed.ack == state.tcb.irs + 1 + 5
       assert ack_parsed.window == 0
 
       {:established, buffered_state} = :sys.get_state(socket)
       assert buffered_state.recv_buffer == "12345"
-      assert buffered_state.rcv_nxt == state.irs + 1 + 5
-      assert buffered_state.rcv_wnd == 0
+      assert buffered_state.tcb.rcv_nxt == state.tcb.irs + 1 + 5
+      assert buffered_state.tcb.rcv_wnd == 0
     end
 
     test "blocks until data arrives", %{
@@ -2386,8 +2415,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "Delayed data"
@@ -2446,8 +2475,8 @@ defmodule Tricep.SocketTest do
       data_segment1 =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "1234567890"
@@ -2465,8 +2494,8 @@ defmodule Tricep.SocketTest do
       data_segment2 =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1 + 10,
-          state.snd_nxt,
+          state.tcb.irs + 1 + 10,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "ABCDEFGHIJ"
@@ -2498,8 +2527,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "Pre-buffered data"
@@ -2530,8 +2559,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "buffered"
@@ -2587,8 +2616,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "Data arrived"
@@ -2628,8 +2657,8 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:rst],
           0
         )
@@ -2656,8 +2685,8 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          wrap_seq(state.rcv_nxt - 1),
-          state.snd_nxt,
+          wrap_seq(state.tcb.rcv_nxt - 1),
+          state.tcb.snd_nxt,
           [:rst],
           0
         )
@@ -2669,7 +2698,7 @@ defmodule Tricep.SocketTest do
       ack = Tcp.parse_segment(ack_segment)
 
       assert :ack in ack.flags
-      assert ack.ack == state.rcv_nxt
+      assert ack.ack == state.tcb.rcv_nxt
       {:established, _state} = :sys.get_state(socket)
     end
 
@@ -2688,13 +2717,13 @@ defmodule Tricep.SocketTest do
 
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
-      assert state.rcv_wnd == 65_535
+      assert state.tcb.rcv_wnd == 65_535
 
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          wrap_seq(state.rcv_nxt + 65_535),
-          state.snd_nxt,
+          wrap_seq(state.tcb.rcv_nxt + 65_535),
+          state.tcb.snd_nxt,
           [:rst],
           0
         )
@@ -2706,7 +2735,7 @@ defmodule Tricep.SocketTest do
       ack = Tcp.parse_segment(ack_segment)
 
       assert :ack in ack.flags
-      assert ack.ack == state.rcv_nxt
+      assert ack.ack == state.tcb.rcv_nxt
       {:established, _state} = :sys.get_state(socket)
     end
 
@@ -2728,8 +2757,8 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:rst],
           0
         )
@@ -2758,8 +2787,8 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:rst],
           0
         )
@@ -2789,8 +2818,8 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:rst],
           0
         )
@@ -2814,7 +2843,7 @@ defmodule Tricep.SocketTest do
       # Get initial state
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
-      initial_snd_wnd = state.snd_wnd
+      initial_snd_wnd = state.tcb.snd_wnd
 
       # Inject a pure ACK with different window
       new_window = 65535
@@ -2822,8 +2851,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack],
           new_window
         )
@@ -2832,8 +2861,8 @@ defmodule Tricep.SocketTest do
 
       # Check window was updated
       {:established, new_state} = :sys.get_state(socket)
-      assert new_state.snd_wnd == new_window
-      assert new_state.snd_wnd != initial_snd_wnd or initial_snd_wnd == new_window
+      assert new_state.tcb.snd_wnd == new_window
+      assert new_state.tcb.snd_wnd != initial_snd_wnd or initial_snd_wnd == new_window
     end
 
     test "off-window pure ACK does not update send state", %{
@@ -2855,8 +2884,8 @@ defmodule Tricep.SocketTest do
       off_window_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          wrap_seq(state_before_ack.rcv_nxt - 1),
-          state_before_ack.snd_nxt,
+          wrap_seq(state_before_ack.tcb.rcv_nxt - 1),
+          state_before_ack.tcb.snd_nxt,
           [:ack],
           65_535
         )
@@ -2868,13 +2897,13 @@ defmodule Tricep.SocketTest do
       challenge = Tcp.parse_segment(challenge_segment)
 
       assert :ack in challenge.flags
-      assert challenge.seq == state_before_ack.snd_nxt
-      assert challenge.ack == state_before_ack.rcv_nxt
+      assert challenge.seq == state_before_ack.tcb.snd_nxt
+      assert challenge.ack == state_before_ack.tcb.rcv_nxt
 
       {:established, state_after_ack} = :sys.get_state(socket)
 
-      assert state_after_ack.snd_una == state_before_ack.snd_una
-      assert state_after_ack.snd_wnd == state_before_ack.snd_wnd
+      assert state_after_ack.tcb.snd_una == state_before_ack.tcb.snd_una
+      assert state_after_ack.tcb.snd_wnd == state_before_ack.tcb.snd_wnd
       assert state_after_ack.unacked_segments == state_before_ack.unacked_segments
       assert state_after_ack.rto_timer_active == state_before_ack.rto_timer_active
     end
@@ -2896,8 +2925,8 @@ defmodule Tricep.SocketTest do
       out_of_order_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.rcv_nxt + 5,
-          state.snd_nxt,
+          state.tcb.rcv_nxt + 5,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "world"
@@ -2910,22 +2939,22 @@ defmodule Tricep.SocketTest do
       ack = Tcp.parse_segment(ack_segment)
 
       assert :ack in ack.flags
-      assert ack.ack == state.rcv_nxt
+      assert ack.ack == state.tcb.rcv_nxt
 
       assert Tricep.recv(socket, 0, 100) == {:error, :timeout}
 
       {:established, queued_state} = :sys.get_state(socket)
-      assert queued_state.rcv_nxt == state.rcv_nxt
+      assert queued_state.tcb.rcv_nxt == state.tcb.rcv_nxt
       assert [{seq, seq_end, payload}] = queued_state.out_of_order_segments
-      assert seq == state.rcv_nxt + 5
-      assert seq_end == state.rcv_nxt + 10
+      assert seq == state.tcb.rcv_nxt + 5
+      assert seq_end == state.tcb.rcv_nxt + 10
       assert payload == "world"
 
       gap_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.rcv_nxt,
-          state.snd_nxt,
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "hello"
@@ -2938,7 +2967,7 @@ defmodule Tricep.SocketTest do
       final_ack = Tcp.parse_segment(final_ack_segment)
 
       assert :ack in final_ack.flags
-      assert final_ack.ack == state.rcv_nxt + 10
+      assert final_ack.ack == state.tcb.rcv_nxt + 10
 
       assert Tricep.recv(socket, 10, 1000) == {:ok, "helloworld"}
 
@@ -2962,8 +2991,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "duplicate once"
@@ -3001,8 +3030,8 @@ defmodule Tricep.SocketTest do
       invalid_ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          wrap_seq(state.snd_nxt + 1),
+          state.tcb.irs + 1,
+          wrap_seq(state.tcb.snd_nxt + 1),
           [:ack, :psh],
           32768,
           payload: "must not deliver"
@@ -3015,12 +3044,12 @@ defmodule Tricep.SocketTest do
       ack = Tcp.parse_segment(ack_segment)
 
       assert :ack in ack.flags
-      assert ack.seq == state.snd_nxt
-      assert ack.ack == state.rcv_nxt
+      assert ack.seq == state.tcb.snd_nxt
+      assert ack.ack == state.tcb.rcv_nxt
       assert Tricep.recv(socket, 0, 100) == {:error, :timeout}
 
       {:established, new_state} = :sys.get_state(socket)
-      assert new_state.rcv_nxt == state.rcv_nxt
+      assert new_state.tcb.rcv_nxt == state.tcb.rcv_nxt
       assert new_state.recv_buffer == <<>>
     end
 
@@ -3043,14 +3072,14 @@ defmodule Tricep.SocketTest do
 
       # Socket should still be in established state and usable
       {:established, new_state} = :sys.get_state(socket)
-      assert new_state.rcv_nxt == state.rcv_nxt
+      assert new_state.tcb.rcv_nxt == state.tcb.rcv_nxt
 
       # Can still recv properly formatted data
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "Valid data"
@@ -3162,7 +3191,7 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
+          state.tcb.irs + 1,
           wrap_seq(parsed1.seq + byte_size(parsed1.payload)),
           [:ack],
           2
@@ -3214,8 +3243,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -3229,8 +3258,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:fin, :ack],
           32768
         )
@@ -3265,8 +3294,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -3299,8 +3328,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          wrap_seq(state.snd_nxt + 1),
+          state.tcb.irs + 1,
+          wrap_seq(state.tcb.snd_nxt + 1),
           [:fin, :ack],
           32768
         )
@@ -3309,9 +3338,9 @@ defmodule Tricep.SocketTest do
 
       {:established, new_state} = :sys.get_state(socket)
 
-      assert new_state.snd_una == state.snd_una
-      assert new_state.snd_nxt == state.snd_nxt
-      assert new_state.rcv_nxt == state.rcv_nxt
+      assert new_state.tcb.snd_una == state.tcb.snd_una
+      assert new_state.tcb.snd_nxt == state.tcb.snd_nxt
+      assert new_state.tcb.rcv_nxt == state.tcb.rcv_nxt
       assert new_state.fin_received == false
 
       assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
@@ -3319,8 +3348,8 @@ defmodule Tricep.SocketTest do
       ack = Tcp.parse_segment(ack_segment)
 
       assert :ack in ack.flags
-      assert ack.seq == state.snd_nxt
-      assert ack.ack == state.rcv_nxt
+      assert ack.seq == state.tcb.snd_nxt
+      assert ack.ack == state.tcb.rcv_nxt
     end
 
     test "recv returns buffered data then EOF after receiving FIN", %{
@@ -3341,8 +3370,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768,
           payload: "Final data"
@@ -3405,8 +3434,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -3446,8 +3475,8 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:rst],
           0
         )
@@ -3484,8 +3513,8 @@ defmodule Tricep.SocketTest do
       fin_ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:fin, :ack],
           32768
         )
@@ -3527,8 +3556,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -3574,8 +3603,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -3610,8 +3639,8 @@ defmodule Tricep.SocketTest do
       wrong_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack],
           32768
         )
@@ -3620,6 +3649,49 @@ defmodule Tricep.SocketTest do
 
       # Should still be in FIN_WAIT_1 (wrong ACK ignored)
       {:fin_wait_1, _} = :sys.get_state(socket)
+    end
+
+    test "preserves state when a no-op segment would otherwise start persist", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 1)
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, established_state} = :sys.get_state(socket)
+      {{_, src_port}, _} = established_state.pair
+
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      :sys.replace_state(socket, fn
+        {:fin_wait_1, state} ->
+          send_buffer = Tricep.DataBuffer.append(state.send_buffer, "pending")
+          {:fin_wait_1, %{state | send_buffer: send_buffer, persist_timer_active: false}}
+      end)
+
+      {:fin_wait_1, before_state} = :sys.get_state(socket)
+      refute before_state.persist_timer_active
+      assert before_state.tcb.snd_wnd == 1
+
+      no_op_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          before_state.tcb.rcv_nxt,
+          0,
+          [],
+          0
+        )
+
+      DummyLink.inject_packet(link, no_op_segment)
+
+      assert {:fin_wait_1, after_state} = :sys.get_state(socket)
+      assert after_state.tcb.snd_wnd == before_state.tcb.snd_wnd
+      assert after_state.persist_timer_active == before_state.persist_timer_active
+      assert after_state.persist_timeout_ms == before_state.persist_timeout_ms
+      assert after_state.send_buffer == before_state.send_buffer
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
     end
 
     test "retransmits lost FIN in FIN_WAIT_1", %{
@@ -3688,7 +3760,7 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
+          state.tcb.irs + 1,
           data_ack,
           [:ack],
           32768
@@ -3697,7 +3769,7 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, ack_segment)
 
       {:fin_wait_1, acked_state} = :sys.get_state(socket)
-      assert acked_state.snd_una == data_ack
+      assert acked_state.tcb.snd_una == data_ack
       assert [{fin_seq, fin_end, :fin, _count}] = acked_state.unacked_segments
       assert fin_seq == fin.seq
       assert fin_end == wrap_seq(fin.seq + 1)
@@ -3706,8 +3778,8 @@ defmodule Tricep.SocketTest do
       fin_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          acked_state.snd_nxt,
+          state.tcb.irs + 1,
+          acked_state.tcb.snd_nxt,
           [:ack],
           32768
         )
@@ -3772,8 +3844,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -3806,8 +3878,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -3820,8 +3892,8 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:rst],
           0
         )
@@ -3853,8 +3925,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -3867,8 +3939,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack, :psh],
           32768,
           payload: "Half-close data"
@@ -3905,8 +3977,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -3943,8 +4015,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -3957,8 +4029,8 @@ defmodule Tricep.SocketTest do
       wrong_seq =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1000,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1000,
+          state.tcb.snd_nxt + 1,
           [:ack, :psh],
           32768,
           payload: "Wrong seq"
@@ -3971,7 +4043,7 @@ defmodule Tricep.SocketTest do
       ack = Tcp.parse_segment(ack_segment)
 
       assert :ack in ack.flags
-      assert ack.ack == state.irs + 1
+      assert ack.ack == state.tcb.irs + 1
 
       # Should still be in FIN_WAIT_2 with empty buffer
       {:fin_wait_2, fin_wait_2_state} = :sys.get_state(socket)
@@ -4002,8 +4074,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -4016,8 +4088,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:fin, :ack],
           32768
         )
@@ -4054,8 +4126,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -4066,8 +4138,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:fin, :ack],
           32768
         )
@@ -4112,8 +4184,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -4123,8 +4195,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:fin, :ack],
           32768
         )
@@ -4140,8 +4212,8 @@ defmodule Tricep.SocketTest do
       just_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 2,
-          state.snd_nxt + 1,
+          state.tcb.irs + 2,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -4181,8 +4253,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4198,8 +4270,8 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 2,
-          state.snd_nxt + 1,
+          state.tcb.irs + 2,
+          state.tcb.snd_nxt + 1,
           [:rst],
           0
         )
@@ -4233,8 +4305,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4250,8 +4322,8 @@ defmodule Tricep.SocketTest do
       our_fin_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 2,
-          state.snd_nxt + 1,
+          state.tcb.irs + 2,
+          state.tcb.snd_nxt + 1,
           [:ack],
           32768
         )
@@ -4283,8 +4355,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4325,8 +4397,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4342,8 +4414,8 @@ defmodule Tricep.SocketTest do
       wrong_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 2,
-          state.snd_nxt,
+          state.tcb.irs + 2,
+          state.tcb.snd_nxt,
           [:ack],
           32768
         )
@@ -4374,8 +4446,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4415,8 +4487,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4464,8 +4536,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4508,8 +4580,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4525,8 +4597,8 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 2,
-          state.snd_nxt,
+          state.tcb.irs + 2,
+          state.tcb.snd_nxt,
           [:rst],
           0
         )
@@ -4554,8 +4626,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4575,8 +4647,8 @@ defmodule Tricep.SocketTest do
       data_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 2,
-          close_wait_state.snd_nxt + 4,
+          state.tcb.irs + 2,
+          close_wait_state.tcb.snd_nxt + 4,
           [:ack],
           65535
         )
@@ -4585,8 +4657,8 @@ defmodule Tricep.SocketTest do
 
       # snd_una should be updated
       {:close_wait, updated_state} = :sys.get_state(socket)
-      assert updated_state.snd_una == close_wait_state.snd_nxt + 4
-      assert updated_state.snd_wnd == 65535
+      assert updated_state.tcb.snd_una == close_wait_state.tcb.snd_nxt + 4
+      assert updated_state.tcb.snd_wnd == 65535
     end
 
     test "off-window ACK in CLOSE_WAIT does not update send state", %{
@@ -4605,8 +4677,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4626,8 +4698,8 @@ defmodule Tricep.SocketTest do
       off_window_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          wrap_seq(state_before_ack.rcv_nxt - 1),
-          state_before_ack.snd_nxt,
+          wrap_seq(state_before_ack.tcb.rcv_nxt - 1),
+          state_before_ack.tcb.snd_nxt,
           [:ack],
           65_535
         )
@@ -4639,13 +4711,13 @@ defmodule Tricep.SocketTest do
       challenge = Tcp.parse_segment(challenge_segment)
 
       assert :ack in challenge.flags
-      assert challenge.seq == state_before_ack.snd_nxt
-      assert challenge.ack == state_before_ack.rcv_nxt
+      assert challenge.seq == state_before_ack.tcb.snd_nxt
+      assert challenge.ack == state_before_ack.tcb.rcv_nxt
 
       {:close_wait, state_after_ack} = :sys.get_state(socket)
 
-      assert state_after_ack.snd_una == state_before_ack.snd_una
-      assert state_after_ack.snd_wnd == state_before_ack.snd_wnd
+      assert state_after_ack.tcb.snd_una == state_before_ack.tcb.snd_una
+      assert state_after_ack.tcb.snd_wnd == state_before_ack.tcb.snd_wnd
       assert state_after_ack.unacked_segments == state_before_ack.unacked_segments
       assert state_after_ack.rto_timer_active == state_before_ack.rto_timer_active
     end
@@ -4668,8 +4740,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4708,8 +4780,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4731,8 +4803,8 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 2,
-          state.snd_nxt + 1,
+          state.tcb.irs + 2,
+          state.tcb.snd_nxt + 1,
           [:rst],
           0
         )
@@ -4760,8 +4832,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4783,8 +4855,8 @@ defmodule Tricep.SocketTest do
       our_fin_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 2,
-          last_ack_state.snd_nxt,
+          state.tcb.irs + 2,
+          last_ack_state.tcb.snd_nxt,
           [:ack],
           32768
         )
@@ -4810,8 +4882,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4863,8 +4935,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4907,8 +4979,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -4930,8 +5002,8 @@ defmodule Tricep.SocketTest do
       wrong_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 2,
-          last_ack_state.snd_nxt - 1,
+          state.tcb.irs + 2,
+          last_ack_state.tcb.snd_nxt - 1,
           [:ack],
           32768
         )
@@ -5119,7 +5191,7 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
+          state.tcb.irs + 1,
           parsed.seq + byte_size(parsed.payload),
           [:ack],
           32768
@@ -5158,7 +5230,7 @@ defmodule Tricep.SocketTest do
       send(socket, {:icmpv6_error, {:packet_too_big, 1300}})
 
       wait_for_socket(socket, fn
-        {:established, %{snd_mss: 1240, unacked_segments: segments}} ->
+        {:established, %{tcb: %{snd_mss: 1240}, unacked_segments: segments}} ->
           Enum.map(segments, fn {seq_start, seq_end, payload, _count} ->
             {seq_start, seq_end, byte_size(payload)}
           end) == [
@@ -5192,7 +5264,7 @@ defmodule Tricep.SocketTest do
       send(socket, {:icmpv6_error, {:packet_too_big, 1200}})
 
       wait_for_socket(socket, fn
-        {:established, %{snd_mss: 1220}} -> true
+        {:established, %{tcb: %{snd_mss: 1220}}} -> true
         _state -> false
       end)
     end
@@ -5320,18 +5392,18 @@ defmodule Tricep.SocketTest do
         local_addr,
         remote_addr,
         src_port,
-        state_before_ack.rcv_nxt,
-        state_before_ack.snd_una,
+        state_before_ack.tcb.rcv_nxt,
+        state_before_ack.tcb.snd_una,
         12_345
       )
 
       {:established, state_after_ack} = :sys.get_state(socket)
 
-      assert state_after_ack.snd_una == state_before_ack.snd_una
-      assert state_after_ack.snd_nxt == state_before_ack.snd_nxt
+      assert state_after_ack.tcb.snd_una == state_before_ack.tcb.snd_una
+      assert state_after_ack.tcb.snd_nxt == state_before_ack.tcb.snd_nxt
       assert state_after_ack.unacked_segments == state_before_ack.unacked_segments
       assert state_after_ack.rto_timer_active == true
-      assert state_after_ack.snd_wnd == 12_345
+      assert state_after_ack.tcb.snd_wnd == 12_345
       refute_receive {:dummy_link_packet, _link, _packet}, 100
     end
 
@@ -5367,15 +5439,15 @@ defmodule Tricep.SocketTest do
         local_addr,
         remote_addr,
         src_port,
-        state_before_ack.rcv_nxt,
+        state_before_ack.tcb.rcv_nxt,
         partial_ack,
         40_000
       )
 
       {:established, state_after_ack} = :sys.get_state(socket)
 
-      assert state_after_ack.snd_una == partial_ack
-      assert state_after_ack.snd_nxt == state_before_ack.snd_nxt
+      assert state_after_ack.tcb.snd_una == partial_ack
+      assert state_after_ack.tcb.snd_nxt == state_before_ack.tcb.snd_nxt
       assert state_after_ack.rto_timer_active == true
 
       assert [{seq_start, seq_end, payload, _count}] = state_after_ack.unacked_segments
@@ -5412,14 +5484,14 @@ defmodule Tricep.SocketTest do
         local_addr,
         remote_addr,
         src_port,
-        state_before_ack.rcv_nxt,
+        state_before_ack.tcb.rcv_nxt,
         full_ack
       )
 
       {:established, state_after_ack} = :sys.get_state(socket)
 
-      assert state_after_ack.snd_una == full_ack
-      assert state_after_ack.snd_una == state_before_ack.snd_nxt
+      assert state_after_ack.tcb.snd_una == full_ack
+      assert state_after_ack.tcb.snd_una == state_before_ack.tcb.snd_nxt
       assert state_after_ack.unacked_segments == []
       assert state_after_ack.rto_timer_active == false
     end
@@ -5441,14 +5513,14 @@ defmodule Tricep.SocketTest do
       {{_, src_port}, _} = state_before_ack.pair
 
       assert length(state_before_ack.unacked_segments) == 1
-      invalid_ack = wrap_seq(state_before_ack.snd_nxt + 1)
+      invalid_ack = wrap_seq(state_before_ack.tcb.snd_nxt + 1)
 
       inject_ack(
         link,
         local_addr,
         remote_addr,
         src_port,
-        state_before_ack.rcv_nxt,
+        state_before_ack.tcb.rcv_nxt,
         invalid_ack,
         1
       )
@@ -5458,14 +5530,14 @@ defmodule Tricep.SocketTest do
       corrective = Tcp.parse_segment(corrective_segment)
 
       assert :ack in corrective.flags
-      assert corrective.seq == state_before_ack.snd_nxt
-      assert corrective.ack == state_before_ack.rcv_nxt
+      assert corrective.seq == state_before_ack.tcb.snd_nxt
+      assert corrective.ack == state_before_ack.tcb.rcv_nxt
 
       {:established, state_after_ack} = :sys.get_state(socket)
 
-      assert state_after_ack.snd_una == state_before_ack.snd_una
-      assert state_after_ack.snd_nxt == state_before_ack.snd_nxt
-      assert state_after_ack.snd_wnd == state_before_ack.snd_wnd
+      assert state_after_ack.tcb.snd_una == state_before_ack.tcb.snd_una
+      assert state_after_ack.tcb.snd_nxt == state_before_ack.tcb.snd_nxt
+      assert state_after_ack.tcb.snd_wnd == state_before_ack.tcb.snd_wnd
       assert state_after_ack.unacked_segments == state_before_ack.unacked_segments
       assert state_after_ack.rto_timer_active == true
     end
@@ -5501,7 +5573,7 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
+          state.tcb.irs + 1,
           parsed.seq + byte_size(parsed.payload),
           [:ack],
           32768
@@ -5533,8 +5605,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:fin, :ack],
           32768
         )
@@ -5700,7 +5772,7 @@ defmodule Tricep.SocketTest do
 
       # Drain ACK
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
-      assert {:established, %{snd_mss: 48}} = :sys.get_state(socket)
+      assert {:established, %{tcb: %{snd_mss: 48}}} = :sys.get_state(socket)
     end
 
     test "nowait connect accepts SYN-ACK that acknowledges wrapped active-open ISS", %{
@@ -5719,7 +5791,8 @@ defmodule Tricep.SocketTest do
 
       :sys.replace_state(socket, fn
         {{:syn_sent, :nowait}, state} ->
-          {{:syn_sent, :nowait}, %{state | iss: 0xFFFFFFFF, snd_una: 0xFFFFFFFF, snd_nxt: 0}}
+          {{:syn_sent, :nowait},
+           %{state | tcb: %{state.tcb | iss: 0xFFFFFFFF, snd_una: 0xFFFFFFFF, snd_nxt: 0}}}
       end)
 
       server_seq = 5000
@@ -5738,7 +5811,8 @@ defmodule Tricep.SocketTest do
       assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
       assert Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}) == :ok
 
-      assert {:established, %{snd_una: 0, snd_nxt: 0, rcv_nxt: 5001}} = :sys.get_state(socket)
+      assert {:established, %{tcb: %{snd_una: 0, snd_nxt: 0, rcv_nxt: 5001}}} =
+               :sys.get_state(socket)
 
       assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
       <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
@@ -6220,8 +6294,8 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          wrap_seq(state.snd_nxt + byte_size(big_data)),
+          state.tcb.irs + 1,
+          wrap_seq(state.tcb.snd_nxt + byte_size(big_data)),
           [:ack],
           32768
         )
@@ -6254,8 +6328,8 @@ defmodule Tricep.SocketTest do
       window_update =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack],
           4
         )
@@ -6297,7 +6371,7 @@ defmodule Tricep.SocketTest do
       probe = Tcp.parse_segment(probe_segment)
 
       assert probe.payload == "a"
-      assert probe.seq == wrap_seq(state.snd_nxt - 1)
+      assert probe.seq == wrap_seq(state.tcb.snd_nxt - 1)
 
       {:established, after_probe} = :sys.get_state(socket)
       assert after_probe.persist_timer_active
@@ -6306,8 +6380,8 @@ defmodule Tricep.SocketTest do
       window_update =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack],
           3
         )
@@ -6321,7 +6395,7 @@ defmodule Tricep.SocketTest do
       data = Tcp.parse_segment(data_segment)
 
       assert data.payload == "abc"
-      assert data.seq == state.snd_nxt
+      assert data.seq == state.tcb.snd_nxt
 
       {:established, opened_state} = :sys.get_state(socket)
       refute opened_state.persist_timer_active
@@ -6350,7 +6424,7 @@ defmodule Tricep.SocketTest do
 
   defp get_socket_snd_nxt(socket) do
     {_state_name, state} = :sys.get_state(socket)
-    state.snd_nxt
+    state.tcb.snd_nxt
   end
 
   defp shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr) do
@@ -6366,8 +6440,8 @@ defmodule Tricep.SocketTest do
     ack_segment =
       Tcp.build_segment(
         {{local_addr, @port}, {remote_addr, src_port}},
-        state.irs + 1,
-        state.snd_nxt + 1,
+        state.tcb.irs + 1,
+        state.tcb.snd_nxt + 1,
         [:ack],
         32768
       )
@@ -6584,8 +6658,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
           [:ack, :psh],
           32768,
           payload: "still receiving"
@@ -6613,8 +6687,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack, :psh],
           32768,
           payload: "half-close data"
@@ -6643,8 +6717,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:ack, :psh],
           32768,
           payload: "ready"
@@ -6687,8 +6761,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.snd_nxt + 1,
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt + 1,
           [:fin, :ack],
           32768
         )
@@ -6728,7 +6802,7 @@ defmodule Tricep.SocketTest do
       ack_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
+          state.tcb.irs + 1,
           wrap_seq(parsed1.seq + byte_size(parsed1.payload)),
           [:ack],
           2
@@ -6833,8 +6907,8 @@ defmodule Tricep.SocketTest do
       data_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.iss + 1,
+          state.tcb.irs + 1,
+          state.tcb.iss + 1,
           [:ack, :psh],
           32768,
           payload: "buffered data"
@@ -6892,8 +6966,8 @@ defmodule Tricep.SocketTest do
       fin_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.irs + 1,
-          state.iss + 1,
+          state.tcb.irs + 1,
+          state.tcb.iss + 1,
           [:fin, :ack],
           32768
         )

@@ -105,7 +105,7 @@ defmodule Tricep.TunLinkTest do
       assert log =~ "ICMPv6 Packet Too Big mtu=1200"
 
       wait_for_socket(socket, fn
-        {:established, %{snd_mss: 1220}} -> true
+        {:established, %{tcb: %{snd_mss: 1220}}} -> true
         _state -> false
       end)
     end
@@ -117,7 +117,8 @@ defmodule Tricep.TunLinkTest do
       socket = establish_connection(local_addr, remote_addr)
 
       :sys.replace_state(socket, fn
-        {:established, state} -> {:established, %{state | snd_mss: 1460}}
+        {:established, state} ->
+          {:established, %{state | tcb: %{state.tcb | snd_mss: 1460}}}
       end)
 
       {quoted_packet, _state} = quoted_tcp_packet(socket)
@@ -134,7 +135,7 @@ defmodule Tricep.TunLinkTest do
         end)
 
       assert log =~ "Ignoring ICMPv6 packet with invalid checksum"
-      assert {:established, %{snd_mss: 1460}} = :sys.get_state(socket)
+      assert {:established, %{tcb: %{snd_mss: 1460}}} = :sys.get_state(socket)
     end
 
     test "Destination Unreachable closes affected TCP socket and notifies waiters", %{
@@ -324,8 +325,8 @@ defmodule Tricep.TunLinkTest do
     tcp_segment =
       Tcp.build_segment(
         state.pair,
-        state.snd_nxt,
-        state.rcv_nxt,
+        state.tcb.snd_nxt,
+        state.tcb.rcv_nxt,
         [:ack],
         32768
       )
