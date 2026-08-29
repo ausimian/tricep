@@ -1236,7 +1236,7 @@ defmodule Tricep.SocketTest do
       assert state.snd_mss == 1220
     end
 
-    test "SYN advertises window scale for large receive buffers" do
+    test "SYN advertises an unscaled maximum window with a non-zero scale offer" do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 1_000_000})
 
       task =
@@ -1250,7 +1250,7 @@ defmodule Tricep.SocketTest do
       parsed = Tcp.parse_segment(tcp_segment)
 
       assert parsed.options.window_scale == 4
-      assert parsed.window == 62_500
+      assert parsed.window == 65_535
 
       Task.shutdown(task, :brutal_kill)
     end
@@ -1260,7 +1260,7 @@ defmodule Tricep.SocketTest do
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
-      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 1_000_000})
 
       task =
         Task.async(fn ->
@@ -1279,7 +1279,7 @@ defmodule Tricep.SocketTest do
           5000,
           syn_parsed.seq + 1,
           [:syn, :ack],
-          10,
+          65_535,
           window_scale: 4,
           sack_permitted: true,
           timestamp: {123, 456}
@@ -1292,9 +1292,159 @@ defmodule Tricep.SocketTest do
       {:established, state} = :sys.get_state(socket)
 
       assert state.snd_wnd_scale == 4
-      assert state.snd_wnd == 160
+      assert state.rcv_wnd_scale == 4
+      assert state.window_scaling_negotiated
+      assert state.snd_wnd == 65_535
+
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      assert Tcp.parse_segment(ack_segment).window == 62_499
+
+      {{_, src_port}, _} = state.pair
+
+      window_update =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.rcv_nxt,
+          state.snd_nxt,
+          [:ack],
+          10
+        )
+
+      DummyLink.inject_packet(link, window_update)
+      assert {:established, %{snd_wnd: 160}} = :sys.get_state(socket)
+
       refute Map.has_key?(state, :peer_sack_permitted)
       refute Map.has_key?(state, :peer_timestamp)
+    end
+
+    test "nowait active open disables scaling when SYN-ACK omits the option", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 1_000_000})
+
+      assert {:select, {:select_info, :connect, ref}} =
+               Tricep.connect(
+                 socket,
+                 %{family: :inet6, addr: @local_addr_str, port: @port},
+                 :nowait
+               )
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      assert syn.options.window_scale == 4
+      assert syn.window == 65_535
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn.seq + 1,
+          [:syn, :ack],
+          65_535
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+
+      assert Tcp.parse_segment(ack_segment).window == 65_535
+
+      assert {:established, state} = :sys.get_state(socket)
+      assert state.snd_wnd == 65_535
+      assert state.snd_wnd_scale == 0
+      assert state.rcv_wnd_scale == 0
+      refute state.window_scaling_negotiated
+    end
+
+    test "blocking active open disables scaling when SYN-ACK omits the option", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 1_000_000})
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn.seq + 1,
+          [:syn, :ack],
+          65_535
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert Task.await(task, 1000) == :ok
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      assert Tcp.parse_segment(ack_segment).window == 65_535
+
+      assert {:established, state} = :sys.get_state(socket)
+      assert state.rcv_wnd == 65_535
+      assert state.snd_wnd_scale == 0
+      assert state.rcv_wnd_scale == 0
+      refute state.window_scaling_negotiated
+    end
+
+    test "nowait active open negotiates scaling and clamps the peer shift", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 1_000_000})
+
+      assert {:select, {:select_info, :connect, ref}} =
+               Tricep.connect(
+                 socket,
+                 %{family: :inet6, addr: @local_addr_str, port: @port},
+                 :nowait
+               )
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      syn_ack_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn.seq + 1,
+          [:syn, :ack],
+          65_535,
+          window_scale: 255
+        )
+
+      DummyLink.inject_packet(link, syn_ack_segment)
+
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+      assert Tcp.parse_segment(ack_segment).window == 62_499
+
+      assert {:established, state} = :sys.get_state(socket)
+      assert state.snd_wnd == 65_535
+      assert state.snd_wnd_scale == 14
+      assert state.rcv_wnd_scale == 4
+      assert state.window_scaling_negotiated
     end
 
     test "passive open advertises and stores negotiated window scale", %{
@@ -1316,7 +1466,7 @@ defmodule Tricep.SocketTest do
           client_seq,
           0,
           [:syn],
-          10,
+          65_535,
           mss: 1000,
           window_scale: 3,
           sack_permitted: true,
@@ -1331,7 +1481,13 @@ defmodule Tricep.SocketTest do
       syn_ack = Tcp.parse_segment(syn_ack_segment)
 
       assert syn_ack.options.window_scale == 4
-      assert syn_ack.window == 62_500
+      assert syn_ack.window == 65_535
+
+      {:listen, listen_state} = :sys.get_state(listener)
+      [child] = Map.keys(listen_state.children)
+
+      assert {:syn_received, %{snd_wnd: 65_535, window_scaling_negotiated: true}} =
+               :sys.get_state(child)
 
       send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
 
@@ -1342,8 +1498,517 @@ defmodule Tricep.SocketTest do
 
       assert state.snd_wnd_scale == 3
       assert state.snd_wnd == 262_144
+      assert state.rcv_adv_wnd == 999_984
+      assert state.rcv_wnd == 999_984
       refute Map.has_key?(state, :peer_sack_permitted)
       refute Map.has_key?(state, :peer_timestamp)
+
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "scaled receive window bounds quantization retraction and preserves entitlement", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 1_000_000})
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      client_port = 40_014
+      client_seq = 0xFFFFF000
+
+      syn =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          client_seq,
+          0,
+          [:syn],
+          65_535,
+          window_scale: 3
+        )
+
+      DummyLink.inject_packet(link, syn)
+
+      assert_receive {:dummy_link_packet, _link, syn_ack_packet}, 1000
+      <<_ip_header::binary-size(40), syn_ack_segment::binary>> = syn_ack_packet
+      syn_ack = Tcp.parse_segment(syn_ack_segment)
+
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      assert {:ok, accepted} = Tricep.accept(listener, 1000)
+      on_exit(fn -> stop_socket(accepted) end)
+
+      assert {:established, initial_state} = :sys.get_state(accepted)
+      assert initial_state.rcv_adv_wnd == 999_984
+      assert initial_state.rcv_wnd == 999_984
+
+      initial_offered_edge = wrap_seq(initial_state.rcv_nxt + initial_state.rcv_adv_wnd)
+
+      {buffered_state, final_offered_edge, saw_retraction, _authorized_edge} =
+        Enum.reduce(
+          1..66,
+          {initial_state, initial_offered_edge, false, initial_state.rcv_right_edge},
+          fn _, {state, previous_edge, saw_retraction, previous_authorized_edge} ->
+            # 1000 is intentionally not a multiple of the scale-4 quantum.
+            payload = :binary.copy("x", 1000)
+
+            data_segment =
+              Tcp.build_segment(
+                {{local_addr, client_port}, {remote_addr, @port}},
+                state.rcv_nxt,
+                state.snd_nxt,
+                [:ack, :psh],
+                32_768,
+                payload: payload
+              )
+
+            DummyLink.inject_packet(link, data_segment)
+
+            assert_receive {:dummy_link_packet, _link, data_ack_packet}, 1000
+            <<_ip_header::binary-size(40), data_ack_segment::binary>> = data_ack_packet
+            data_ack = Tcp.parse_segment(data_ack_segment)
+
+            offered_edge =
+              wrap_seq(data_ack.ack + Bitwise.bsl(data_ack.window, state.rcv_wnd_scale))
+
+            forward_delta = Bitwise.band(offered_edge - previous_edge, 0xFFFFFFFF)
+            retraction = Bitwise.band(previous_edge - offered_edge, 0xFFFFFFFF)
+            retracted? = forward_delta >= 0x80000000
+
+            if retracted?, do: assert(retraction <= 15)
+
+            assert {:established, new_state} = :sys.get_state(accepted)
+
+            assert new_state.rcv_wnd <=
+                     new_state.recv_buffer_size - byte_size(new_state.recv_buffer)
+
+            assert new_state.rcv_adv_wnd <=
+                     new_state.recv_buffer_size - byte_size(new_state.recv_buffer)
+
+            assert Bitwise.band(new_state.rcv_right_edge - previous_authorized_edge, 0xFFFFFFFF) <
+                     0x80000000
+
+            {new_state, offered_edge, saw_retraction or retracted?, new_state.rcv_right_edge}
+          end
+        )
+
+      assert byte_size(buffered_state.recv_buffer) == 66_000
+      assert saw_retraction
+
+      assert Bitwise.band(buffered_state.rcv_right_edge - final_offered_edge, 0xFFFFFFFF) <
+               0x80000000
+
+      assert {:ok, drained} = Tricep.recv(accepted, 16, 1000)
+      assert drained == :binary.copy("x", 16)
+
+      assert_receive {:dummy_link_packet, _link, update_packet}, 1000
+      <<_ip_header::binary-size(40), update_segment::binary>> = update_packet
+      update = Tcp.parse_segment(update_segment)
+      assert update.window == 58_376
+
+      update_edge =
+        wrap_seq(update.ack + Bitwise.bsl(update.window, buffered_state.rcv_wnd_scale))
+
+      assert Bitwise.band(update_edge - final_offered_edge, 0xFFFFFFFF) < 0x80000000
+
+      {:established, reopened_state} = :sys.get_state(accepted)
+      assert reopened_state.rcv_adv_wnd == 934_016
+
+      assert reopened_state.rcv_wnd <=
+               reopened_state.recv_buffer_size - byte_size(reopened_state.recv_buffer)
+
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "out-of-order buffering retracts the encoded edge only to physical capacity", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(link, local_addr, remote_addr,
+          open_opts: %{recv_buffer_size: 1_000_000},
+          window_scale: 0
+        )
+
+      on_exit(fn -> stop_socket(socket) end)
+      assert_receive {:dummy_link_packet, _link, _handshake_ack_packet}, 1000
+
+      assert {:established, initial_state} = :sys.get_state(socket)
+      assert initial_state.rcv_wnd_scale == 4
+      {{_, src_port}, _} = initial_state.pair
+
+      initial_edge = wrap_seq(initial_state.rcv_nxt + initial_state.rcv_adv_wnd)
+
+      out_of_order_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(initial_state.rcv_nxt + 500_000),
+          initial_state.snd_nxt,
+          [:ack, :psh],
+          32_768,
+          payload: :binary.copy("o", 1440)
+        )
+
+      DummyLink.inject_packet(link, out_of_order_segment)
+      assert_receive {:dummy_link_packet, _link, duplicate_ack_packet}, 1000
+      <<_ip_header::binary-size(40), duplicate_ack_segment::binary>> = duplicate_ack_packet
+      duplicate_ack = Tcp.parse_segment(duplicate_ack_segment)
+      assert duplicate_ack.ack == initial_state.rcv_nxt
+
+      encoded_edge =
+        wrap_seq(
+          duplicate_ack.ack +
+            Bitwise.bsl(duplicate_ack.window, initial_state.rcv_wnd_scale)
+        )
+
+      retraction = Bitwise.band(initial_edge - encoded_edge, 0xFFFFFFFF)
+      assert retraction > 15
+      assert retraction <= 1440
+
+      assert {:established, buffered_state} = :sys.get_state(socket)
+
+      available =
+        buffered_state.recv_buffer_size -
+          byte_size(buffered_state.recv_buffer) -
+          Enum.sum(
+            Enum.map(buffered_state.out_of_order_segments, fn {_seq, _seq_end, payload} ->
+              byte_size(payload)
+            end)
+          )
+
+      assert length(buffered_state.out_of_order_segments) == 1
+      assert buffered_state.rcv_adv_wnd <= available
+      assert buffered_state.rcv_wnd <= available
+      assert buffered_state.rcv_right_edge == initial_state.rcv_right_edge
+    end
+
+    test "scaled zero window retains an already-authorized byte and FIN", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 65_536})
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      client_port = 40_015
+      client_seq = 11_000
+
+      syn =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          client_seq,
+          0,
+          [:syn],
+          65_535,
+          window_scale: 0
+        )
+
+      DummyLink.inject_packet(link, syn)
+      assert_receive {:dummy_link_packet, _link, syn_ack_packet}, 1000
+      <<_ip_header::binary-size(40), syn_ack_segment::binary>> = syn_ack_packet
+      syn_ack = Tcp.parse_segment(syn_ack_segment)
+      assert syn_ack.options.window_scale == 1
+
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+      assert {:ok, accepted} = Tricep.accept(listener, 1000)
+      on_exit(fn -> stop_socket(accepted) end)
+
+      {:established, initial_state} = :sys.get_state(accepted)
+
+      almost_closed_state =
+        Enum.reduce_while(1..100, initial_state, fn _, state ->
+          if state.rcv_adv_wnd == 2 do
+            {:halt, state}
+          else
+            chunk_size = min(1440, state.rcv_adv_wnd - 2)
+
+            data_segment =
+              Tcp.build_segment(
+                {{local_addr, client_port}, {remote_addr, @port}},
+                state.rcv_nxt,
+                state.snd_nxt,
+                [:ack, :psh],
+                32_768,
+                payload: :binary.copy("z", chunk_size)
+              )
+
+            DummyLink.inject_packet(link, data_segment)
+            assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+            <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+            assert Tcp.parse_segment(ack_segment).window > 0
+            assert {:established, new_state} = :sys.get_state(accepted)
+            {:cont, new_state}
+          end
+        end)
+
+      assert almost_closed_state.rcv_adv_wnd == 2
+
+      one_byte = fn state ->
+        segment =
+          Tcp.build_segment(
+            {{local_addr, client_port}, {remote_addr, @port}},
+            state.rcv_nxt,
+            state.snd_nxt,
+            [:ack, :psh],
+            32_768,
+            payload: "z"
+          )
+
+        DummyLink.inject_packet(link, segment)
+        assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+        <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+        {Tcp.parse_segment(ack_segment), :sys.get_state(accepted)}
+      end
+
+      {zero_ack, {:established, zero_state}} = one_byte.(almost_closed_state)
+      assert zero_ack.window == 0
+      assert zero_state.rcv_adv_wnd == 0
+      assert zero_state.rcv_wnd == 1
+      assert zero_state.rcv_wnd <= zero_state.recv_buffer_size - byte_size(zero_state.recv_buffer)
+
+      fin_segment =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          zero_state.rcv_nxt,
+          zero_state.snd_nxt,
+          [:fin, :ack],
+          32_768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      assert_receive {:dummy_link_packet, _link, final_ack_packet}, 1000
+      <<_ip_header::binary-size(40), final_ack_segment::binary>> = final_ack_packet
+      assert Tcp.parse_segment(final_ack_segment).window == 0
+
+      assert {:close_wait, final_state} = :sys.get_state(accepted)
+      assert final_state.rcv_adv_wnd == 0
+      assert final_state.rcv_wnd == 0
+      assert final_state.fin_received
+      assert byte_size(final_state.recv_buffer) == 65_535
+
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "bare FIN at RCV.NXT closes a completely full zero window", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      for {buffer_size, peer_window_scale} <- [{65_535, nil}, {65_536, 0}] do
+        opts = [open_opts: %{recv_buffer_size: buffer_size}]
+
+        opts =
+          if is_nil(peer_window_scale),
+            do: opts,
+            else: Keyword.put(opts, :window_scale, peer_window_scale)
+
+        socket = establish_connection(link, local_addr, remote_addr, opts)
+        on_exit(fn -> stop_socket(socket) end)
+
+        # Drain the active opener's final handshake ACK.
+        assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+        {:established, initial_state} = :sys.get_state(socket)
+        {{_, src_port}, _} = initial_state.pair
+
+        full_state =
+          Enum.reduce_while(1..100, initial_state, fn _, state ->
+            remaining = buffer_size - byte_size(state.recv_buffer)
+
+            if remaining == 0 do
+              {:halt, state}
+            else
+              chunk_size = min(1440, min(remaining, state.rcv_wnd))
+              assert chunk_size > 0
+
+              data_segment =
+                Tcp.build_segment(
+                  {{local_addr, @port}, {remote_addr, src_port}},
+                  state.rcv_nxt,
+                  state.snd_nxt,
+                  [:ack, :psh],
+                  32_768,
+                  payload: :binary.copy("f", chunk_size)
+                )
+
+              DummyLink.inject_packet(link, data_segment)
+              assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
+              <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
+              assert Tcp.parse_segment(ack_segment).ack == wrap_seq(state.rcv_nxt + chunk_size)
+              assert {:established, next_state} = :sys.get_state(socket)
+              {:cont, next_state}
+            end
+          end)
+
+        assert byte_size(full_state.recv_buffer) == buffer_size
+        assert full_state.rcv_wnd == 0
+        assert full_state.rcv_adv_wnd == 0
+
+        rejected_data =
+          Tcp.build_segment(
+            {{local_addr, @port}, {remote_addr, src_port}},
+            full_state.rcv_nxt,
+            full_state.snd_nxt,
+            [:ack, :psh],
+            32_768,
+            payload: "x"
+          )
+
+        DummyLink.inject_packet(link, rejected_data)
+        assert_receive {:dummy_link_packet, _link, zero_window_ack_packet}, 1000
+        <<_ip_header::binary-size(40), zero_window_ack_segment::binary>> = zero_window_ack_packet
+        zero_window_ack = Tcp.parse_segment(zero_window_ack_segment)
+        assert zero_window_ack.ack == full_state.rcv_nxt
+        assert zero_window_ack.window == 0
+        assert {:established, rejected_state} = :sys.get_state(socket)
+        assert rejected_state.rcv_nxt == full_state.rcv_nxt
+        assert rejected_state.recv_buffer == full_state.recv_buffer
+
+        fin_without_ack =
+          Tcp.build_segment(
+            {{local_addr, @port}, {remote_addr, src_port}},
+            full_state.rcv_nxt,
+            full_state.snd_nxt,
+            [:fin],
+            32_768
+          )
+
+        DummyLink.inject_packet(link, fin_without_ack)
+        assert_receive {:dummy_link_packet, _link, rejected_fin_ack_packet}, 1000
+
+        <<_ip_header::binary-size(40), rejected_fin_ack_segment::binary>> =
+          rejected_fin_ack_packet
+
+        rejected_fin_ack = Tcp.parse_segment(rejected_fin_ack_segment)
+        assert rejected_fin_ack.ack == full_state.rcv_nxt
+        assert rejected_fin_ack.window == 0
+        assert {:established, no_ack_fin_state} = :sys.get_state(socket)
+        refute no_ack_fin_state.fin_received
+        assert no_ack_fin_state.recv_buffer == full_state.recv_buffer
+
+        fin_segment =
+          Tcp.build_segment(
+            {{local_addr, @port}, {remote_addr, src_port}},
+            full_state.rcv_nxt,
+            full_state.snd_nxt,
+            [:fin, :ack],
+            32_768
+          )
+
+        DummyLink.inject_packet(link, fin_segment)
+        assert_receive {:dummy_link_packet, _link, fin_ack_packet}, 1000
+        <<_ip_header::binary-size(40), fin_ack_segment::binary>> = fin_ack_packet
+        assert Tcp.parse_segment(fin_ack_segment).ack == wrap_seq(full_state.rcv_nxt + 1)
+
+        assert {:close_wait, close_wait_state} = :sys.get_state(socket)
+        assert close_wait_state.fin_received
+        assert byte_size(close_wait_state.recv_buffer) == buffer_size
+
+        assert {:ok, drained} = Tricep.recv(socket, 0, 1000)
+        assert byte_size(drained) == buffer_size
+        assert_receive {:dummy_link_packet, _link, _window_update_packet}, 1000
+        assert {:ok, <<>>} = Tricep.recv(socket, 0, 1000)
+      end
+    end
+
+    test "passive open omits window scale when the SYN omits it", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 1_000_000})
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      client_port = 40_011
+      client_seq = 9001
+
+      syn =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          client_seq,
+          0,
+          [:syn],
+          65_535,
+          mss: 1000
+        )
+
+      DummyLink.inject_packet(link, syn)
+
+      assert_receive {:dummy_link_packet, _link, syn_ack_packet}, 1000
+      <<_ip_header::binary-size(40), syn_ack_segment::binary>> = syn_ack_packet
+      syn_ack = Tcp.parse_segment(syn_ack_segment)
+
+      refute Map.has_key?(syn_ack.options, :window_scale)
+      assert syn_ack.window == 65_535
+
+      {:listen, listen_state} = :sys.get_state(listener)
+      [child] = Map.keys(listen_state.children)
+
+      assert {:syn_received, state} = :sys.get_state(child)
+      assert state.snd_wnd == 65_535
+      assert state.snd_wnd_scale == 0
+      assert state.rcv_wnd_scale == 0
+      refute state.window_scaling_negotiated
+
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      assert {:ok, accepted} = Tricep.accept(listener, 1000)
+      on_exit(fn -> stop_socket(accepted) end)
+
+      assert {:established, %{snd_wnd: 32_768}} = :sys.get_state(accepted)
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "passive SYN-ACK retransmission preserves negotiated option presence", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp, %{recv_buffer_size: 1_000_000})
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 2) == :ok
+
+      for {client_port, options} <- [{40_012, [window_scale: 3]}, {40_013, []}] do
+        syn =
+          Tcp.build_segment(
+            {{local_addr, client_port}, {remote_addr, @port}},
+            9000 + client_port,
+            0,
+            [:syn],
+            65_535,
+            options
+          )
+
+        DummyLink.inject_packet(link, syn)
+        assert_receive {:dummy_link_packet, _link, _initial_syn_ack}, 1000
+      end
+
+      retransmissions =
+        for _ <- 1..2 do
+          assert_receive {:dummy_link_packet, _link, packet}, 1500
+          packet
+        end
+
+      retransmissions_by_port =
+        Map.new(retransmissions, fn packet ->
+          <<_ip_header::binary-size(40), tcp_segment::binary>> = packet
+          <<_src_port::16, dst_port::16, _rest::binary>> = tcp_segment
+
+          {dst_port, Tcp.parse_segment(tcp_segment)}
+        end)
+
+      assert retransmissions_by_port[40_012].options.window_scale == 4
+      refute Map.has_key?(retransmissions_by_port[40_013].options, :window_scale)
+      assert retransmissions_by_port[40_012].window == 65_535
+      assert retransmissions_by_port[40_013].window == 65_535
 
       assert Tricep.close(listener) == :ok
     end
@@ -1615,6 +2280,48 @@ defmodule Tricep.SocketTest do
       {:established, reopened_state} = :sys.get_state(socket)
       assert reopened_state.rcv_wnd == 7
       assert reopened_state.recv_buffer == "def"
+    end
+
+    test "recv does not repeat a capped unscaled window advertisement", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(link, local_addr, remote_addr,
+          open_opts: %{recv_buffer_size: 1_000_000}
+        )
+
+      assert_receive {:dummy_link_packet, _link, _handshake_ack}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+      assert state.rcv_wnd == 65_535
+      refute state.window_scaling_negotiated
+
+      data_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.rcv_nxt,
+          state.snd_nxt,
+          [:ack, :psh],
+          32_768,
+          payload: "ab"
+        )
+
+      DummyLink.inject_packet(link, data_segment)
+
+      assert_receive {:dummy_link_packet, _link, data_ack_packet}, 1000
+      <<_ip_header::binary-size(40), data_ack_segment::binary>> = data_ack_packet
+      assert Tcp.parse_segment(data_ack_segment).window == 65_535
+
+      assert Tricep.recv(socket, 1, 1000) == {:ok, "a"}
+      refute_receive {:dummy_link_packet, _link, _window_update}, 100
+
+      assert Tricep.recv(socket, 1, 1000) == {:ok, "b"}
+      refute_receive {:dummy_link_packet, _link, _window_update}, 100
+
+      assert {:established, %{rcv_wnd: 65_535, recv_buffer: <<>>}} = :sys.get_state(socket)
     end
 
     test "receive buffer caps accepted payload to advertised window", %{
@@ -1971,18 +2678,22 @@ defmodule Tricep.SocketTest do
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
-      socket = establish_connection(link, local_addr, remote_addr)
+      socket =
+        establish_connection(link, local_addr, remote_addr,
+          open_opts: %{recv_buffer_size: 1_000_000}
+        )
 
       # Drain the ACK packet
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
 
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
+      assert state.rcv_wnd == 65_535
 
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          wrap_seq(state.rcv_nxt + state.rcv_wnd + 1),
+          wrap_seq(state.rcv_nxt + 65_535),
           state.snd_nxt,
           [:rst],
           0
@@ -4874,10 +5585,9 @@ defmodule Tricep.SocketTest do
 
     # Build SYN-ACK with optional MSS/window
     server_seq = 5000
-    mss = Keyword.get(opts, :mss)
     window = Keyword.get(opts, :window, 32768)
 
-    segment_opts = if mss, do: [mss: mss], else: []
+    segment_opts = Keyword.take(opts, [:mss, :window_scale])
 
     syn_ack_segment =
       Tcp.build_segment(

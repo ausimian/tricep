@@ -186,6 +186,10 @@ defmodule Tricep.Socket do
     field :irs, non_neg_integer() | nil, default: nil
     field :rcv_nxt, non_neg_integer() | nil, default: nil
     field :rcv_wnd, non_neg_integer() | nil, default: nil
+    # Effective (post-scale) window represented by the outgoing 16-bit field
+    field :rcv_adv_wnd, non_neg_integer() | nil, default: nil
+    # Furthest logical edge previously offered; physical admission stays capped
+    field :rcv_right_edge, non_neg_integer() | nil, default: nil
     # MSS we advertise to peer (what we can receive)
     field :rcv_mss, non_neg_integer() | nil, default: nil
     # Effective send MSS after applying peer, path, and protocol bounds
@@ -194,6 +198,8 @@ defmodule Tricep.Socket do
     field :rcv_wnd_scale, non_neg_integer(), default: 0
     # Window scale peer advertised for its receive window
     field :snd_wnd_scale, non_neg_integer(), default: 0
+    # Window scaling is enabled only after both SYNs carried the option
+    field :window_scaling_negotiated, boolean(), default: false
     # Buffers for data transfer
     field :send_buffer, DataBuffer.t(), default: DataBuffer.new()
     field :recv_buffer, binary(), default: <<>>
@@ -597,12 +603,12 @@ defmodule Tricep.Socket do
 
   def handle_event(:internal, {:send_syn, from, timeout}, :closed, %__MODULE__{} = state) do
     iss = :crypto.strong_rand_bytes(4) |> :binary.decode_unsigned()
-    rcv_wnd = advertised_receive_window(state)
+    syn_window = advertised_syn_window(state)
 
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(state.pair, iss, 0, [:syn], rcv_wnd,
+      Tcp.build_segment(state.pair, iss, 0, [:syn], syn_window,
         mss: state.rcv_mss,
         window_scale: state.rcv_wnd_scale
       )
@@ -616,7 +622,7 @@ defmodule Tricep.Socket do
         snd_una: iss,
         snd_nxt: wrap_seq(iss + 1),
         snd_wnd: 0,
-        rcv_wnd: rcv_wnd,
+        rcv_wnd: syn_window,
         syn_retransmit_count: 0,
         rto_ms: @initial_rto_ms
     }
@@ -675,23 +681,30 @@ defmodule Tricep.Socket do
             {:next_state, :closed, nil, actions}
 
           syn? and ack? and ack == expected_ack ->
-            # Valid SYN-ACK: send ACK and transition to ESTABLISHED
-            send_ack(wrap_seq(seq + 1), state)
-
             snd_mss = peer_send_mss(options, state.rcv_mss)
-            snd_wnd_scale = peer_window_scale(options)
 
-            new_state = %{
-              state
-              | irs: seq,
-                rcv_nxt: wrap_seq(seq + 1),
-                snd_una: ack,
-                snd_wnd: scale_window(window, snd_wnd_scale),
-                snd_mss: snd_mss,
-                snd_wnd_scale: snd_wnd_scale,
-                syn_retransmit_count: 0,
-                rto_ms: @initial_rto_ms
-            }
+            {rcv_wnd_scale, snd_wnd_scale, window_scaling_negotiated} =
+              negotiated_window_scaling(options, state.rcv_wnd_scale)
+
+            new_state =
+              %{
+                state
+                | irs: seq,
+                  rcv_nxt: wrap_seq(seq + 1),
+                  snd_una: ack,
+                  # The window in a SYN or SYN-ACK is never scaled.
+                  snd_wnd: window,
+                  snd_mss: snd_mss,
+                  rcv_wnd_scale: rcv_wnd_scale,
+                  snd_wnd_scale: snd_wnd_scale,
+                  window_scaling_negotiated: window_scaling_negotiated,
+                  syn_retransmit_count: 0,
+                  rto_ms: @initial_rto_ms
+              }
+              |> open_receive_window()
+
+            # The final ACK is the first segment whose window may be scaled.
+            send_ack(new_state.rcv_nxt, new_state)
 
             # Cancel timers and reply success
             actions = [
@@ -736,26 +749,33 @@ defmodule Tricep.Socket do
             {:next_state, state_name, state_data, actions}
 
           syn? and ack? and ack == expected_ack ->
-            # Valid SYN-ACK: send ACK, notify caller, transition to ESTABLISHED
-            send_ack(wrap_seq(seq + 1), state)
-
             snd_mss = peer_send_mss(options, state.rcv_mss)
-            snd_wnd_scale = peer_window_scale(options)
+
+            {rcv_wnd_scale, snd_wnd_scale, window_scaling_negotiated} =
+              negotiated_window_scaling(options, state.rcv_wnd_scale)
 
             # Notify callers that connect can complete
             notify_selects(state.connect_selects)
 
-            new_state = %{
-              state
-              | irs: seq,
-                rcv_nxt: wrap_seq(seq + 1),
-                snd_una: ack,
-                snd_wnd: scale_window(window, snd_wnd_scale),
-                snd_mss: snd_mss,
-                snd_wnd_scale: snd_wnd_scale,
-                syn_retransmit_count: 0,
-                rto_ms: @initial_rto_ms
-            }
+            new_state =
+              %{
+                state
+                | irs: seq,
+                  rcv_nxt: wrap_seq(seq + 1),
+                  snd_una: ack,
+                  # The window in a SYN or SYN-ACK is never scaled.
+                  snd_wnd: window,
+                  snd_mss: snd_mss,
+                  rcv_wnd_scale: rcv_wnd_scale,
+                  snd_wnd_scale: snd_wnd_scale,
+                  window_scaling_negotiated: window_scaling_negotiated,
+                  syn_retransmit_count: 0,
+                  rto_ms: @initial_rto_ms
+              }
+              |> open_receive_window()
+
+            # The final ACK is the first segment whose window may be scaled.
+            send_ack(new_state.rcv_nxt, new_state)
 
             actions = [{{:timeout, :rto}, :cancel}]
             {:next_state, :established, new_state, actions}
@@ -799,14 +819,16 @@ defmodule Tricep.Socket do
             reject_unacceptable_rst(state)
 
           ack? and ack == state.snd_nxt and seq == state.rcv_nxt ->
-            base_state = %{
-              state
-              | snd_una: ack,
-                snd_wnd: scale_peer_window(state, window),
-                syn_retransmit_count: 0,
-                rto_ms: @initial_rto_ms,
-                passive_listener: nil
-            }
+            base_state =
+              %{
+                state
+                | snd_una: ack,
+                  snd_wnd: scale_peer_window(state, window),
+                  syn_retransmit_count: 0,
+                  rto_ms: @initial_rto_ms,
+                  passive_listener: nil
+              }
+              |> open_receive_window()
 
             # credo:disable-for-lines:2 Credo.Check.Refactor.Nesting
             new_state =
@@ -1973,8 +1995,10 @@ defmodule Tricep.Socket do
     %{seq: seq, window: window, options: options} = Tcp.parse_segment(segment)
     iss = :crypto.strong_rand_bytes(4) |> :binary.decode_unsigned()
     recv_buffer_size = configured_recv_buffer_size(socket_opts)
-    rcv_wnd_scale = window_scale_for(recv_buffer_size)
-    snd_wnd_scale = peer_window_scale(options)
+
+    {rcv_wnd_scale, snd_wnd_scale, window_scaling_negotiated} =
+      negotiated_window_scaling(options, window_scale_for(recv_buffer_size))
+
     local_mss = local_send_mss(mtu)
 
     %__MODULE__{
@@ -1983,14 +2007,18 @@ defmodule Tricep.Socket do
       iss: iss,
       snd_una: iss,
       snd_nxt: wrap_seq(iss + 1),
-      snd_wnd: scale_window(window, snd_wnd_scale),
+      # The window in the initial SYN is never scaled.
+      snd_wnd: window,
       irs: seq,
       rcv_nxt: wrap_seq(seq + 1),
-      rcv_wnd: recv_buffer_size,
+      rcv_wnd: min(recv_buffer_size, @max_tcp_window),
+      rcv_adv_wnd: min(recv_buffer_size, @max_tcp_window),
+      rcv_right_edge: wrap_seq(seq + 1 + min(recv_buffer_size, @max_tcp_window)),
       rcv_mss: local_mss,
       snd_mss: peer_send_mss(options, local_mss),
       rcv_wnd_scale: rcv_wnd_scale,
       snd_wnd_scale: snd_wnd_scale,
+      window_scaling_negotiated: window_scaling_negotiated,
       recv_buffer_size: recv_buffer_size,
       rto_ms: @initial_rto_ms,
       syn_retransmit_count: 0,
@@ -2106,15 +2134,21 @@ defmodule Tricep.Socket do
   defp send_syn_ack(%__MODULE__{} = state) do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
+    options =
+      if state.window_scaling_negotiated do
+        [mss: state.rcv_mss, window_scale: state.rcv_wnd_scale]
+      else
+        [mss: state.rcv_mss]
+      end
+
     tcp_segment =
       Tcp.build_segment(
         state.pair,
         state.iss,
         state.rcv_nxt,
         [:syn, :ack],
-        advertised_receive_window(state),
-        mss: state.rcv_mss,
-        window_scale: state.rcv_wnd_scale
+        advertised_syn_window(state),
+        options
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
@@ -2146,7 +2180,7 @@ defmodule Tricep.Socket do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
-      Tcp.build_segment(state.pair, state.iss, 0, [:syn], advertised_receive_window(state),
+      Tcp.build_segment(state.pair, state.iss, 0, [:syn], advertised_syn_window(state),
         mss: state.rcv_mss,
         window_scale: state.rcv_wnd_scale
       )
@@ -2361,7 +2395,11 @@ defmodule Tricep.Socket do
       end
 
     send_actions = notify_send_waiters_error(state.send_waiters, :epipe)
-    new_state = %{state | send_waiters: []}
+
+    new_state =
+      state
+      |> Map.put(:send_waiters, [])
+      |> refresh_receive_window()
 
     {new_state, recv_actions ++ send_actions}
   end
@@ -2711,24 +2749,91 @@ defmodule Tricep.Socket do
 
   defp normalize_fin_wait_2_timeout_ms(_timeout_ms), do: @default_fin_wait_2_timeout_ms
 
-  defp receive_window(%__MODULE__{} = state) do
+  defp available_receive_window(%__MODULE__{} = state) do
     buffered_bytes = byte_size(state.recv_buffer) + out_of_order_size(state)
     max(0, state.recv_buffer_size - buffered_bytes)
   end
 
   defp advertised_receive_window(%__MODULE__{} = state) do
+    state.rcv_adv_wnd >>> receive_window_scale(state)
+  end
+
+  defp advertised_syn_window(%__MODULE__{} = state) do
     state
-    |> receive_window()
-    |> then(&(&1 >>> state.rcv_wnd_scale))
+    |> available_receive_window()
     |> min(@max_tcp_window)
   end
 
-  defp refresh_receive_window(%__MODULE__{} = state) do
-    %{state | rcv_wnd: receive_window(state)}
+  defp receive_window_scale(%__MODULE__{window_scaling_negotiated: true} = state),
+    do: state.rcv_wnd_scale
+
+  defp receive_window_scale(%__MODULE__{}), do: 0
+
+  defp open_receive_window(%__MODULE__{} = state) do
+    # Leave one scale quantum of physical headroom for sub-quantum ACK movement.
+    refresh_receive_window(state, reserve_scale_headroom?: true)
+  end
+
+  defp refresh_receive_window(%__MODULE__{} = state, opts \\ []) do
+    available_window = available_receive_window(state)
+    scale = receive_window_scale(state)
+
+    reserve =
+      if Keyword.get(opts, :reserve_scale_headroom?, false), do: (1 <<< scale) - 1, else: 0
+
+    advertised_window =
+      state
+      |> representable_receive_window(max(0, available_window - reserve))
+
+    # Flooring never promises bytes beyond physical capacity. When RCV.NXT
+    # advances in order, quantization can retract the on-wire edge by at most
+    # one scale quantum minus one. Out-of-order buffering can retract it by the
+    # consumed capacity because RCV.NXT does not advance.
+    advertised_right_edge = wrap_seq(state.rcv_nxt + advertised_window)
+
+    # Retain the logical offered edge so entitlement can be restored as capacity
+    # permits. Effective admission below remains capped by current buffer space;
+    # bytes that cannot physically fit are rejected rather than truncated.
+    authorized_right_edge = later_right_edge(state.rcv_right_edge, advertised_right_edge)
+
+    receive_window =
+      state.rcv_nxt
+      |> window_to_right_edge(authorized_right_edge)
+      |> min(available_window)
+
+    %{
+      state
+      | rcv_wnd: receive_window,
+        rcv_adv_wnd: advertised_window,
+        rcv_right_edge: authorized_right_edge
+    }
+  end
+
+  defp representable_receive_window(%__MODULE__{} = state, available_window) do
+    scale = receive_window_scale(state)
+
+    available_window
+    |> then(&(&1 >>> scale))
+    |> min(@max_tcp_window)
+    |> then(&(&1 <<< scale))
+  end
+
+  defp later_right_edge(nil, candidate), do: candidate
+
+  defp later_right_edge(current, candidate) do
+    if seq_gt(candidate, current), do: candidate, else: current
+  end
+
+  defp window_to_right_edge(rcv_nxt, right_edge) do
+    if seq_lt(rcv_nxt, right_edge), do: sequence_distance(rcv_nxt, right_edge), else: 0
+  end
+
+  defp receive_window(%__MODULE__{} = state) do
+    min(state.rcv_wnd, available_receive_window(state))
   end
 
   defp maybe_send_window_update(%__MODULE__{} = new_state, %__MODULE__{} = old_state) do
-    if new_state.rcv_wnd > old_state.rcv_wnd do
+    if advertised_receive_window(new_state) > advertised_receive_window(old_state) do
       send_ack(new_state.rcv_nxt, new_state)
     end
 
@@ -2878,6 +2983,14 @@ defmodule Tricep.Socket do
     options
     |> Map.get(:window_scale, 0)
     |> normalize_window_scale()
+  end
+
+  defp negotiated_window_scaling(options, rcv_wnd_scale) do
+    if Map.has_key?(options, :window_scale) do
+      {rcv_wnd_scale, peer_window_scale(options), true}
+    else
+      {0, 0, false}
+    end
   end
 
   defp normalize_window_scale(scale) when is_integer(scale) and scale >= 0 do
@@ -3072,10 +3185,16 @@ defmodule Tricep.Socket do
   defp invalid_ack?(_state, false, _ack), do: false
 
   defp segment_acceptable?(state, %{seq: seq} = segment) do
-    window = receive_window(state)
+    window = state.rcv_wnd
     segment_len = segment_sequence_length(segment)
 
     cond do
+      # A peer can legitimately send FIN after filling the exact advertised
+      # data window. Accept only that control byte at RCV.NXT so a zero-window
+      # connection can still make progress without admitting any payload.
+      window == 0 and zero_window_fin_at_rcv_nxt?(segment, seq, state.rcv_nxt) ->
+        true
+
       window == 0 and segment_len == 0 ->
         seq == state.rcv_nxt
 
@@ -3093,8 +3212,14 @@ defmodule Tricep.Socket do
     end
   end
 
+  defp zero_window_fin_at_rcv_nxt?(segment, seq, rcv_nxt) do
+    seq == rcv_nxt and segment.payload == <<>> and :ack in segment.flags and
+      :fin in segment.flags and
+      :syn not in segment.flags
+  end
+
   defp acceptable_rst?(state, seq) do
-    seq_in_receive_window?(seq, state.rcv_nxt, receive_window(state))
+    seq_in_receive_window?(seq, state.rcv_nxt, state.rcv_wnd)
   end
 
   defp seq_in_receive_window?(seq, rcv_nxt, 0), do: seq == rcv_nxt
