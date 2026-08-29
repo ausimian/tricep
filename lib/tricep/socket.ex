@@ -8,6 +8,7 @@ defmodule Tricep.Socket do
   alias Tricep.Application
   alias Tricep.DataBuffer
   alias Tricep.Tcp
+  alias Tricep.Tcp.ChallengeAckLimiter
   alias Tricep.Tcp.Sequence
   alias Tricep.Tcp.Synchronized
   alias Tricep.Tcp.Tcb
@@ -142,7 +143,11 @@ defmodule Tricep.Socket do
 
   @spec start_link(any()) :: :ignore | {:error, any()} | {:ok, pid()}
   def start_link(opts) do
-    :gen_statem.start_link(__MODULE__, opts, hibernate_after: 15_000)
+    if valid_socket_options?(socket_opts(opts)) do
+      :gen_statem.start_link(__MODULE__, opts, hibernate_after: 15_000)
+    else
+      {:error, :einval}
+    end
   end
 
   @spec start_passive_connection(map()) :: :ignore | {:error, any()} | {:ok, pid()}
@@ -183,6 +188,9 @@ defmodule Tricep.Socket do
   typedstruct enforce: true do
     field :pair, {addr_port(), addr_port()}
     field :link, pid()
+    # Immutable socket options survive a TCP incarnation so a closed socket
+    # can reconnect with the same configuration and a fresh TCB.
+    field :socket_opts, map() | keyword(), default: %{}
     # Protocol control state is owned by the pure TCP control block. The
     # adapter fields below contain only OTP, I/O, buffering, and timer state.
     field :tcb, Tcb.t(), default: %Tcb{}
@@ -218,6 +226,9 @@ defmodule Tricep.Socket do
     field :write_shutdown, boolean(), default: false
     # How long to wait in FIN_WAIT_2 for the peer FIN
     field :fin_wait_2_timeout_ms, pos_integer(), default: @default_fin_wait_2_timeout_ms
+    # Per-connection RFC 5961 challenge-ACK accounting. The socket owns the
+    # limiter because it owns the connection's receive path and TCB.
+    field :challenge_ack_limiter, ChallengeAckLimiter.t(), default: ChallengeAckLimiter.new()
     # Listening socket that owns this connection while the passive handshake completes
     field :passive_listener, pid() | nil, default: nil
   end
@@ -230,19 +241,29 @@ defmodule Tricep.Socket do
 
   @impl true
   def init({:passive_connection, opts}) do
-    state = passive_connection_state(opts)
+    if valid_socket_options?(Map.get(opts, :socket_opts, %{})) do
+      state = passive_connection_state(opts)
 
-    case Application.register_socket_pair(state.pair) do
-      :ok ->
-        {:ok, :syn_received, state}
+      case Application.register_socket_pair(state.pair) do
+        :ok ->
+          {:ok, :syn_received, state}
 
-      {:error, reason} ->
-        {:stop, reason}
+        {:error, reason} ->
+          {:stop, reason}
+      end
+    else
+      {:stop, :einval}
     end
   end
 
   def init(opts) do
-    {:ok, :closed, %{socket_opts: socket_opts(opts)}}
+    socket_opts = socket_opts(opts)
+
+    if valid_socket_options?(socket_opts) do
+      {:ok, :closed, %{socket_opts: socket_opts}}
+    else
+      {:stop, :einval}
+    end
   end
 
   @impl true
@@ -464,14 +485,14 @@ defmodule Tricep.Socket do
         {:call, {caller_pid, _} = from},
         {:connect, _address, _timeout},
         {:connect_failed, connect_selects, reason},
-        nil
+        closed_data
       ) do
     case take_select_for_pid(connect_selects, caller_pid) do
       {{^caller_pid, _ref}, []} ->
-        {:next_state, :closed, nil, {:reply, from, {:error, reason}}}
+        {:next_state, :closed, closed_data, {:reply, from, {:error, reason}}}
 
       {{^caller_pid, _ref}, remaining_selects} ->
-        {:next_state, {:connect_failed, remaining_selects, reason}, nil,
+        {:next_state, {:connect_failed, remaining_selects, reason}, closed_data,
          {:reply, from, {:error, reason}}}
 
       nil ->
@@ -553,7 +574,7 @@ defmodule Tricep.Socket do
       :reset ->
         reset_state(state)
 
-        {:next_state, :closed, nil,
+        {:next_state, :closed, closed_data(state),
          [
            {{:timeout, :rto}, :cancel},
            {{:timeout, :connect_timeout}, :cancel},
@@ -614,10 +635,16 @@ defmodule Tricep.Socket do
       :acceptable_reset ->
         reset_state(state)
         notify_passive_listener(state, :passive_failed)
-        {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
+        {:next_state, :closed, closed_data(state), {{:timeout, :rto}, :cancel}}
 
-      :unacceptable_reset ->
-        reject_unacceptable_rst(state)
+      :challenge_ack ->
+        send_challenge_ack(state)
+
+      :silent_drop ->
+        :keep_state_and_data
+
+      :unacceptable_segment ->
+        reject_unacceptable_segment(state)
 
       {:established, new_state} ->
         notify_passive_listener(state, :passive_established)
@@ -640,7 +667,7 @@ defmodule Tricep.Socket do
     if state.syn_retransmit_count >= @max_retransmit_count do
       reset_state(state)
       notify_passive_listener(state, :passive_failed)
-      {:next_state, :closed, nil}
+      {:next_state, :closed, closed_data(state)}
     else
       retransmit_syn_ack(state)
     end
@@ -658,7 +685,7 @@ defmodule Tricep.Socket do
       # Max retries exceeded - connection failure
       reset_state(state)
       actions = [{{:timeout, :connect_timeout}, :cancel}, {:reply, from, {:error, :etimedout}}]
-      {:next_state, :closed, nil, actions}
+      {:next_state, :closed, closed_data(state), actions}
     else
       retransmit_syn(state, {:syn_timeout, from})
     end
@@ -691,7 +718,7 @@ defmodule Tricep.Socket do
       ) do
     reset_state(state)
     actions = [{{:timeout, :rto}, :cancel}, {:reply, from, {:error, :timeout}}]
-    {:next_state, :closed, nil, actions}
+    {:next_state, :closed, closed_data(state), actions}
   end
 
   # --- Calls while connect is pending ---
@@ -924,7 +951,7 @@ defmodule Tricep.Socket do
       {:reply, from, {:error, reason}}
     ]
 
-    {:next_state, :closed, nil, actions}
+    {:next_state, :closed, closed_data(state), actions}
   end
 
   def handle_event(
@@ -953,7 +980,7 @@ defmodule Tricep.Socket do
            ] do
     reset_state(state)
     actions = notify_waiters_error(state, reason)
-    {:next_state, :closed, nil, actions}
+    {:next_state, :closed, closed_data(state), actions}
   end
 
   # --- Active close from established ---
@@ -1060,7 +1087,7 @@ defmodule Tricep.Socket do
       ) do
     reset_state(state)
     actions = notify_waiters_error(state, :etimedout)
-    {:next_state, :closed, nil, actions}
+    {:next_state, :closed, closed_data(state), actions}
   end
 
   def handle_event(:info, segment, :fin_wait_2, %__MODULE__{} = state) when is_binary(segment) do
@@ -1091,18 +1118,13 @@ defmodule Tricep.Socket do
 
   def handle_event({:timeout, :time_wait}, :time_wait_expired, :time_wait, %__MODULE__{} = state) do
     reset_state(state)
-    {:next_state, :closed, nil}
+    {:next_state, :closed, closed_data(state)}
   end
 
   def handle_event(:info, segment, :time_wait, %__MODULE__{} = state) when is_binary(segment) do
-    # Re-ACK any FIN received (peer may have missed our ACK)
     case Tcp.parse_segment(segment) do
-      %{flags: flags, seq: _seq} ->
-        if :fin in flags do
-          send_ack(state.tcb.rcv_nxt, state)
-        end
-
-        :keep_state_and_data
+      %{flags: flags, seq: sequence, payload: payload} ->
+        handle_time_wait_segment(state, flags, sequence, byte_size(payload))
 
       _ ->
         :keep_state_and_data
@@ -1632,7 +1654,7 @@ defmodule Tricep.Socket do
     cond do
       ack? and ack == state.tcb.snd_nxt ->
         reset_state(ack_state)
-        {:next_state, :closed, nil, ack_actions}
+        {:next_state, :closed, closed_data(ack_state), ack_actions}
 
       ack? ->
         {:keep_state, ack_state, ack_actions}
@@ -1702,6 +1724,7 @@ defmodule Tricep.Socket do
     %__MODULE__{
       pair: {{dst_addr, dst_port}, {src_addr, src_port}},
       link: link,
+      socket_opts: socket_opts,
       tcb: %Tcb{
         iss: iss,
         snd_una: iss,
@@ -1723,6 +1746,7 @@ defmodule Tricep.Socket do
       rto_ms: @initial_rto_ms,
       syn_retransmit_count: 0,
       fin_wait_2_timeout_ms: configured_fin_wait_2_timeout_ms(socket_opts),
+      challenge_ack_limiter: configured_challenge_ack_limiter(socket_opts),
       passive_listener: listener
     }
   end
@@ -1860,17 +1884,20 @@ defmodule Tricep.Socket do
 
   defp connection_state(pair, link, mtu, data) do
     recv_buffer_size = recv_buffer_size(data)
+    socket_opts = connection_socket_opts(data)
 
     %__MODULE__{
       pair: pair,
       link: link,
+      socket_opts: socket_opts,
       tcb: %Tcb{
         rcv_mss: local_send_mss(mtu),
         rcv_wnd: recv_buffer_size,
         rcv_wnd_scale: window_scale_for(recv_buffer_size)
       },
       recv_buffer_size: recv_buffer_size,
-      fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(data)
+      fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(data),
+      challenge_ack_limiter: challenge_ack_limiter(data)
     }
   end
 
@@ -2040,7 +2067,7 @@ defmodule Tricep.Socket do
       # Max retries exceeded - connection failure
       reset_state(state)
       actions = notify_waiters_error(state, :etimedout)
-      {:next_state, :closed, nil, actions}
+      {:next_state, :closed, closed_data(state), actions}
     else
       send_fin_segment(state, seq)
 
@@ -2072,7 +2099,7 @@ defmodule Tricep.Socket do
       # Max retries exceeded - connection failure
       reset_state(state)
       actions = notify_waiters_error(state, :etimedout)
-      {:next_state, :closed, nil, actions}
+      {:next_state, :closed, closed_data(state), actions}
     else
       # Retransmit the oldest unacked segment
       {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
@@ -2308,10 +2335,12 @@ defmodule Tricep.Socket do
     Application.deregister_socket_pair(state.pair)
   end
 
+  defp closed_data(%__MODULE__{socket_opts: socket_opts}), do: %{socket_opts: socket_opts}
+
   defp reset_connection(%__MODULE__{} = state, error, timer_actions \\ []) do
     reset_state(state)
     actions = timer_actions ++ notify_waiters_error(state, error)
-    {:next_state, :closed, nil, actions}
+    {:next_state, :closed, closed_data(state), actions}
   end
 
   defp synchronized_rejection(state, outcome, reset \\ :connection)
@@ -2328,12 +2357,15 @@ defmodule Tricep.Socket do
 
   defp synchronized_rejection(state, :acceptable_reset, :close) do
     reset_state(state)
-    {:next_state, :closed, nil, {{:timeout, :rto}, :cancel}}
+    {:next_state, :closed, closed_data(state), {{:timeout, :rto}, :cancel}}
   end
 
-  defp synchronized_rejection(state, :unacceptable_reset, _reset),
-    do: reject_unacceptable_rst(state)
+  defp synchronized_rejection(state, :challenge_ack, _reset), do: send_challenge_ack(state)
 
+  defp synchronized_rejection(_state, :silent_drop, _reset), do: :keep_state_and_data
+
+  # RFC 5961 RST/SYN challenge ACKs use one shared limiter. Issue #124 owns
+  # the separate policy for non-RFC-5961 corrective ACKs.
   defp synchronized_rejection(state, :unacceptable_segment, _reset),
     do: reject_unacceptable_segment(state)
 
@@ -2350,10 +2382,21 @@ defmodule Tricep.Socket do
   end
 
   defp syn_sent_outcome(state, parsed, flags, acknowledgment) do
-    case {:rst in flags, :syn in flags, :ack in flags, acknowledgment == state.tcb.snd_nxt} do
-      {true, _syn?, _ack?, _expected_ack?} -> :reset
-      {false, true, true, true} -> {:established, establish_after_syn_ack(state, parsed)}
-      {false, _syn?, true, false} -> {:bad_ack, acknowledgment}
+    if :rst in flags do
+      syn_sent_reset_outcome(state.tcb, flags, acknowledgment)
+    else
+      syn_sent_non_reset_outcome(state, parsed, flags, acknowledgment)
+    end
+  end
+
+  defp syn_sent_reset_outcome(tcb, flags, acknowledgment) do
+    if :ack in flags and acknowledges_syn?(tcb, acknowledgment), do: :reset, else: :ignore
+  end
+
+  defp syn_sent_non_reset_outcome(state, parsed, flags, acknowledgment) do
+    case {:syn in flags, :ack in flags, acknowledgment == state.tcb.snd_nxt} do
+      {true, true, true} -> {:established, establish_after_syn_ack(state, parsed)}
+      {_syn?, true, false} -> {:bad_ack, acknowledgment}
       _ -> :ignore
     end
   end
@@ -2369,35 +2412,34 @@ defmodule Tricep.Socket do
   end
 
   defp syn_received_outcome(state, flags, sequence, acknowledgment, window, payload) do
-    reset? = :rst in flags
-    acceptable_reset? = Tcb.acceptable_reset?(state.tcb, sequence)
+    if :rst in flags do
+      Synchronized.reset_outcome(state.tcb, sequence)
+    else
+      syn_received_non_reset_outcome(state, flags, sequence, acknowledgment, window, payload)
+    end
+  end
 
-    valid_ack? =
-      :ack in flags and acknowledgment == state.tcb.snd_nxt and sequence == state.tcb.rcv_nxt
-
-    case {reset?, acceptable_reset?, valid_ack?, :ack in flags, :syn in flags,
-          sequence == state.tcb.irs} do
-      {true, true, _valid_ack?, _ack?, _syn?, _same_initial_receive?} ->
-        :acceptable_reset
-
-      {true, false, _valid_ack?, _ack?, _syn?, _same_initial_receive?} ->
-        :unacceptable_reset
-
-      {false, _acceptable_reset?, true, _ack?, _syn?, _same_initial_receive?} ->
-        {:established, establish_after_syn_received(state, acknowledgment, window, payload)}
-
-      {false, _acceptable_reset?, false, true, _syn?, _same_initial_receive?} ->
-        {:bad_ack, acknowledgment}
-
-      {false, _acceptable_reset?, false, false, true, true} ->
+  defp syn_received_non_reset_outcome(state, flags, sequence, acknowledgment, window, payload) do
+    cond do
+      :syn in flags and sequence == state.tcb.irs ->
         :retransmit_syn_ack
 
-      _ ->
+      not Tcb.acceptable_segment?(state.tcb, %{flags: flags, seq: sequence, payload: payload}) ->
+        :unacceptable_segment
+
+      :ack in flags and acknowledges_syn_ack?(state.tcb, acknowledgment) ->
+        {:established,
+         establish_after_syn_received(state, sequence, acknowledgment, window, payload)}
+
+      :ack in flags ->
+        {:bad_ack, acknowledgment}
+
+      true ->
         :ignore
     end
   end
 
-  defp establish_after_syn_received(state, acknowledgment, window, payload) do
+  defp establish_after_syn_received(state, sequence, acknowledgment, window, payload) do
     base_state =
       %{
         state
@@ -2408,7 +2450,7 @@ defmodule Tricep.Socket do
       }
       |> open_receive_window()
 
-    receive_syn_received_payload(base_state, payload)
+    receive_syn_received_payload(base_state, sequence, payload)
   end
 
   defp establish_after_syn_ack(state, %{
@@ -2443,10 +2485,29 @@ defmodule Tricep.Socket do
     |> open_receive_window()
   end
 
-  defp receive_syn_received_payload(state, <<>>), do: state
+  defp acknowledges_syn?(%Tcb{iss: iss, snd_nxt: send_next}, acknowledgment) do
+    Sequence.gt?(acknowledgment, iss) and Sequence.lte?(acknowledgment, send_next)
+  end
 
-  defp receive_syn_received_payload(state, payload) do
-    {receive_state, _accepted_length} = receive_payload(state, payload)
+  defp acknowledges_syn_ack?(
+         %Tcb{snd_una: send_unacknowledged, snd_nxt: send_next},
+         acknowledgment
+       ) do
+    Sequence.gt?(acknowledgment, send_unacknowledged) and
+      Sequence.lte?(acknowledgment, send_next)
+  end
+
+  defp receive_syn_received_payload(state, _sequence, <<>>), do: state
+
+  defp receive_syn_received_payload(state, sequence, payload) do
+    receive_state =
+      if sequence == state.tcb.rcv_nxt do
+        {receive_state, _accepted_length} = receive_payload(state, payload)
+        receive_state
+      else
+        buffer_out_of_order_payload(state, sequence, payload)
+      end
+
     send_ack(receive_state.tcb.rcv_nxt, receive_state)
     receive_state
   end
@@ -2482,14 +2543,15 @@ defmodule Tricep.Socket do
 
   defp nowait_connect_failure(%__MODULE__{} = state, reason) do
     reset_state(state)
+    closed_data = closed_data(state)
 
     case state.connect_selects do
       [] ->
-        {:closed, nil}
+        {:closed, closed_data}
 
       connect_selects ->
         notify_selects(connect_selects)
-        {{:connect_failed, connect_selects, reason}, nil}
+        {{:connect_failed, connect_selects, reason}, closed_data}
     end
   end
 
@@ -2681,11 +2743,17 @@ defmodule Tricep.Socket do
   defp socket_opts(opts) when is_map(opts), do: opts
   defp socket_opts(_opts), do: %{}
 
+  defp connection_socket_opts(%{socket_opts: socket_opts}), do: socket_opts
+  defp connection_socket_opts(data), do: socket_opts(data)
+
   defp recv_buffer_size(%{socket_opts: opts}), do: configured_recv_buffer_size(opts)
   defp recv_buffer_size(_closed_data), do: @default_recv_buffer_size
 
   defp fin_wait_2_timeout_ms(%{socket_opts: opts}), do: configured_fin_wait_2_timeout_ms(opts)
   defp fin_wait_2_timeout_ms(_closed_data), do: @default_fin_wait_2_timeout_ms
+
+  defp challenge_ack_limiter(%{socket_opts: opts}), do: configured_challenge_ack_limiter(opts)
+  defp challenge_ack_limiter(_closed_data), do: ChallengeAckLimiter.new()
 
   defp configured_recv_buffer_size(opts) when is_map(opts) do
     opts
@@ -2715,6 +2783,22 @@ defmodule Tricep.Socket do
 
   defp configured_fin_wait_2_timeout_ms(_opts), do: @default_fin_wait_2_timeout_ms
 
+  defp configured_challenge_ack_limiter(opts) when is_map(opts) do
+    ChallengeAckLimiter.new(
+      limit: Map.get(opts, :challenge_ack_limit, 10),
+      interval_ms: Map.get(opts, :challenge_ack_interval_ms, 5_000)
+    )
+  end
+
+  defp configured_challenge_ack_limiter(opts) when is_list(opts) do
+    ChallengeAckLimiter.new(
+      limit: Keyword.get(opts, :challenge_ack_limit, 10),
+      interval_ms: Keyword.get(opts, :challenge_ack_interval_ms, 5_000)
+    )
+  end
+
+  defp configured_challenge_ack_limiter(_opts), do: ChallengeAckLimiter.new()
+
   defp normalize_recv_buffer_size(size) when is_integer(size) and size > 0 do
     min(size, @max_scaled_tcp_window)
   end
@@ -2727,6 +2811,10 @@ defmodule Tricep.Socket do
   end
 
   defp normalize_fin_wait_2_timeout_ms(_timeout_ms), do: @default_fin_wait_2_timeout_ms
+
+  # Bug #125 owns making legacy socket-option validation uniform. Keep the
+  # RFC 5961 limiter strict without changing legacy fallback behavior here.
+  defp valid_socket_options?(opts), do: ChallengeAckLimiter.valid_options?(opts)
 
   defp available_receive_window(%__MODULE__{} = state) do
     buffered_bytes = byte_size(state.recv_buffer) + out_of_order_size(state)
@@ -3091,9 +3179,37 @@ defmodule Tricep.Socket do
     {:keep_state, state, []}
   end
 
-  defp reject_unacceptable_rst(state) do
-    send_ack(state.tcb.rcv_nxt, state)
-    {:keep_state, state, []}
+  defp send_challenge_ack(%__MODULE__{} = state) do
+    now = System.monotonic_time(:millisecond)
+
+    case ChallengeAckLimiter.allow(state.challenge_ack_limiter, now) do
+      {:allow, limiter} ->
+        send_ack(state.tcb.rcv_nxt, state)
+        {:keep_state, %{state | challenge_ack_limiter: limiter}, []}
+
+      {:limit, limiter} ->
+        {:keep_state, %{state | challenge_ack_limiter: limiter}, []}
+    end
+  end
+
+  defp handle_time_wait_segment(state, flags, sequence, payload_length) do
+    cond do
+      # RFC 1337 F1: an RST must not terminate TIME_WAIT; SYNs must not
+      # trigger the narrow FIN retransmission exception either.
+      :rst in flags or :syn in flags ->
+        :keep_state_and_data
+
+      :fin in flags and
+          Sequence.wrap(sequence + payload_length) == Sequence.wrap(state.tcb.rcv_nxt - 1) ->
+        # Re-ACK only the peer's FIN retransmission. Issue #104 owns any
+        # TIME_WAIT timer-restart behavior.
+        send_ack(state.tcb.rcv_nxt, state)
+        :keep_state_and_data
+
+      true ->
+        # Avoid reflecting arbitrary old duplicates while retaining TIME_WAIT.
+        :keep_state_and_data
+    end
   end
 
   defp reject_unacceptable_segment(state) do

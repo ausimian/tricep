@@ -42,6 +42,14 @@ defmodule Tricep.Tcp.TcbTest do
     assert Tcb.advance_receive(tcb, 2).rcv_nxt == 1
   end
 
+  test "classifies reset sequences across the wrap boundary" do
+    tcb = %Tcb{rcv_nxt: 0xFFFFFFFF, rcv_wnd: 8}
+
+    assert Tcb.reset_validation(tcb, 0xFFFFFFFF) == :exact
+    assert Tcb.reset_validation(tcb, 0) == :in_window
+    assert Tcb.reset_validation(tcb, 8) == :out_of_window
+  end
+
   test "updates an acknowledgement and its scaled peer window together" do
     tcb = %Tcb{snd_una: 100, snd_nxt: 200, snd_wnd: 0, snd_wnd_scale: 3}
 

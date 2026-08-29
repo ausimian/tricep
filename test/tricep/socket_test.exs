@@ -335,10 +335,43 @@ defmodule Tricep.SocketTest do
       assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
 
       <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn = Tcp.parse_segment(syn_segment)
       <<src_port::16, _::binary>> = syn_segment
 
       # Build a RST response
       rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          0,
+          syn.seq + 1,
+          [:rst, :ack],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      # Connect should fail with connection refused
+      assert Task.await(task, 1000) == {:error, :econnrefused}
+    end
+
+    test "ignores RST whose ACK does not acknowledge the SYN", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+
+      bare_rst =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
           0,
@@ -347,9 +380,33 @@ defmodule Tricep.SocketTest do
           0
         )
 
-      DummyLink.inject_packet(link, rst_segment)
+      DummyLink.inject_packet(link, bare_rst)
+      assert {{:syn_sent, _}, _state} = :sys.get_state(socket)
 
-      # Connect should fail with connection refused
+      invalid_rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          0,
+          syn.seq,
+          [:rst, :ack],
+          0
+        )
+
+      DummyLink.inject_packet(link, invalid_rst)
+
+      assert {{:syn_sent, _}, _state} = :sys.get_state(socket)
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      valid_rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          0,
+          wrap_seq(syn.seq + 1),
+          [:rst, :ack],
+          0
+        )
+
+      DummyLink.inject_packet(link, valid_rst)
       assert Task.await(task, 1000) == {:error, :econnrefused}
     end
 
@@ -2042,6 +2099,138 @@ defmodule Tricep.SocketTest do
     end
   end
 
+  describe "SYN_RECEIVED admission" do
+    test "queues sequence-acceptable reordered data while completing the handshake", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, client_port: client_port, state: state} =
+        start_passive_child(link, local_addr, remote_addr)
+
+      payload = "reordered"
+      sequence = wrap_seq(state.tcb.rcv_nxt + 7)
+
+      segment =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          sequence,
+          state.tcb.snd_nxt,
+          [:ack, :psh],
+          32_768,
+          payload: payload
+        )
+
+      DummyLink.inject_packet(link, segment)
+
+      assert_receive {:dummy_link_packet, ^link, ack_packet}, 1000
+      <<_::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert ack.flags == [:ack]
+      assert ack.ack == state.tcb.rcv_nxt
+      refute :rst in ack.flags
+
+      assert {:established, established_state} = :sys.get_state(child)
+      assert established_state.tcb.rcv_nxt == state.tcb.rcv_nxt
+
+      assert established_state.out_of_order_segments == [
+               {sequence, wrap_seq(sequence + byte_size(payload)), payload}
+             ]
+
+      assert {:ok, ^child} = Tricep.accept(listener, 1000)
+      assert Tricep.close(listener) == :ok
+      stop_socket(child)
+    end
+
+    test "drops an out-of-window ACK and data without generating RST", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, client_port: client_port, state: state} =
+        start_passive_child(link, local_addr, remote_addr)
+
+      out_of_window = wrap_seq(state.tcb.rcv_nxt + state.tcb.rcv_wnd)
+
+      segment =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          out_of_window,
+          wrap_seq(state.tcb.snd_nxt + 1),
+          [:ack, :psh],
+          32_768,
+          payload: "old"
+        )
+
+      DummyLink.inject_packet(link, segment)
+
+      assert_receive {:dummy_link_packet, ^link, rejection_packet}, 1000
+      <<_::binary-size(40), rejection_segment::binary>> = rejection_packet
+      rejection = Tcp.parse_segment(rejection_segment)
+
+      assert rejection.flags == [:ack]
+      assert rejection.ack == state.tcb.rcv_nxt
+      refute :rst in rejection.flags
+      assert {:syn_received, ^state} = :sys.get_state(child)
+
+      assert Tricep.close(listener) == :ok
+      stop_socket(child)
+    end
+
+    test "only resets sequence-acceptable ACKs outside the SYN-ACK range at wrap", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, client_port: client_port, state: state} =
+        start_passive_child(link, local_addr, remote_addr, client_seq: 0xFFFFFFFF)
+
+      assert state.tcb.rcv_nxt == 0
+
+      invalid_ack =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          state.tcb.rcv_nxt,
+          state.tcb.snd_una,
+          [:ack],
+          32_768
+        )
+
+      DummyLink.inject_packet(link, invalid_ack)
+
+      assert_receive {:dummy_link_packet, ^link, rst_packet}, 1000
+      <<_::binary-size(40), rst_segment::binary>> = rst_packet
+      rst = Tcp.parse_segment(rst_segment)
+
+      assert rst.flags == [:rst]
+      assert rst.seq == state.tcb.snd_una
+      assert {:syn_received, ^state} = :sys.get_state(child)
+
+      stale_ack =
+        Tcp.build_segment(
+          {{local_addr, client_port}, {remote_addr, @port}},
+          0xFFFFFFFF,
+          state.tcb.snd_una,
+          [:ack],
+          32_768
+        )
+
+      DummyLink.inject_packet(link, stale_ack)
+
+      assert_receive {:dummy_link_packet, ^link, rejection_packet}, 1000
+      <<_::binary-size(40), rejection_segment::binary>> = rejection_packet
+      rejection = Tcp.parse_segment(rejection_segment)
+
+      assert rejection.flags == [:ack]
+      refute :rst in rejection.flags
+      assert {:syn_received, ^state} = :sys.get_state(child)
+
+      assert Tricep.close(listener) == :ok
+      stop_socket(child)
+    end
+  end
+
   describe "send/2" do
     test "sends data segment with correct seq and ack", %{
       link: link,
@@ -2669,7 +2858,46 @@ defmodule Tricep.SocketTest do
       assert Task.await(recv_task, 1000) == {:error, :econnreset}
     end
 
-    test "RST with old sequence is rejected with challenge ACK", %{
+    test "exact RST preserves default options for bind and reconnect", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+      assert {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      exact_rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, exact_rst)
+
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+      assert Process.alive?(socket)
+
+      assert Tricep.bind(socket, %{family: :inet6, addr: remote_addr, port: 0}) == :ok
+
+      assert {:bound, %{socket_opts: %{}, local_addr: ^remote_addr, local_port: local_port}} =
+               :sys.get_state(socket)
+
+      assert local_port in 49_152..65_535
+      assert Tricep.close(socket) == :ok
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+
+      reconnect_socket(socket, link, local_addr, remote_addr, 6_000)
+      assert {:established, %{socket_opts: %{}}} = :sys.get_state(socket)
+    end
+
+    test "in-window non-exact RST is rejected with a challenge ACK", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -2685,7 +2913,7 @@ defmodule Tricep.SocketTest do
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          wrap_seq(state.tcb.rcv_nxt - 1),
+          wrap_seq(state.tcb.rcv_nxt + 1),
           state.tcb.snd_nxt,
           [:rst],
           0
@@ -2693,16 +2921,11 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, rst_segment)
 
-      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
-      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
-      ack = Tcp.parse_segment(ack_segment)
-
-      assert :ack in ack.flags
-      assert ack.ack == state.tcb.rcv_nxt
+      assert_challenge_ack(link, state)
       {:established, _state} = :sys.get_state(socket)
     end
 
-    test "RST outside future receive window is rejected with challenge ACK", %{
+    test "RST outside the receive window is silently dropped", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -2730,13 +2953,271 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, rst_segment)
 
-      assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
-      <<_ip_header::binary-size(40), ack_segment::binary>> = ack_packet
-      ack = Tcp.parse_segment(ack_segment)
-
-      assert :ack in ack.flags
-      assert ack.ack == state.tcb.rcv_nxt
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
       {:established, _state} = :sys.get_state(socket)
+    end
+
+    test "old RST is silently dropped", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(state.tcb.rcv_nxt - 1),
+          state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+      assert {:established, _state} = :sys.get_state(socket)
+    end
+
+    test "unexpected SYN is challenge-ACKed irrespective of its sequence number", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      syn_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(state.tcb.rcv_nxt + state.tcb.rcv_wnd),
+          0,
+          [:syn],
+          0
+        )
+
+      DummyLink.inject_packet(link, syn_segment)
+
+      assert_challenge_ack(link, state)
+      assert {:established, _state} = :sys.get_state(socket)
+    end
+
+    test "limits RFC 5961 challenge ACKs per socket", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(link, local_addr, remote_addr,
+          open_opts: %{challenge_ack_limit: 2, challenge_ack_interval_ms: 60_000}
+        )
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(state.tcb.rcv_nxt + 1),
+          state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      Enum.each(1..3, fn _ -> DummyLink.inject_packet(link, rst_segment) end)
+
+      assert_challenge_ack(link, state)
+      assert_challenge_ack(link, state)
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      assert {:established, %{challenge_ack_limiter: %{sent: 2}}} = :sys.get_state(socket)
+    end
+
+    test "shares and renews one RFC 5961 challenge ACK quota for RST and SYN", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(link, local_addr, remote_addr,
+          open_opts: %{challenge_ack_limit: 2, challenge_ack_interval_ms: 60_000}
+        )
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+      assert {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(state.tcb.rcv_nxt + 1),
+          state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      syn =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(state.tcb.rcv_nxt + state.tcb.rcv_wnd),
+          0,
+          [:syn],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst)
+      DummyLink.inject_packet(link, syn)
+
+      assert_challenge_ack(link, state)
+      assert_challenge_ack(link, state)
+
+      DummyLink.inject_packet(link, rst)
+      refute_receive {:dummy_link_packet, ^link, _}, 100
+
+      :sys.replace_state(socket, fn {:established, established_state} ->
+        limiter = %{
+          established_state.challenge_ack_limiter
+          | sent: established_state.challenge_ack_limiter.limit,
+            window_started_at:
+              System.monotonic_time(:millisecond) -
+                established_state.challenge_ack_limiter.interval_ms
+        }
+
+        {:established, %{established_state | challenge_ack_limiter: limiter}}
+      end)
+
+      assert {:established, renewed_state} = :sys.get_state(socket)
+
+      DummyLink.inject_packet(link, syn)
+      DummyLink.inject_packet(link, rst)
+
+      assert_challenge_ack(link, renewed_state)
+      assert_challenge_ack(link, renewed_state)
+
+      DummyLink.inject_packet(link, syn)
+      refute_receive {:dummy_link_packet, ^link, _}, 100
+      assert {:established, %{challenge_ack_limiter: %{sent: 2}}} = :sys.get_state(socket)
+    end
+
+    test "retains supplied socket configuration across reset, timeout, and reconnect", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket_opts = %{
+        recv_buffer_size: 100_000,
+        fin_wait_2_timeout_ms: 25,
+        challenge_ack_limit: 1,
+        challenge_ack_interval_ms: 60_000
+      }
+
+      socket =
+        establish_connection(link, local_addr, remote_addr, open_opts: socket_opts)
+
+      on_exit(fn -> stop_socket(socket) end)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+
+      assert {:established, first_state} = :sys.get_state(socket)
+      assert first_state.socket_opts == socket_opts
+      assert first_state.recv_buffer_size == 100_000
+      assert first_state.fin_wait_2_timeout_ms == 25
+      assert first_state.challenge_ack_limiter.limit == 1
+      assert first_state.challenge_ack_limiter.interval_ms == 60_000
+      {{_, first_port}, _} = first_state.pair
+
+      challenge_rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, first_port}},
+          wrap_seq(first_state.tcb.rcv_nxt + 1),
+          first_state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, challenge_rst)
+      assert_challenge_ack(link, first_state)
+
+      exact_rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, first_port}},
+          first_state.tcb.rcv_nxt,
+          first_state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, exact_rst)
+      assert {:closed, %{socket_opts: ^socket_opts}} = :sys.get_state(socket)
+
+      reconnect_socket(socket, link, local_addr, remote_addr, 6_000)
+      assert {:established, reconnected_state} = :sys.get_state(socket)
+
+      assert reconnected_state.socket_opts == socket_opts
+      assert reconnected_state.recv_buffer_size == 100_000
+      assert reconnected_state.fin_wait_2_timeout_ms == 25
+      assert reconnected_state.challenge_ack_limiter.limit == 1
+      assert reconnected_state.challenge_ack_limiter.interval_ms == 60_000
+      assert reconnected_state.challenge_ack_limiter.sent == 0
+      {{_, reconnected_port}, _} = reconnected_state.pair
+
+      fresh_challenge_rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, reconnected_port}},
+          wrap_seq(reconnected_state.tcb.rcv_nxt + 1),
+          reconnected_state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, fresh_challenge_rst)
+      assert_challenge_ack(link, reconnected_state)
+
+      exhausted_syn =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, reconnected_port}},
+          wrap_seq(reconnected_state.tcb.rcv_nxt + reconnected_state.tcb.rcv_wnd),
+          0,
+          [:syn],
+          0
+        )
+
+      DummyLink.inject_packet(link, exhausted_syn)
+      refute_receive {:dummy_link_packet, ^link, _}, 100
+
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, ^link, _fin_packet}, 1000
+
+      fin_ack =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, reconnected_port}},
+          reconnected_state.tcb.rcv_nxt,
+          wrap_seq(reconnected_state.tcb.snd_nxt + 1),
+          [:ack],
+          32_768
+        )
+
+      DummyLink.inject_packet(link, fin_ack)
+      assert {:fin_wait_2, _} = :sys.get_state(socket)
+
+      wait_for_state_name(socket, :closed, 1_000)
+      assert {:closed, %{socket_opts: ^socket_opts}} = :sys.get_state(socket)
+
+      reconnect_socket(socket, link, local_addr, remote_addr, 7_000)
+      assert {:established, final_state} = :sys.get_state(socket)
+      assert final_state.socket_opts == socket_opts
+      assert final_state.recv_buffer_size == 100_000
+      assert final_state.fin_wait_2_timeout_ms == 25
+      assert final_state.challenge_ack_limiter.limit == 1
+      assert final_state.challenge_ack_limiter.interval_ms == 60_000
+      assert final_state.challenge_ack_limiter.sent == 0
     end
 
     test "RST notifies blocking send waiters", %{
@@ -2766,7 +3247,7 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, rst_segment)
 
       assert Task.await(send_task, 1000) == {:error, :econnreset}
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "RST cancels timed send waiters", %{
@@ -2796,7 +3277,7 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, rst_segment)
 
       assert Task.await(send_task, 1000) == {:error, :econnreset}
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
 
       refute_receive {:EXIT, _pid, _reason}, 100
     end
@@ -3267,7 +3748,8 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, fin_segment)
 
       # Should be in TIME_WAIT
-      {:time_wait, _} = :sys.get_state(socket)
+      {:time_wait, time_wait_state} = :sys.get_state(socket)
+      assert Tcp.parse_segment(fin_segment).seq == wrap_seq(time_wait_state.tcb.rcv_nxt - 1)
 
       # Should receive ACK for peer's FIN
       assert_receive {:dummy_link_packet, _link, ack_packet}, 1000
@@ -3484,7 +3966,7 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, rst_segment)
 
       # Should be closed
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "FIN+ACK in FIN_WAIT_1 goes directly to TIME_WAIT", %{
@@ -3900,7 +4382,7 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, rst_segment)
 
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "data in FIN_WAIT_2 is buffered (half-close)", %{
@@ -4052,6 +4534,62 @@ defmodule Tricep.SocketTest do
   end
 
   describe "TIME_WAIT state" do
+    test "exact RST leaves TIME_WAIT without responding", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {_established_state, time_wait_state} =
+        enter_time_wait(socket, link, local_addr, remote_addr)
+
+      {{_, src_port}, _} = time_wait_state.pair
+
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          time_wait_state.tcb.rcv_nxt,
+          time_wait_state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      refute_receive {:dummy_link_packet, ^link, _}, 100
+      assert {:time_wait, _state} = :sys.get_state(socket)
+    end
+
+    test "unexpected SYN in TIME_WAIT is silently dropped", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {_established_state, time_wait_state} =
+        enter_time_wait(socket, link, local_addr, remote_addr)
+
+      {{_, src_port}, _} = time_wait_state.pair
+
+      syn_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(time_wait_state.tcb.rcv_nxt - 1),
+          0,
+          [:syn, :fin],
+          0
+        )
+
+      DummyLink.inject_packet(link, syn_segment)
+
+      refute_receive {:dummy_link_packet, ^link, _}, 100
+      assert {:time_wait, _state} = :sys.get_state(socket)
+    end
+
     test "TIME_WAIT expires and closes connection", %{
       link: link,
       local_addr: local_addr,
@@ -4096,7 +4634,8 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, fin_segment)
 
-      {:time_wait, _} = :sys.get_state(socket)
+      {:time_wait, time_wait_state} = :sys.get_state(socket)
+      assert Tcp.parse_segment(fin_segment).seq == wrap_seq(time_wait_state.tcb.rcv_nxt - 1)
 
       # Drain ACK for peer's FIN
       assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
@@ -4104,7 +4643,7 @@ defmodule Tricep.SocketTest do
       wait_for_state_name(socket, :closed, 2_500)
     end
 
-    test "FIN retransmit in TIME_WAIT is re-ACKed", %{
+    test "bare FIN retransmit in TIME_WAIT is re-ACKed", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -4146,7 +4685,8 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, fin_segment)
 
-      {:time_wait, _} = :sys.get_state(socket)
+      {:time_wait, time_wait_state} = :sys.get_state(socket)
+      assert Tcp.parse_segment(fin_segment).seq == wrap_seq(time_wait_state.tcb.rcv_nxt - 1)
 
       # Drain first ACK
       assert_receive {:dummy_link_packet, _link, _first_ack}, 1000
@@ -4157,13 +4697,61 @@ defmodule Tricep.SocketTest do
       # Should re-ACK
       assert_receive {:dummy_link_packet, _link, re_ack_packet}, 1000
       <<_::binary-size(40), re_ack_seg::binary>> = re_ack_packet
-      assert :ack in Tcp.parse_segment(re_ack_seg).flags
+      re_ack = Tcp.parse_segment(re_ack_seg)
+      assert re_ack.flags == [:ack]
+      assert re_ack.ack == time_wait_state.tcb.rcv_nxt
 
       # Should still be in TIME_WAIT
       {:time_wait, _} = :sys.get_state(socket)
+      refute_receive {:dummy_link_packet, ^link, _}, 100
     end
 
-    test "non-FIN segment in TIME_WAIT is ignored", %{
+    test "data plus FIN retransmit in TIME_WAIT is re-ACKed", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      payload = "final payload"
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, ^link, _ack_packet}, 1000
+
+      {established_state, time_wait_state} =
+        enter_time_wait(socket, link, local_addr, remote_addr, payload: payload)
+
+      assert time_wait_state.tcb.rcv_nxt ==
+               wrap_seq(established_state.tcb.irs + 1 + byte_size(payload) + 1)
+
+      {{_, src_port}, _} = time_wait_state.pair
+
+      retransmitted_data_fin =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          established_state.tcb.irs + 1,
+          time_wait_state.tcb.snd_nxt,
+          [:fin, :ack],
+          32768,
+          payload: payload
+        )
+
+      retransmit = Tcp.parse_segment(retransmitted_data_fin)
+
+      assert wrap_seq(retransmit.seq + byte_size(retransmit.payload)) ==
+               wrap_seq(time_wait_state.tcb.rcv_nxt - 1)
+
+      DummyLink.inject_packet(link, retransmitted_data_fin)
+
+      assert_receive {:dummy_link_packet, ^link, ack_packet}, 1000
+      <<_::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert ack.flags == [:ack]
+      assert ack.ack == time_wait_state.tcb.rcv_nxt
+      assert {:time_wait, %{tcb: %{rcv_nxt: rcv_nxt}}} = :sys.get_state(socket)
+      assert rcv_nxt == time_wait_state.tcb.rcv_nxt
+      refute_receive {:dummy_link_packet, ^link, _}, 100
+    end
+
+    test "out-of-window bare ACK in TIME_WAIT is silently dropped", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -4203,16 +4791,16 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, fin_segment)
 
-      {:time_wait, _} = :sys.get_state(socket)
+      {:time_wait, time_wait_state} = :sys.get_state(socket)
 
       # Drain first ACK
       assert_receive {:dummy_link_packet, _link, _first_ack}, 1000
 
-      # Send non-FIN segment (just ACK)
+      # Send an arbitrary out-of-window non-FIN segment.
       just_ack =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
-          state.tcb.irs + 2,
+          wrap_seq(time_wait_state.tcb.rcv_nxt + time_wait_state.tcb.rcv_wnd),
           state.tcb.snd_nxt + 1,
           [:ack],
           32768
@@ -4225,6 +4813,82 @@ defmodule Tricep.SocketTest do
 
       # Should still be in TIME_WAIT
       {:time_wait, _} = :sys.get_state(socket)
+    end
+
+    test "unrelated FIN in TIME_WAIT is silently dropped", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, ^link, _ack_packet}, 1000
+
+      {_established_state, time_wait_state} =
+        enter_time_wait(socket, link, local_addr, remote_addr)
+
+      {{_, src_port}, _} = time_wait_state.pair
+
+      unrelated_fin =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          time_wait_state.tcb.rcv_nxt,
+          time_wait_state.tcb.snd_nxt,
+          [:fin, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, unrelated_fin)
+
+      refute_receive {:dummy_link_packet, ^link, _}, 100
+      assert {:time_wait, _state} = :sys.get_state(socket)
+    end
+
+    test "payload-bearing FIN retransmit crossing the wrap boundary is re-ACKed", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, ^link, _ack_packet}, 1000
+
+      {_established_state, time_wait_state} =
+        enter_time_wait(socket, link, local_addr, remote_addr)
+
+      wrapped_time_wait_state =
+        :sys.replace_state(socket, fn {:time_wait, state} ->
+          {:time_wait, %{state | tcb: %{state.tcb | rcv_nxt: 1}}}
+        end)
+
+      assert {:time_wait, %{tcb: %{rcv_nxt: 1}}} = wrapped_time_wait_state
+      {{_, src_port}, _} = time_wait_state.pair
+
+      payload = <<0xAA, 0xBB>>
+
+      retransmitted_fin =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          0xFFFFFFFE,
+          time_wait_state.tcb.snd_nxt,
+          [:fin, :ack],
+          32768,
+          payload: payload
+        )
+
+      retransmit = Tcp.parse_segment(retransmitted_fin)
+      assert retransmit.seq == 0xFFFFFFFE
+      assert retransmit.payload == payload
+      assert wrap_seq(retransmit.seq + byte_size(retransmit.payload)) == 0
+
+      DummyLink.inject_packet(link, retransmitted_fin)
+
+      assert_receive {:dummy_link_packet, ^link, ack_packet}, 1000
+      <<_::binary-size(40), ack_segment::binary>> = ack_packet
+      ack = Tcp.parse_segment(ack_segment)
+
+      assert ack.flags == [:ack]
+      assert ack.ack == 1
+      assert {:time_wait, %{tcb: %{rcv_nxt: 1}}} = :sys.get_state(socket)
+      refute_receive {:dummy_link_packet, ^link, _}, 100
     end
   end
 
@@ -4278,7 +4942,49 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, rst_segment)
 
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+    end
+
+    test "in-window non-exact RST in CLOSING gets a challenge ACK", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+      fin_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.tcb.irs + 1,
+          state.tcb.snd_nxt,
+          [:fin, :ack],
+          32768
+        )
+
+      DummyLink.inject_packet(link, fin_segment)
+      assert {:closing, closing_state} = :sys.get_state(socket)
+      assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
+
+      rst_segment =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(closing_state.tcb.rcv_nxt + 1),
+          closing_state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst_segment)
+
+      assert_challenge_ack(link, closing_state)
+      assert {:closing, _state} = :sys.get_state(socket)
     end
 
     test "ACK of our FIN in CLOSING goes to TIME_WAIT", %{
@@ -4605,7 +5311,7 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, rst_segment)
 
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "ACK in CLOSE_WAIT updates snd_una", %{
@@ -4811,7 +5517,7 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, rst_segment)
 
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "ACK of our FIN in LAST_ACK closes connection", %{
@@ -4863,7 +5569,7 @@ defmodule Tricep.SocketTest do
 
       DummyLink.inject_packet(link, our_fin_ack)
 
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "retransmits lost FIN in LAST_ACK", %{
@@ -5110,6 +5816,7 @@ defmodule Tricep.SocketTest do
       assert_receive {:dummy_link_packet, _link, packet}, 1000
 
       <<_ip_header::binary-size(40), syn_segment::binary>> = packet
+      syn = Tcp.parse_segment(syn_segment)
       <<src_port::16, _::binary>> = syn_segment
 
       # Send RST response
@@ -5117,8 +5824,8 @@ defmodule Tricep.SocketTest do
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
           0,
-          0,
-          [:rst],
+          syn.seq + 1,
+          [:rst, :ack],
           0
         )
 
@@ -5365,7 +6072,7 @@ defmodule Tricep.SocketTest do
       end)
 
       assert Task.await(send_task, 1500) == {:error, :etimedout}
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "duplicate ACK leaves retransmission state intact", %{
@@ -5639,6 +6346,44 @@ defmodule Tricep.SocketTest do
   end
 
   # Helper to establish a connection and return the socket
+  defp start_passive_child(link, local_addr, remote_addr, opts \\ []) do
+    socket_opts = Keyword.get(opts, :socket_opts, %{})
+    client_port = Keyword.get(opts, :client_port, 40_020)
+    client_seq = Keyword.get(opts, :client_seq, 9_000)
+
+    {:ok, listener} = Tricep.open(:inet6, :stream, :tcp, socket_opts)
+    assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+    assert Tricep.listen(listener, 1) == :ok
+
+    syn =
+      Tcp.build_segment(
+        {{local_addr, client_port}, {remote_addr, @port}},
+        client_seq,
+        0,
+        [:syn],
+        32_768
+      )
+
+    DummyLink.inject_packet(link, syn)
+
+    assert_receive {:dummy_link_packet, ^link, syn_ack_packet}, 1000
+    <<_::binary-size(40), syn_ack_segment::binary>> = syn_ack_packet
+    syn_ack = Tcp.parse_segment(syn_ack_segment)
+
+    assert {:listen, listen_state} = :sys.get_state(listener)
+    [child] = Map.keys(listen_state.children)
+    assert {:syn_received, state} = :sys.get_state(child)
+
+    %{
+      listener: listener,
+      child: child,
+      client_port: client_port,
+      client_seq: client_seq,
+      syn_ack: syn_ack,
+      state: state
+    }
+  end
+
   defp establish_connection(link, local_addr, remote_addr, opts \\ []) do
     open_opts = Keyword.get(opts, :open_opts, %{})
     {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, open_opts)
@@ -5676,6 +6421,84 @@ defmodule Tricep.SocketTest do
     assert Task.await(task, 1000) == :ok
 
     socket
+  end
+
+  defp reconnect_socket(socket, link, local_addr, remote_addr, server_sequence) do
+    task =
+      Task.async(fn ->
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+      end)
+
+    assert_receive {:dummy_link_packet, ^link, syn_packet}, 1000
+    <<_::binary-size(40), syn_segment::binary>> = syn_packet
+    syn = Tcp.parse_segment(syn_segment)
+    <<src_port::16, _::binary>> = syn_segment
+
+    syn_ack =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        server_sequence,
+        wrap_seq(syn.seq + 1),
+        [:syn, :ack],
+        32_768
+      )
+
+    DummyLink.inject_packet(link, syn_ack)
+    assert Task.await(task, 1_000) == :ok
+    assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1_000
+  end
+
+  defp assert_challenge_ack(link, state) do
+    assert_receive {:dummy_link_packet, ^link, packet}, 1_000
+    <<_ip_header::binary-size(40), tcp_segment::binary>> = packet
+    challenge_ack = Tcp.parse_segment(tcp_segment)
+
+    assert challenge_ack.flags == [:ack]
+    assert challenge_ack.seq == state.tcb.snd_nxt
+    assert challenge_ack.ack == state.tcb.rcv_nxt
+  end
+
+  defp enter_time_wait(socket, link, local_addr, remote_addr, opts \\ []) do
+    payload = Keyword.get(opts, :payload, <<>>)
+    {:established, state} = :sys.get_state(socket)
+    {{_, src_port}, _} = state.pair
+
+    assert Tricep.close(socket) == :ok
+    assert_receive {:dummy_link_packet, _link, _fin_packet}, 1000
+
+    ack_segment =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        state.tcb.irs + 1,
+        state.tcb.snd_nxt + 1,
+        [:ack],
+        32768
+      )
+
+    DummyLink.inject_packet(link, ack_segment)
+    assert {:fin_wait_2, _state} = :sys.get_state(socket)
+
+    fin_segment =
+      Tcp.build_segment(
+        {{local_addr, @port}, {remote_addr, src_port}},
+        state.tcb.irs + 1,
+        state.tcb.snd_nxt + 1,
+        [:fin, :ack],
+        32768,
+        payload: payload
+      )
+
+    DummyLink.inject_packet(link, fin_segment)
+
+    assert {:time_wait, time_wait_state} = :sys.get_state(socket)
+    assert_receive {:dummy_link_packet, ^link, fin_ack_packet}, 1000
+    <<_::binary-size(40), fin_ack_segment::binary>> = fin_ack_packet
+    fin_ack = Tcp.parse_segment(fin_ack_segment)
+
+    assert fin_ack.flags == [:ack]
+    assert fin_ack.ack == time_wait_state.tcb.rcv_nxt
+
+    {state, time_wait_state}
   end
 
   defp start_pending_blocking_connect do
@@ -6136,6 +6959,7 @@ defmodule Tricep.SocketTest do
       # Wait for SYN
       assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
       <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      syn = Tcp.parse_segment(syn_segment)
       <<src_port::16, _::binary>> = syn_segment
 
       # Send RST
@@ -6143,8 +6967,8 @@ defmodule Tricep.SocketTest do
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
           0,
-          0,
-          [:rst],
+          syn.seq + 1,
+          [:rst, :ack],
           0
         )
 
@@ -6158,7 +6982,7 @@ defmodule Tricep.SocketTest do
                :nowait
              ) == {:error, :econnrefused}
 
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "SYN retry exhaustion during :nowait connect notifies and returns etimedout" do
@@ -6182,7 +7006,7 @@ defmodule Tricep.SocketTest do
                :nowait
              ) == {:error, :etimedout}
 
-      {:closed, nil} = :sys.get_state(socket)
+      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "bad ACK during :nowait connect sends RST", %{

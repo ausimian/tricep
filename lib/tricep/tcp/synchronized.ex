@@ -1,10 +1,9 @@
 defmodule Tricep.Tcp.Synchronized do
   @moduledoc false
 
-  # Internal admission pipeline shared by synchronized TCP states. It preserves
-  # pre-#111 RST-before-window processing before data and FIN effects. That
-  # diverges from RFC 9293/RFC 5961 out-of-window silent-drop and challenge-ACK
-  # behavior; bug #97 owns the correction.
+  # Internal admission pipeline shared by synchronized TCP states. RFC 5961
+  # RST and SYN handling deliberately happens before state-specific effects so
+  # every synchronized state applies the same challenge-ACK policy.
 
   alias Tricep.Tcp
   alias Tricep.Tcp.Tcb
@@ -13,7 +12,8 @@ defmodule Tricep.Tcp.Synchronized do
           {:ok, Tcp.parsed_segment()}
           | :malformed
           | :acceptable_reset
-          | :unacceptable_reset
+          | :challenge_ack
+          | :silent_drop
           | :unacceptable_segment
           | :invalid_ack
 
@@ -23,30 +23,41 @@ defmodule Tricep.Tcp.Synchronized do
 
     case Tcp.parse_segment(segment) do
       %{flags: flags, seq: sequence, ack: acknowledgment} = parsed ->
-        classify(
-          tcb,
-          parsed,
-          :rst in flags,
-          :ack in flags,
-          sequence,
-          acknowledgment,
-          validate_ack?
-        )
+        classify(tcb, parsed, flags, sequence, acknowledgment, validate_ack?)
 
       _ ->
         :malformed
     end
   end
 
-  defp classify(tcb, _segment, true, _ack?, sequence, _acknowledgment, _validate_ack?) do
-    if Tcb.acceptable_reset?(tcb, sequence), do: :acceptable_reset, else: :unacceptable_reset
+  defp classify(tcb, segment, flags, sequence, acknowledgment, validate_ack?) do
+    cond do
+      :rst in flags ->
+        reset_outcome(tcb, sequence)
+
+      :syn in flags ->
+        # RFC 5961 §4.2 requires a challenge ACK irrespective of SEG.SEQ, so
+        # SYN classification deliberately precedes receive-window rejection.
+        :challenge_ack
+
+      not Tcb.acceptable_segment?(tcb, segment) ->
+        :unacceptable_segment
+
+      validate_ack? and Tcb.invalid_ack?(tcb, :ack in flags, acknowledgment) ->
+        :invalid_ack
+
+      true ->
+        {:ok, segment}
+    end
   end
 
-  defp classify(tcb, segment, false, ack?, _sequence, acknowledgment, validate_ack?) do
-    cond do
-      not Tcb.acceptable_segment?(tcb, segment) -> :unacceptable_segment
-      validate_ack? and Tcb.invalid_ack?(tcb, ack?, acknowledgment) -> :invalid_ack
-      true -> {:ok, segment}
+  @spec reset_outcome(Tcb.t(), Tcb.sequence()) ::
+          :acceptable_reset | :challenge_ack | :silent_drop
+  def reset_outcome(%Tcb{} = tcb, sequence) do
+    case Tcb.reset_validation(tcb, sequence) do
+      :exact -> :acceptable_reset
+      :in_window -> :challenge_ack
+      :out_of_window -> :silent_drop
     end
   end
 end

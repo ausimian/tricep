@@ -162,7 +162,7 @@ defmodule Tricep.TunLinkTest do
 
       assert log =~ "ICMPv6 enetunreach"
       assert Task.await(recv_task, 1000) == {:error, :enetunreach}
-      assert {:closed, nil} = :sys.get_state(socket)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "reassembles fragmented TCP packets before dispatch", %{
