@@ -11,14 +11,19 @@ defmodule Tricep.SocketTest do
   @remote_addr_str "fd00::2"
   @port 8080
 
-  setup do
+  setup context do
     # Get binary addresses
     {:ok, local_addr} = Tricep.Address.from(@local_addr_str)
     {:ok, remote_addr} = Tricep.Address.from(@remote_addr_str)
 
     # Start DummyLink - registers so Socket can find it when connecting to local_addr
     {:ok, link} =
-      DummyLink.start_link(local_addr: local_addr, remote_addr: remote_addr, owner: self())
+      DummyLink.start_link(
+        local_addr: local_addr,
+        remote_addr: remote_addr,
+        mtu: Map.get(context, :mtu, 1500),
+        owner: self()
+      )
 
     on_exit(fn -> stop_link(link) end)
 
@@ -26,6 +31,24 @@ defmodule Tricep.SocketTest do
   end
 
   describe "connect/2" do
+    test "rejects links and routes below the IPv6 minimum MTU", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      assert Tricep.Application.register_link(remote_addr, {local_addr, 1279}) ==
+               {:error, :invalid_mtu}
+
+      assert Tricep.Application.register_route(remote_addr, local_addr, 64, 1279) ==
+               {:error, :invalid_mtu}
+
+      {:ok, minimum_mtu_addr} = Tricep.Address.from("fd00::ffff")
+
+      assert Tricep.Application.register_link(remote_addr, {minimum_mtu_addr, 1280}) == :ok
+      assert {_link, {^remote_addr, 1280}} = Tricep.Application.lookup_link(minimum_mtu_addr)
+      assert Tricep.Application.deregister_link(minimum_mtu_addr) == :ok
+      assert Tricep.Application.lookup_link(minimum_mtu_addr) == nil
+    end
+
     test "sends SYN packet when connecting", %{remote_addr: remote_addr, local_addr: local_addr} do
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
 
@@ -981,7 +1004,7 @@ defmodule Tricep.SocketTest do
       Task.shutdown(task, :brutal_kill)
     end
 
-    test "stores peer MSS from SYN-ACK", %{
+    test "caps peer MSS to the local link MSS", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -1017,14 +1040,164 @@ defmodule Tricep.SocketTest do
 
       assert Task.await(task, 1000) == :ok
 
-      # Check that the socket stored the peer's MSS
+      # The peer allows 1460, but the local 1500-byte link permits 1440 bytes
+      # after the fixed IPv6 and TCP headers.
       # gen_statem returns {state_name, state_data}
       {:established, state} = :sys.get_state(socket)
-      assert state.snd_mss == peer_mss
+      assert state.snd_mss == 1440
       assert state.rcv_mss == 1440
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+      assert Tricep.send(socket, :binary.copy("x", 1441)) == :ok
+
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+      assert_receive {:dummy_link_packet, _link, packet2}, 1000
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      <<_::binary-size(40), segment1::binary>> = packet1
+      <<_::binary-size(40), segment2::binary>> = packet2
+      assert byte_size(Tcp.parse_segment(segment1).payload) == 1440
+      assert byte_size(Tcp.parse_segment(segment2).payload) == 1
     end
 
-    test "defaults to 1440 MSS when peer doesn't send MSS option", %{
+    @tag mtu: 100_000
+    test "caps maximum wire MSS to the non-jumbogram IPv6 payload ceiling", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, _link, syn_packet}, 1000
+      <<_::binary-size(40), syn_segment::binary>> = syn_packet
+      syn = Tcp.parse_segment(syn_segment)
+      <<src_port::16, _::binary>> = syn_segment
+      assert syn.options.mss == 65_515
+
+      syn_ack =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          5000,
+          syn.seq + 1,
+          [:syn, :ack],
+          65_535,
+          mss: 65_535
+        )
+
+      DummyLink.inject_packet(link, syn_ack)
+      assert Task.await(task, 1000) == :ok
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+      assert {:established, %{rcv_mss: 65_515, snd_mss: 65_515}} = :sys.get_state(socket)
+
+      assert Tricep.send(socket, :binary.copy("x", 65_516)) == :ok
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+      assert_receive {:dummy_link_packet, _link, packet2}, 1000
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      <<_::binary-size(40), segment1::binary>> = packet1
+      <<_::binary-size(40), segment2::binary>> = packet2
+      assert byte_size(Tcp.parse_segment(segment1).payload) == 65_515
+      assert byte_size(Tcp.parse_segment(segment2).payload) == 1
+      assert Process.alive?(socket)
+    end
+
+    test "clamps zero MSS and drains the send buffer with non-empty segments", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, mss: 0)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+      assert {:established, %{snd_mss: 48}} = :sys.get_state(socket)
+
+      payload = :binary.copy("x", 49)
+      assert Tricep.send(socket, payload) == :ok
+
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+      assert_receive {:dummy_link_packet, _link, packet2}, 1000
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      <<_::binary-size(40), segment1::binary>> = packet1
+      <<_::binary-size(40), segment2::binary>> = packet2
+
+      assert byte_size(Tcp.parse_segment(segment1).payload) == 48
+      assert byte_size(Tcp.parse_segment(segment2).payload) == 1
+
+      assert {:established, state} = :sys.get_state(socket)
+      assert Tricep.DataBuffer.empty?(state.send_buffer)
+
+      assert Enum.all?(state.unacked_segments, fn {_start, _end, data, _count} -> data != <<>> end)
+    end
+
+    test "clamps a one-byte peer MSS and makes finite send-buffer progress", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, mss: 1)
+
+      assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+      assert {:established, %{snd_mss: 48}} = :sys.get_state(socket)
+
+      payload = :binary.copy("x", 49)
+      assert Tricep.send(socket, payload) == :ok
+      assert_receive {:dummy_link_packet, _link, packet1}, 1000
+      assert_receive {:dummy_link_packet, _link, packet2}, 1000
+      refute_receive {:dummy_link_packet, _link, _packet}, 100
+
+      <<_::binary-size(40), segment1::binary>> = packet1
+      <<_::binary-size(40), segment2::binary>> = packet2
+      assert byte_size(Tcp.parse_segment(segment1).payload) == 48
+      assert byte_size(Tcp.parse_segment(segment2).payload) == 1
+
+      assert {:established, state} = :sys.get_state(socket)
+      assert Tricep.DataBuffer.empty?(state.send_buffer)
+    end
+
+    test "clamps only peer MSS values below the minimum send floor", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      for {peer_mss, expected_mss} <- [{47, 48}, {48, 48}, {49, 49}] do
+        socket = establish_connection(link, local_addr, remote_addr, mss: peer_mss)
+
+        assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+        assert {:established, %{snd_mss: ^expected_mss}} = :sys.get_state(socket)
+      end
+    end
+
+    test "normalizes zero MSS during passive open", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      accept_task = Task.async(fn -> Tricep.accept(listener, 1000) end)
+      client_port = 40_040
+      client_seq = 6000
+      syn_ack = send_passive_syn(link, local_addr, remote_addr, client_port, client_seq, 0)
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      assert {:ok, accepted} = Task.await(accept_task, 1000)
+      on_exit(fn -> stop_socket(accepted) end)
+
+      assert {:established, %{snd_mss: 48}} = :sys.get_state(accepted)
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "defaults to 1220 MSS when peer doesn't send MSS option", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -1242,13 +1415,14 @@ defmodule Tricep.SocketTest do
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
-      socket = establish_connection(link, local_addr, remote_addr, mss: 10)
+      socket = establish_connection(link, local_addr, remote_addr, mss: 48)
 
       # Drain the ACK packet
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
 
       # Send data larger than MSS
-      assert Tricep.send(socket, "Hello, World!") == :ok
+      payload = :binary.copy("x", 49)
+      assert Tricep.send(socket, payload) == :ok
 
       # Should receive two segments
       assert_receive {:dummy_link_packet, _link, packet1}, 1000
@@ -1260,8 +1434,8 @@ defmodule Tricep.SocketTest do
       parsed1 = Tcp.parse_segment(seg1)
       parsed2 = Tcp.parse_segment(seg2)
 
-      assert parsed1.payload == "Hello, Wor"
-      assert parsed2.payload == "ld!"
+      assert byte_size(parsed1.payload) == 48
+      assert byte_size(parsed2.payload) == 1
     end
 
     test "limits sent data to the peer receive window and resumes after ACK", %{
@@ -1269,7 +1443,7 @@ defmodule Tricep.SocketTest do
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
-      socket = establish_connection(link, local_addr, remote_addr, mss: 10, window: 1)
+      socket = establish_connection(link, local_addr, remote_addr, mss: 48, window: 1)
 
       # Drain the ACK packet
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
@@ -2254,7 +2428,7 @@ defmodule Tricep.SocketTest do
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
-      socket = establish_connection(link, local_addr, remote_addr, mss: 10, window: 1)
+      socket = establish_connection(link, local_addr, remote_addr, mss: 48, window: 1)
 
       # Drain the ACK packet from handshake
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
@@ -3517,7 +3691,7 @@ defmodule Tricep.SocketTest do
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
-      socket = establish_connection(link, local_addr, remote_addr, mss: 10)
+      socket = establish_connection(link, local_addr, remote_addr, mss: 48)
 
       # Drain ACK
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
@@ -3544,7 +3718,8 @@ defmodule Tricep.SocketTest do
       assert_receive {:dummy_link_packet, _link, _fin_ack}, 1000
 
       # Send large data that will be segmented
-      assert Tricep.send(socket, "Hello, World!") == :ok
+      payload = :binary.copy("x", 49)
+      assert Tricep.send(socket, payload) == :ok
 
       # Should receive two segments
       assert_receive {:dummy_link_packet, _link, packet1}, 1000
@@ -3556,8 +3731,8 @@ defmodule Tricep.SocketTest do
       parsed1 = Tcp.parse_segment(seg1)
       parsed2 = Tcp.parse_segment(seg2)
 
-      assert parsed1.payload == "Hello, Wor"
-      assert parsed2.payload == "ld!"
+      assert byte_size(parsed1.payload) == 48
+      assert byte_size(parsed2.payload) == 1
     end
 
     test "close in CLOSE_WAIT sends FIN and goes to LAST_ACK", %{
@@ -4454,12 +4629,12 @@ defmodule Tricep.SocketTest do
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
-      socket = establish_connection(link, local_addr, remote_addr, mss: 5)
+      socket = establish_connection(link, local_addr, remote_addr, mss: 48)
 
       # Drain the ACK packet from handshake
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
 
-      assert Tricep.send(socket, "helloworld") == :ok
+      assert Tricep.send(socket, :binary.copy("x", 96)) == :ok
 
       assert_receive {:dummy_link_packet, _link, packet1}, 1000
       assert_receive {:dummy_link_packet, _link, packet2}, 1000
@@ -4779,7 +4954,7 @@ defmodule Tricep.SocketTest do
       assert :syn in parsed.flags
     end
 
-    test "sends notification on SYN-ACK", %{
+    test "sends notification on SYN-ACK and normalizes zero MSS", %{
       link: link,
       local_addr: local_addr,
       remote_addr: remote_addr
@@ -4804,7 +4979,8 @@ defmodule Tricep.SocketTest do
           server_seq,
           syn_parsed.seq + 1,
           [:syn, :ack],
-          32768
+          32768,
+          mss: 0
         )
 
       DummyLink.inject_packet(link, syn_ack_segment)
@@ -4814,6 +4990,7 @@ defmodule Tricep.SocketTest do
 
       # Drain ACK
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
+      assert {:established, %{snd_mss: 48}} = :sys.get_state(socket)
     end
 
     test "nowait connect accepts SYN-ACK that acknowledges wrapped active-open ISS", %{
@@ -5537,7 +5714,7 @@ defmodule Tricep.SocketTest do
     end
   end
 
-  defp send_passive_syn(link, local_addr, remote_addr, client_port, client_seq)
+  defp send_passive_syn(link, local_addr, remote_addr, client_port, client_seq, mss \\ 1000)
        when is_pid(link) do
     syn =
       Tcp.build_segment(
@@ -5546,7 +5723,7 @@ defmodule Tricep.SocketTest do
         0,
         [:syn],
         32768,
-        mss: 1000
+        mss: mss
       )
 
     DummyLink.inject_packet(link, syn)
@@ -5820,7 +5997,7 @@ defmodule Tricep.SocketTest do
       local_addr: local_addr,
       remote_addr: remote_addr
     } do
-      socket = establish_connection(link, local_addr, remote_addr, mss: 10, window: 1)
+      socket = establish_connection(link, local_addr, remote_addr, mss: 48, window: 1)
 
       # Drain the ACK packet from handshake
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
