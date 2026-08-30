@@ -40,11 +40,19 @@ defmodule Tricep do
 
       {:select, {:select_info, operation, ref}}
 
-  When the operation can proceed, the caller receives a message:
+  When the operation can be retried, the caller receives a message:
 
       {:"$socket", socket_pid, :select, ref}
 
-  The caller can then retry the operation to complete it.
+  The caller can then retry the operation. For listeners, explicit close and
+  connection-supervisor loss also wake pending accept selectors; that retry
+  returns the listener's closed-state error.
+
+  Select messages do not guarantee notification of abnormal socket death. A
+  socket that exits abnormally may not send a select message and causes a
+  pending blocking socket call to exit with the exit reason. Callers that need
+  a completion signal across socket death must monitor the socket PID and
+  handle its `:DOWN` message.
   """
 
   @doc """
@@ -80,6 +88,12 @@ defmodule Tricep do
     * `{:ok, socket}` - A socket pid on success
     * `{:error, :unsupported}` - If the domain/type/protocol combination is not supported
     * `{:error, :einval}` - If a supplied challenge-ACK option is not a positive integer
+
+  ## Lifecycle
+
+  `open/3` starts the socket linked to its creator. A normal creator exit does
+  not close the socket, so the creator or another manager must call `close/1`
+  when it is no longer needed.
 
   ## Examples
 
@@ -137,6 +151,12 @@ defmodule Tricep do
     * `{:ok, socket}` - A socket pid on success
     * `{:error, :unsupported}` - If the domain/type/protocol combination is not supported
     * `{:error, :einval}` - If a supplied challenge-ACK option is not a positive integer
+
+  ## Lifecycle
+
+  Like `open/3`, this starts the socket linked to its creator. A normal creator
+  exit does not close the socket; close it explicitly when it is no longer
+  needed.
   """
   @spec open(:inet6, :stream, :tcp | :default, map()) ::
           {:ok, pid()} | {:error, :unsupported | :einval}
@@ -167,8 +187,10 @@ defmodule Tricep do
   Select info returned when an operation would block with `:nowait` timeout.
 
   The tuple contains the operation type (`:accept`, `:connect`, `:recv`, or `:send`) and
-  a unique reference. When the operation can proceed, the caller receives
-  `{:"$socket", socket_pid, :select, ref}`.
+  a unique reference. When the operation can be retried, the caller receives
+  `{:"$socket", socket_pid, :select, ref}`. For listener accepts, a select can
+  also report listener closure. It is not a guaranteed socket-death
+  notification; monitor `socket_pid` to handle abnormal socket exit.
   """
   @type select_info :: {:select_info, :accept | :connect | :recv | :send, reference()}
 
@@ -279,6 +301,14 @@ defmodule Tricep do
     * `{:ok, socket}` - A connected child socket
     * `{:error, :timeout}` - Timed out waiting for a connection
     * `{:select, select_info}` - No connection is ready with `:nowait`
+
+  A blocking accept that is settled while the listener closes returns
+  `{:error, :closed}`. Once the listener has entered its closed state, a later
+  `accept/2` call returns `{:error, :einval}` under the current API.
+
+  Accepted passive children are unlinked from listener supervision before they
+  are returned. Callers should close or otherwise supervise the returned socket
+  PID according to their application's lifecycle.
   """
   @spec accept(pid(), socket_timeout()) ::
           {:ok, pid()} | {:error, atom()} | {:select, select_info()}

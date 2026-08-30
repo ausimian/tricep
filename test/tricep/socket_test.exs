@@ -5,6 +5,8 @@ defmodule Tricep.SocketTest do
 
   alias Tricep.DummyLink
   alias Tricep.Tcp
+  alias Tricep.Tcp.Listener
+  alias Tricep.Tcp.Listener.{Accepted, Child, Waiter}
   alias Tricep.Tcp.ReceiveReassembly
 
   # Test addresses
@@ -823,6 +825,235 @@ defmodule Tricep.SocketTest do
       assert Tricep.close(listener) == :ok
     end
 
+    test "a dead infinite acceptor leaves its next child available and reusable", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      acceptor = spawn(fn -> Tricep.accept(listener, :infinity) end)
+      acceptor_ref = Process.monitor(acceptor)
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_waiters: [_]}} -> true
+        _state -> false
+      end)
+
+      Process.exit(acceptor, :kill)
+      assert_receive {:DOWN, ^acceptor_ref, :process, ^acceptor, :killed}, 1_000
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_waiters: []}} -> true
+        _state -> false
+      end)
+
+      client_port = 40_040
+      client_seq = 4_000
+      syn_ack = send_passive_syn(link, local_addr, remote_addr, client_port, client_seq)
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      {:listen, %{connection_supervisor: connection_supervisor}} =
+        wait_for_socket(listener, fn
+          {:listen, %{accept_queue: [_], pending_count: 0}} -> true
+          _state -> false
+        end)
+
+      [child] = Map.keys(:sys.get_state(connection_supervisor).children)
+      assert {:ok, ^child} = Tricep.accept(listener, :nowait)
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_queue: [], children: children}} -> children == %{}
+        _state -> false
+      end)
+
+      child_ref = Process.monitor(child)
+      Process.exit(child, :kill)
+      assert_receive {:DOWN, ^child_ref, :process, ^child, :killed}, 1_000
+
+      assert wait_until(fn ->
+               Tricep.Application.lookup_socket_pair(
+                 {{remote_addr, @port}, {local_addr, client_port}}
+               ) ==
+                 nil
+             end)
+
+      _syn_ack = send_passive_syn(link, local_addr, remote_addr, client_port, client_seq + 100)
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "a dead finite acceptor leaves its next child supervisor-owned", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: @remote_addr_str, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      acceptor = spawn(fn -> Tricep.accept(listener, 5_000) end)
+      acceptor_ref = Process.monitor(acceptor)
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_waiters: [_]}} -> true
+        _state -> false
+      end)
+
+      Process.exit(acceptor, :kill)
+      assert_receive {:DOWN, ^acceptor_ref, :process, ^acceptor, :killed}, 1_000
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_waiters: []}} -> true
+        _state -> false
+      end)
+
+      client_port = 40_041
+      client_seq = 4_100
+      syn_ack = send_passive_syn(link, local_addr, remote_addr, client_port, client_seq)
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      {:listen, %{connection_supervisor: connection_supervisor}} =
+        wait_for_socket(listener, fn
+          {:listen, %{accept_queue: [_], pending_count: 0}} -> true
+          _state -> false
+        end)
+
+      [child] = Map.keys(:sys.get_state(connection_supervisor).children)
+      assert {:ok, ^child} = Tricep.accept(listener, 1_000)
+
+      child_ref = Process.monitor(child)
+      Process.exit(child, :kill)
+      assert_receive {:DOWN, ^child_ref, :process, ^child, :killed}, 1_000
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "accept waiters settle once across timeout, caller down, and close", %{
+      remote_addr: remote_addr
+    } do
+      parent = self()
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: remote_addr, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      timeout_acceptor =
+        spawn(fn -> send(parent, {:accept_result, :timeout, Tricep.accept(listener, 25)}) end)
+
+      timeout_acceptor_ref = Process.monitor(timeout_acceptor)
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_waiters: [_]}} -> true
+        _state -> false
+      end)
+
+      assert_receive {:accept_result, :timeout, {:error, :timeout}}, 1_000
+      assert_receive {:DOWN, ^timeout_acceptor_ref, :process, ^timeout_acceptor, :normal}, 1_000
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_waiters: []}} -> true
+        _state -> false
+      end)
+
+      refute_receive {:accept_result, :timeout, _result}, 50
+
+      close_acceptor =
+        spawn(fn -> send(parent, {:accept_result, :close, Tricep.accept(listener, 5_000)}) end)
+
+      close_acceptor_ref = Process.monitor(close_acceptor)
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_waiters: [_]}} -> true
+        _state -> false
+      end)
+
+      assert Tricep.close(listener) == :ok
+      assert_receive {:accept_result, :close, {:error, :closed}}, 1_000
+      assert_receive {:DOWN, ^close_acceptor_ref, :process, ^close_acceptor, :normal}, 1_000
+      refute_receive {:accept_result, :close, _result}, 50
+    end
+
+    test "accept skips a stale queued child before returning a live child", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{
+        listener: listener,
+        child: child,
+        client_port: client_port,
+        client_seq: client_seq,
+        syn_ack: syn_ack
+      } = start_passive_child(link, local_addr, remote_addr)
+
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_queue: [_]}} -> true
+        _state -> false
+      end)
+
+      prepend_stale_accepted_child(listener)
+
+      assert {:ok, ^child} = Tricep.accept(listener, 1_000)
+      assert Tricep.close(listener) == :ok
+      stop_socket(child)
+    end
+
+    test "a blocking accept skips stale queued children when a live child arrives", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{
+        listener: listener,
+        child: child,
+        client_port: client_port,
+        client_seq: client_seq,
+        syn_ack: syn_ack
+      } = start_passive_child(link, local_addr, remote_addr)
+
+      accept_task = Task.async(fn -> Tricep.accept(listener, 1_000) end)
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_waiters: [_]}} -> true
+        _state -> false
+      end)
+
+      prepend_stale_accepted_child(listener)
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      assert {:ok, ^child} = Task.await(accept_task, 1_000)
+      assert Tricep.close(listener) == :ok
+      stop_socket(child)
+    end
+
+    test "nowait accept skips stale queued children after select notification", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{
+        listener: listener,
+        child: child,
+        client_port: client_port,
+        client_seq: client_seq,
+        syn_ack: syn_ack
+      } = start_passive_child(link, local_addr, remote_addr)
+
+      assert {:select, {:select_info, :accept, ref}} = Tricep.accept(listener, :nowait)
+      prepend_stale_accepted_child(listener)
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      assert_receive {:"$socket", ^listener, :select, ^ref}, 1_000
+      assert {:ok, ^child} = Tricep.accept(listener, :nowait)
+      assert Tricep.close(listener) == :ok
+      stop_socket(child)
+    end
+
     test "listen backlog drops additional SYNs while full", %{
       link: link,
       local_addr: local_addr,
@@ -847,6 +1078,163 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, syn)
       refute_receive {:dummy_link_packet, _link, _packet}, 100
 
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "listener sockname uses the public IPv6 address tuple", %{remote_addr: remote_addr} do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: remote_addr, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      assert {:ok, %{family: :inet6, addr: {0xFD00, 0, 0, 0, 0, 0, 0, 2}, port: @port}} =
+               Tricep.sockname(listener)
+
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "listener rejects unmodeled calls", %{remote_addr: remote_addr} do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: remote_addr, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      assert {:error, :einval} = :gen_statem.call(listener, :unmodeled_listener_call)
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "samples passive child start failures", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: remote_addr, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      {:listen, state} = :sys.get_state(listener)
+      failure_supervisor = start_passive_failure_supervisor(:enomem)
+
+      log =
+        capture_log(fn ->
+          state = %{state | connection_supervisor: failure_supervisor}
+
+          state =
+            Enum.reduce(1..5, state, fn _failure, state ->
+              assert {:keep_state, state} =
+                       Listener.handle_event(
+                         :info,
+                         passive_syn_event(local_addr, remote_addr, 40_099),
+                         state
+                       )
+
+              state
+            end)
+
+          send(self(), {:passive_start_failure_state, state})
+        end)
+
+      assert_receive {:passive_start_failure_state, failure_state}
+      assert failure_state.passive_start_failures == 5
+      assert log =~ "sampled failure #1"
+      assert log =~ "sampled failure #2"
+      assert log =~ "sampled failure #4"
+      refute log =~ "sampled failure #3"
+      refute log =~ "sampled failure #5"
+      assert log =~ "port: 40099"
+      assert log =~ ":enomem"
+
+      assert Tricep.close(listener) == :ok
+      stop_socket(failure_supervisor)
+    end
+
+    test "keeps a closed passive child supervisor quiet", %{
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: remote_addr, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      {:listen, state} = :sys.get_state(listener)
+      closed_supervisor = spawn(fn -> :ok end)
+      assert wait_until(fn -> not Process.alive?(closed_supervisor) end)
+
+      log =
+        capture_log(fn ->
+          state = %{state | connection_supervisor: closed_supervisor}
+
+          assert :keep_state_and_data =
+                   Listener.handle_event(
+                     :info,
+                     passive_syn_event(local_addr, remote_addr, 40_100),
+                     state
+                   )
+        end)
+
+      refute log =~ "could not start passive child"
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "retains queued accepts when the child supervisor is unavailable", %{
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: remote_addr, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      {:listen, state} = :sys.get_state(listener)
+      closed_supervisor = spawn(fn -> :ok end)
+      assert wait_until(fn -> not Process.alive?(closed_supervisor) end)
+
+      queue = [
+        %Accepted{child: self()},
+        %Accepted{child: spawn(fn -> :ok end)}
+      ]
+
+      from = {self(), make_ref()}
+      state = %{state | connection_supervisor: closed_supervisor, accept_queue: queue}
+
+      assert {:keep_state, retained_state, {:reply, ^from, {:error, :closed}}} =
+               Listener.handle_event({:call, from}, {:accept, 1_000}, state)
+
+      assert retained_state.accept_queue == queue
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "retains a finite accept waiter when the child supervisor is unavailable", %{
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: remote_addr, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      {:listen, state} = :sys.get_state(listener)
+      closed_supervisor = spawn(fn -> :ok end)
+      assert wait_until(fn -> not Process.alive?(closed_supervisor) end)
+
+      from = {self(), make_ref()}
+      timer = make_ref()
+      monitor = Process.monitor(self())
+      waiter = %Waiter{from: from, id: timer, timer: timer, monitor: monitor}
+
+      state = %{
+        state
+        | connection_supervisor: closed_supervisor,
+          pending_count: 1,
+          children: %{self() => %Child{status: :pending}},
+          accept_waiters: [waiter]
+      }
+
+      assert {:keep_state, retained_state, []} =
+               Listener.handle_event(:info, {:passive_established, self()}, state)
+
+      assert retained_state.accept_waiters == [waiter]
+      assert retained_state.accept_queue == [%Accepted{child: self()}]
+      Process.demonitor(monitor, [:flush])
       assert Tricep.close(listener) == :ok
     end
 
@@ -929,6 +1317,367 @@ defmodule Tricep.SocketTest do
       assert Process.alive?(socket)
 
       assert Tricep.close(socket) == :ok
+    end
+
+    test "listener close reaps an unaccepted passive child", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, state: state} =
+        start_passive_child(link, local_addr, remote_addr)
+
+      child_ref = Process.monitor(child)
+
+      assert Tricep.close(listener) == :ok
+      assert_receive {:DOWN, ^child_ref, :process, ^child, :shutdown}, 1_000
+      refute Process.alive?(child)
+      assert wait_until(fn -> Tricep.Application.lookup_listener(remote_addr, @port) == nil end)
+      assert wait_until(fn -> Tricep.Application.lookup_socket_pair(state.pair) == nil end)
+    end
+
+    test "a listener survives its creator exiting normally and keeps passive children owned", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      parent = self()
+
+      creator =
+        spawn(fn ->
+          {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+          send(parent, {:listener_from_creator, self(), listener})
+
+          receive do
+            :exit_normally -> :ok
+          end
+        end)
+
+      creator_ref = Process.monitor(creator)
+      assert_receive {:listener_from_creator, ^creator, listener}, 1_000
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: remote_addr, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      client_port = 40_042
+      client_seq = 4_200
+      syn_ack = send_passive_syn(link, local_addr, remote_addr, client_port, client_seq)
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      {:listen, %{connection_supervisor: connection_supervisor, children: children}} =
+        wait_for_socket(listener, fn
+          {:listen, %{children: children}} when map_size(children) == 1 -> true
+          _state -> false
+        end)
+
+      [child] = Map.keys(children)
+      child_ref = Process.monitor(child)
+
+      send(creator, :exit_normally)
+      assert_receive {:DOWN, ^creator_ref, :process, ^creator, :normal}, 1_000
+
+      assert Process.alive?(listener)
+      assert Tricep.Application.lookup_listener(remote_addr, @port) == listener
+      assert Map.has_key?(:sys.get_state(connection_supervisor).children, child)
+
+      assert Tricep.close(listener) == :ok
+      assert_receive {:DOWN, ^child_ref, :process, ^child, :shutdown}, 1_000
+    end
+
+    test "abnormal listener shutdown reaps children without settling selectors", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, state: state} =
+        start_passive_child(link, local_addr, remote_addr)
+
+      assert {:select, {:select_info, :accept, ref}} = Tricep.accept(listener, :nowait)
+
+      Process.unlink(listener)
+      listener_ref = Process.monitor(listener)
+      child_ref = Process.monitor(child)
+      {:listen, %{connection_supervisor: connection_supervisor}} = :sys.get_state(listener)
+      supervisor_ref = Process.monitor(connection_supervisor)
+
+      Process.exit(listener, :shutdown)
+
+      assert_receive {:DOWN, ^listener_ref, :process, ^listener, :shutdown}, 1_000
+      assert_receive {:DOWN, ^child_ref, :process, ^child, :shutdown}, 1_000
+      assert_receive {:DOWN, ^supervisor_ref, :process, ^connection_supervisor, :normal}, 1_000
+      refute Process.alive?(child)
+      refute_receive {:"$socket", ^listener, :select, ^ref}, 50
+      assert wait_until(fn -> Tricep.Application.lookup_listener(remote_addr, @port) == nil end)
+      assert wait_until(fn -> Tricep.Application.lookup_socket_pair(state.pair) == nil end)
+    end
+
+    test "listener kill reaps an unaccepted passive child", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, state: state} =
+        start_passive_child(link, local_addr, remote_addr)
+
+      Process.unlink(listener)
+      listener_ref = Process.monitor(listener)
+      child_ref = Process.monitor(child)
+
+      Process.exit(listener, :kill)
+
+      assert_receive {:DOWN, ^listener_ref, :process, ^listener, :killed}, 1_000
+      assert_receive {:DOWN, ^child_ref, :process, ^child, :shutdown}, 1_000
+      refute Process.alive?(child)
+      assert wait_until(fn -> Tricep.Application.lookup_socket_pair(state.pair) == nil end)
+    end
+
+    test "connection supervisor kill reaps unaccepted children", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{listener: listener, child: child, state: state} =
+        start_passive_child(link, local_addr, remote_addr)
+
+      {:listen, %{connection_supervisor: connection_supervisor}} = :sys.get_state(listener)
+
+      child_ref = Process.monitor(child)
+
+      log =
+        capture_log(fn ->
+          Process.exit(connection_supervisor, :kill)
+
+          assert_receive {:DOWN, ^child_ref, :process, ^child, :killed}, 1_000
+          refute Process.alive?(child)
+          assert wait_until(fn -> Tricep.Application.lookup_socket_pair(state.pair) == nil end)
+          assert wait_for_state_name(listener, :closed, 1_000)
+        end)
+
+      assert log =~ "TCP listener connection supervisor exited unexpectedly: :killed"
+      assert {:error, :einval} = Tricep.accept(listener, :nowait)
+      assert {:error, :enotconn} = Tricep.close(listener)
+    end
+
+    test "supervisor kill closes finite accepts and preserves terminal listener APIs", %{
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: remote_addr, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      accept_task = Task.async(fn -> Tricep.accept(listener, 5_000) end)
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_waiters: [_]}} -> true
+        _state -> false
+      end)
+
+      assert {:select, {:select_info, :accept, ref}} = Tricep.accept(listener, :nowait)
+      {:listen, %{connection_supervisor: connection_supervisor}} = :sys.get_state(listener)
+
+      log =
+        capture_log(fn ->
+          Process.exit(connection_supervisor, :kill)
+
+          assert {:error, :closed} = Task.await(accept_task, 1_000)
+          assert_receive {:"$socket", ^listener, :select, ^ref}, 1_000
+          assert wait_for_state_name(listener, :closed, 1_000)
+        end)
+
+      assert log =~ "TCP listener connection supervisor exited unexpectedly: :killed"
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(listener)
+      assert {:error, :einval} = Tricep.accept(listener, :nowait)
+      assert {:error, :enotconn} = Tricep.close(listener)
+    end
+
+    test "a queued child exit frees backlog capacity for the next SYN", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{
+        listener: listener,
+        child: child,
+        client_port: client_port,
+        client_seq: client_seq,
+        syn_ack: syn_ack
+      } = start_passive_child(link, local_addr, remote_addr)
+
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      wait_for_socket(listener, fn
+        {:listen, %{children: children, pending_count: 0, accept_queue: [_]}} ->
+          Map.has_key?(children, child)
+
+        _state ->
+          false
+      end)
+
+      child_ref = Process.monitor(child)
+      Process.exit(child, :kill)
+
+      assert_receive {:DOWN, ^child_ref, :process, ^child, :killed}, 1_000
+
+      wait_for_socket(listener, fn
+        {:listen, %{children: children, pending_count: 0, accept_queue: []}} -> children == %{}
+        _state -> false
+      end)
+
+      _syn_ack = send_passive_syn(link, local_addr, remote_addr, 40_021, 9_001)
+      assert Tricep.close(listener) == :ok
+    end
+
+    test "ordinary close and supervisor loss use the ordinary closed contract", %{
+      remote_addr: remote_addr
+    } do
+      {:ok, ordinary_listener} = Tricep.open(:inet6, :stream, :tcp)
+      {:ok, failed_listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(ordinary_listener, %{family: :inet6, addr: remote_addr, port: @port}) ==
+               :ok
+
+      assert Tricep.bind(failed_listener, %{family: :inet6, addr: remote_addr, port: @port + 1}) ==
+               :ok
+
+      assert Tricep.listen(ordinary_listener, 1) == :ok
+      assert Tricep.listen(failed_listener, 1) == :ok
+
+      accept_task = Task.async(fn -> Tricep.accept(ordinary_listener, 5_000) end)
+
+      wait_for_socket(ordinary_listener, fn
+        {:listen, %{accept_waiters: [_]}} -> true
+        _state -> false
+      end)
+
+      assert {:select, {:select_info, :accept, ref}} = Tricep.accept(ordinary_listener, :nowait)
+
+      ordinary_log =
+        capture_log(fn ->
+          assert Tricep.close(ordinary_listener) == :ok
+          assert {:error, :closed} = Task.await(accept_task, 1_000)
+          assert_receive {:"$socket", ^ordinary_listener, :select, ^ref}, 1_000
+        end)
+
+      refute ordinary_log =~ "TCP listener connection supervisor"
+      assert {:closed, %{}} = :sys.get_state(ordinary_listener)
+
+      {:listen, %{connection_supervisor: connection_supervisor}} = :sys.get_state(failed_listener)
+
+      failed_log =
+        capture_log(fn ->
+          Process.exit(connection_supervisor, :kill)
+          assert wait_for_state_name(failed_listener, :closed, 1_000)
+        end)
+
+      assert 1 ==
+               length(
+                 Regex.scan(
+                   ~r/TCP listener connection supervisor exited unexpectedly/,
+                   failed_log
+                 )
+               )
+
+      for listener <- [ordinary_listener, failed_listener] do
+        assert {:error, :einval} = Tricep.accept(listener, :nowait)
+        assert {:error, :enotconn} = Tricep.close(listener)
+      end
+    end
+
+    test "listener termination settles pending accepts before monitor shutdown", %{
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+
+      assert Tricep.bind(listener, %{family: :inet6, addr: remote_addr, port: @port}) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+
+      accept_task = Task.async(fn -> Tricep.accept(listener, 5_000) end)
+
+      wait_for_socket(listener, fn
+        {:listen, %{accept_waiters: [_]}} -> true
+        _state -> false
+      end)
+
+      assert {:select, {:select_info, :accept, ref}} = Tricep.accept(listener, :nowait)
+      {:listen, %{connection_supervisor: connection_supervisor}} = :sys.get_state(listener)
+      listener_ref = Process.monitor(listener)
+      supervisor_ref = Process.monitor(connection_supervisor)
+
+      log =
+        capture_log(fn ->
+          assert :ok = :gen_statem.stop(listener)
+          assert {:error, :closed} = Task.await(accept_task, 1_000)
+          assert_receive {:"$socket", ^listener, :select, ^ref}, 1_000
+          assert_receive {:DOWN, ^listener_ref, :process, ^listener, :normal}, 1_000
+
+          assert_receive {:DOWN, ^supervisor_ref, :process, ^connection_supervisor, :normal},
+                         1_000
+        end)
+
+      refute log =~ "TCP listener connection supervisor"
+      refute_receive {:"$socket", ^listener, :select, ^ref}, 50
+      assert wait_until(fn -> Tricep.Application.lookup_listener(remote_addr, @port) == nil end)
+    end
+
+    test "a closed listener can rebind, relisten, and reconnect", %{
+      remote_addr: remote_addr
+    } do
+      {:ok, listener} = Tricep.open(:inet6, :stream, :tcp)
+      address = %{family: :inet6, addr: remote_addr, port: @port}
+
+      assert Tricep.bind(listener, address) == :ok
+      assert Tricep.listen(listener, 1) == :ok
+      assert Tricep.close(listener) == :ok
+      assert {:closed, %{}} = :sys.get_state(listener)
+
+      assert Tricep.bind(listener, address) == :ok
+      assert {:bound, bound_data} = :sys.get_state(listener)
+      assert bound_data.local_port == @port
+
+      assert Tricep.listen(listener, 1) == :ok
+      assert Tricep.close(listener) == :ok
+
+      assert {:select, {:select_info, :connect, _ref}} =
+               Tricep.connect(
+                 listener,
+                 %{family: :inet6, addr: @local_addr_str, port: @port},
+                 :nowait
+               )
+
+      assert_receive {:dummy_link_packet, _link, _packet}, 1_000
+      assert {{:syn_sent, :nowait}, connect_state} = :sys.get_state(listener)
+      assert is_map(connect_state)
+      stop_socket(listener)
+    end
+
+    test "claiming an accepted child removes it from the supervisor failure domain", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      %{
+        listener: listener,
+        child: child,
+        client_port: client_port,
+        client_seq: client_seq,
+        syn_ack: syn_ack
+      } = start_passive_child(link, local_addr, remote_addr)
+
+      {:listen, %{connection_supervisor: connection_supervisor}} = :sys.get_state(listener)
+      send_passive_ack(link, local_addr, remote_addr, client_port, client_seq, syn_ack.seq)
+
+      assert {:ok, ^child} = Tricep.accept(listener, 1_000)
+
+      Process.exit(connection_supervisor, :kill)
+
+      assert wait_for_state_name(listener, :closed, 1_000)
+      assert Process.alive?(child)
+      assert {:established, _state} = :sys.get_state(child)
+
+      child_ref = Process.monitor(child)
+      Process.exit(child, :kill)
+      assert_receive {:DOWN, ^child_ref, :process, ^child, :killed}, 1_000
     end
   end
 
@@ -8915,6 +9664,29 @@ defmodule Tricep.SocketTest do
     }
   end
 
+  defp prepend_stale_accepted_child(listener) do
+    :sys.replace_state(listener, fn {:listen, state} ->
+      accepted = %Accepted{child: self()}
+      {:listen, %{state | accept_queue: [accepted | state.accept_queue]}}
+    end)
+  end
+
+  defp passive_syn_event(local_addr, remote_addr, client_port) do
+    {:passive_syn, local_addr, remote_addr, client_port, @port, <<>>}
+  end
+
+  defp start_passive_failure_supervisor(reason) do
+    spawn(fn -> passive_failure_supervisor_loop(reason) end)
+  end
+
+  defp passive_failure_supervisor_loop(reason) do
+    receive do
+      {:"$gen_call", from, {:start_child, _opts}} ->
+        GenServer.reply(from, {:error, reason})
+        passive_failure_supervisor_loop(reason)
+    end
+  end
+
   defp establish_connection(link, local_addr, remote_addr, opts \\ []) do
     open_opts = Keyword.get(opts, :open_opts, %{})
     {:ok, socket} = Tricep.open(:inet6, :stream, :tcp, open_opts)
@@ -10199,6 +10971,26 @@ defmodule Tricep.SocketTest do
       true ->
         Process.sleep(1)
         wait_for_socket(socket, predicate, deadline, state)
+    end
+  end
+
+  defp wait_until(predicate, timeout \\ 1_000)
+
+  defp wait_until(predicate, timeout) when is_integer(timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    wait_until_deadline(predicate, deadline)
+  end
+
+  defp wait_until_deadline(predicate, deadline) do
+    if predicate.() do
+      true
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        false
+      else
+        Process.sleep(1)
+        wait_until_deadline(predicate, deadline)
+      end
     end
   end
 
