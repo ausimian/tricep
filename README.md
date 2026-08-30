@@ -46,7 +46,9 @@ before running the gate so it can verify the update will be committed.
 non-canonical CI matrix jobs; it is not a replacement for the complete local
 gate. CI enforces the 80% coverage threshold with `mix precommit` on the
 explicitly flagged coverage job, then runs the suite again to publish that
-job's coverage to Coveralls. Other supported Elixir/OTP jobs pair
+job's coverage to Coveralls. That canonical job also runs `mix test --only
+fin_ack_rto` for the two-test FIN+ACK retransmission pair without enabling
+integration or inherited slow tests. Other supported Elixir/OTP jobs pair
 `mix precommit_checks` with plain `mix test` so compiler-specific coverage line
 attribution cannot make legacy toolchains fail the canonical coverage gate.
 
