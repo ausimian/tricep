@@ -9,6 +9,7 @@ defmodule Tricep.Socket do
   alias Tricep.DataBuffer
   alias Tricep.Tcp
   alias Tricep.Tcp.ChallengeAckLimiter
+  alias Tricep.Tcp.Listener
   alias Tricep.Tcp.ReceiveReassembly
   alias Tricep.Tcp.Sequence
   alias Tricep.Tcp.Synchronized
@@ -257,8 +258,8 @@ defmodule Tricep.Socket do
     # Per-connection RFC 5961 challenge-ACK accounting. The socket owns the
     # limiter because it owns the connection's receive path and TCB.
     field :challenge_ack_limiter, ChallengeAckLimiter.t(), default: ChallengeAckLimiter.new()
-    # Listening socket that owns this connection while the passive handshake completes
-    field :passive_listener, pid() | nil, default: nil
+    # The passive connection supervisor owns this socket until accept claims it.
+    field :passive_owner, pid() | nil, default: nil
   end
 
   # TIME_WAIT duration (2*MSL - using short value for TUN-based stack)
@@ -295,6 +296,13 @@ defmodule Tricep.Socket do
   end
 
   @impl true
+  def terminate(_reason, :listen, %Listener{} = listener) do
+    Listener.terminate(listener)
+  end
+
+  def terminate(_reason, _state_name, _state_data), do: :ok
+
+  @impl true
   def handle_event({:call, from}, {:bind, address}, :closed, closed_data) do
     case validate_sockaddr_in6(address, 0..65_535) do
       {:ok, local_addr, local_port} ->
@@ -321,147 +329,19 @@ defmodule Tricep.Socket do
 
   def handle_event({:call, from}, {:listen, backlog}, :bound, bound_data)
       when is_integer(backlog) and backlog > 0 do
-    local_addr = Map.fetch!(bound_data, :local_addr)
-    local_port = Map.fetch!(bound_data, :local_port)
+    case Listener.new(self(), bound_data, backlog) do
+      {:ok, listener} ->
+        {:next_state, :listen, listener, {:reply, from, :ok}}
 
-    case Application.register_listener(local_addr, local_port) do
-      :ok ->
-        listen_data =
-          bound_data
-          |> Map.put(:backlog, backlog)
-          |> Map.put(:pending_count, 0)
-          |> Map.put(:accept_queue, [])
-          |> Map.put(:accept_waiters, [])
-          |> Map.put(:accept_selects, [])
-          |> Map.put(:children, %{})
-
-        {:next_state, :listen, listen_data, {:reply, from, :ok}}
-
-      {:error, {:already_registered, _pid}} ->
-        {:keep_state_and_data, {:reply, from, {:error, :eaddrinuse}}}
+      {:error, reason} ->
+        {:keep_state_and_data, {:reply, from, {:error, reason}}}
     end
   end
 
-  def handle_event({:call, from}, {:listen, backlog}, :listen, listen_data)
-      when is_integer(backlog) and backlog > 0 do
-    {:keep_state, %{listen_data | backlog: backlog}, {:reply, from, :ok}}
-  end
-
-  def handle_event({:call, from}, {:accept, timeout}, :listen, listen_data) do
-    case listen_data.accept_queue do
-      [child | rest] ->
-        {listen_data, actions} =
-          listen_data
-          |> Map.put(:accept_queue, rest)
-          |> accept_child(child, [{:reply, from, {:ok, child}}])
-
-        {:keep_state, listen_data, actions}
-
-      [] ->
-        {:keep_state_and_data, [{:next_event, :internal, {:wait_accept, from, timeout}}]}
-    end
-  end
-
-  def handle_event(:internal, {:wait_accept, from, :nowait}, :listen, listen_data) do
-    ref = make_ref()
-    {caller_pid, _} = from
-
-    new_data = %{
-      listen_data
-      | accept_selects: listen_data.accept_selects ++ [{caller_pid, ref}]
-    }
-
-    {:keep_state, new_data, {:reply, from, {:select, {:select_info, :accept, ref}}}}
-  end
-
-  def handle_event(:internal, {:wait_accept, from, :infinity}, :listen, listen_data) do
-    waiter = {from, make_ref(), nil}
-    new_data = %{listen_data | accept_waiters: listen_data.accept_waiters ++ [waiter]}
-    {:keep_state, new_data}
-  end
-
-  def handle_event(:internal, {:wait_accept, from, timeout}, :listen, listen_data)
-      when is_integer(timeout) and timeout >= 0 do
-    timer_ref = make_ref()
-    waiter = {from, timer_ref, timer_ref}
-    new_data = %{listen_data | accept_waiters: listen_data.accept_waiters ++ [waiter]}
-    {:keep_state, new_data, {{:timeout, timer_ref}, timeout, {:accept_timeout, timer_ref}}}
-  end
-
-  def handle_event(:internal, {:wait_accept, from, _timeout}, :listen, _listen_data) do
-    {:keep_state_and_data, {:reply, from, {:error, :einval}}}
-  end
-
-  def handle_event(
-        {:timeout, timer_ref},
-        {:accept_timeout, timer_ref},
-        :listen,
-        listen_data
-      ) do
-    case List.keytake(listen_data.accept_waiters, timer_ref, 1) do
-      {{from, ^timer_ref, ^timer_ref}, rest} ->
-        {:keep_state, %{listen_data | accept_waiters: rest}, {:reply, from, {:error, :timeout}}}
-
-      nil ->
-        :keep_state_and_data
-    end
-  end
-
-  def handle_event(
-        :info,
-        {:passive_syn, src_addr, dst_addr, src_port, dst_port, segment},
-        :listen,
-        listen_data
-      ) do
-    case passive_connection_opts(
-           listen_data,
-           src_addr,
-           dst_addr,
-           src_port,
-           dst_port,
-           segment
-         ) do
-      {:ok, opts} -> start_passive_child(listen_data, opts)
-      :ignore -> :keep_state_and_data
-    end
-  end
-
-  def handle_event(:info, {:passive_established, child}, :listen, listen_data) do
-    case Map.get(listen_data.children, child) do
-      {ref, :pending} ->
-        listen_data =
-          listen_data
-          |> Map.put(:pending_count, max(0, listen_data.pending_count - 1))
-          |> put_child(child, ref, :queued)
-
-        {listen_data, actions} = enqueue_accepted_child(listen_data, child)
-        {:keep_state, listen_data, actions}
-
-      _ ->
-        :keep_state_and_data
-    end
-  end
-
-  def handle_event(:info, {:passive_failed, child}, :listen, listen_data) do
-    {:keep_state, remove_listen_child(listen_data, child)}
-  end
-
-  def handle_event(:info, {:passive_failed, child, reason}, :listen, listen_data) do
-    Logger.debug(
-      "Passive TCP handshake failed after SYN-ACK retry exhaustion: #{inspect(reason)}"
-    )
-
-    {:keep_state, remove_listen_child(listen_data, child)}
-  end
-
-  def handle_event(:info, {:DOWN, ref, :process, child, _reason}, :listen, listen_data) do
-    case Map.get(listen_data.children, child) do
-      {^ref, _status} ->
-        {:keep_state, remove_listen_child(listen_data, child)}
-
-      _ ->
-        :keep_state_and_data
-    end
+  # Listening behavior lives in the typed listener boundary. Socket retains
+  # the public PID so callers and Registry lookups observe no API change.
+  def handle_event(event_type, event, :listen, %Listener{} = listener) do
+    Listener.handle_event(event_type, event, listener)
   end
 
   @impl true
@@ -489,7 +369,8 @@ defmodule Tricep.Socket do
         local_addr: local_addr,
         local_port: local_port
       }) do
-    {:keep_state_and_data, {:reply, from, {:ok, sockaddr_in6(local_addr, local_port)}}}
+    {:keep_state_and_data,
+     {:reply, from, {:ok, Tricep.Address.sockaddr_in6(local_addr, local_port)}}}
   end
 
   def handle_event(
@@ -498,7 +379,8 @@ defmodule Tricep.Socket do
         _state_name,
         %__MODULE__{pair: {{local_addr, local_port}, _remote}}
       ) do
-    {:keep_state_and_data, {:reply, from, {:ok, sockaddr_in6(local_addr, local_port)}}}
+    {:keep_state_and_data,
+     {:reply, from, {:ok, Tricep.Address.sockaddr_in6(local_addr, local_port)}}}
   end
 
   # Connect completion after :nowait readiness - consume one retry per registered selector
@@ -671,7 +553,7 @@ defmodule Tricep.Socket do
     case syn_received_segment(state, segment) do
       :acceptable_reset ->
         reset_state(state)
-        notify_passive_listener(state, :passive_failed)
+        notify_passive_owner(state, :passive_failed)
         {:stop, :normal}
 
       :challenge_ack ->
@@ -684,7 +566,7 @@ defmodule Tricep.Socket do
         reject_unacceptable_segment(state)
 
       {:established, next_state, new_state, receive_actions} ->
-        notify_passive_listener(state, :passive_established)
+        notify_passive_owner(state, :passive_established)
         {:next_state, next_state, new_state, receive_actions ++ [{{:timeout, :rto}, :cancel}]}
 
       {:bad_ack, acknowledgment} ->
@@ -704,7 +586,7 @@ defmodule Tricep.Socket do
     if state.syn_retransmit_count >= @max_retransmit_count do
       reason = retry_exhaustion_error(state)
       reset_state(state)
-      notify_passive_listener(state, {:passive_failed, reason})
+      notify_passive_owner(state, {:passive_failed, reason})
       {:stop, :normal}
     else
       retransmit_syn_ack(state)
@@ -1309,13 +1191,6 @@ defmodule Tricep.Socket do
     {:next_state, :closed, closed_data, {:reply, from, :ok}}
   end
 
-  def handle_event({:call, from}, :close, :listen, listen_data) do
-    deregister_listen_data(listen_data)
-    closed_data = %{socket_opts: listen_data.socket_opts}
-    actions = close_accept_actions(listen_data) ++ [{:reply, from, :ok}]
-    {:next_state, :closed, closed_data, actions}
-  end
-
   # --- Catch-all handlers ---
 
   def handle_event(:info, _message, _state, _state_data) do
@@ -1736,7 +1611,7 @@ defmodule Tricep.Socket do
 
   defp passive_connection_state(opts) do
     %{
-      listener: listener,
+      passive_owner: passive_owner,
       src_addr: src_addr,
       dst_addr: dst_addr,
       src_port: src_port,
@@ -1783,68 +1658,8 @@ defmodule Tricep.Socket do
       syn_retransmit_count: 0,
       fin_wait_2_timeout_ms: configured_fin_wait_2_timeout_ms(socket_opts),
       challenge_ack_limiter: configured_challenge_ack_limiter(socket_opts),
-      passive_listener: listener
+      passive_owner: passive_owner
     }
-  end
-
-  defp listen_addr_matches?(<<0::128>>, _dst_addr), do: true
-  defp listen_addr_matches?(local_addr, dst_addr), do: local_addr == dst_addr
-
-  defp listen_backlog_full?(listen_data) do
-    listen_data.pending_count + length(listen_data.accept_queue) >= listen_data.backlog
-  end
-
-  defp passive_link(peer_addr, local_addr) do
-    case Application.lookup_link(peer_addr) do
-      {link, {^local_addr, mtu}} -> {:ok, link, mtu}
-      _ -> :error
-    end
-  end
-
-  defp passive_connection_opts(
-         listen_data,
-         src_addr,
-         dst_addr,
-         src_port,
-         dst_port,
-         segment
-       ) do
-    with true <- listen_addr_matches?(listen_data.local_addr, dst_addr),
-         false <- listen_backlog_full?(listen_data),
-         {:ok, link, mtu} <- passive_link(src_addr, dst_addr) do
-      {:ok,
-       %{
-         listener: self(),
-         src_addr: src_addr,
-         dst_addr: dst_addr,
-         src_port: src_port,
-         dst_port: dst_port,
-         segment: segment,
-         link: link,
-         mtu: mtu,
-         socket_opts: listen_data.socket_opts
-       }}
-    else
-      _ -> :ignore
-    end
-  end
-
-  defp start_passive_child(listen_data, opts) do
-    case start_passive_connection(opts) do
-      {:ok, child} ->
-        ref = Process.monitor(child)
-
-        new_data =
-          listen_data
-          |> Map.put(:pending_count, listen_data.pending_count + 1)
-          |> put_child(child, ref, :pending)
-
-        send(child, :send_syn_ack)
-        {:keep_state, new_data}
-
-      _ ->
-        :keep_state_and_data
-    end
   end
 
   defp connect_from_closed(from, timeout, closed_data, dst_addr, dst_port) do
@@ -1938,98 +1753,8 @@ defmodule Tricep.Socket do
     }
   end
 
-  defp put_child(listen_data, child, ref, status) do
-    %{listen_data | children: Map.put(listen_data.children, child, {ref, status})}
-  end
-
-  defp remove_listen_child(listen_data, child) do
-    case Map.pop(listen_data.children, child) do
-      {{ref, :pending}, children} ->
-        Process.demonitor(ref, [:flush])
-
-        %{
-          listen_data
-          | children: children,
-            pending_count: max(0, listen_data.pending_count - 1)
-        }
-
-      {{ref, :queued}, children} ->
-        Process.demonitor(ref, [:flush])
-
-        %{
-          listen_data
-          | children: children,
-            accept_queue: List.delete(listen_data.accept_queue, child)
-        }
-
-      {nil, _children} ->
-        listen_data
-    end
-  end
-
-  defp enqueue_accepted_child(%{accept_waiters: [{from, _ref, timer_ref} | rest]} = data, child) do
-    cancel_actions = if timer_ref, do: [{{:timeout, timer_ref}, :cancel}], else: []
-
-    {data, _actions} =
-      data
-      |> Map.put(:accept_waiters, rest)
-      |> accept_child(child)
-
-    {data, cancel_actions ++ [{:reply, from, {:ok, child}}]}
-  end
-
-  defp enqueue_accepted_child(%{accept_selects: selects} = data, child) when selects != [] do
-    notify_selects(selects)
-
-    data =
-      data
-      |> Map.put(:accept_queue, data.accept_queue ++ [child])
-      |> Map.put(:accept_selects, [])
-
-    {data, []}
-  end
-
-  defp enqueue_accepted_child(data, child) do
-    {%{data | accept_queue: data.accept_queue ++ [child]}, []}
-  end
-
-  defp accept_child(data, child, actions \\ []) do
-    case Map.pop(data.children, child) do
-      {{ref, _status}, children} ->
-        Process.demonitor(ref, [:flush])
-        {%{data | children: children}, actions}
-
-      {nil, _children} ->
-        {data, actions}
-    end
-  end
-
-  defp close_accept_actions(data) do
-    notify_selects(data.accept_selects)
-
-    Enum.flat_map(data.accept_waiters, fn {from, _ref, timer_ref} ->
-      actions = [{:reply, from, {:error, :closed}}]
-
-      if timer_ref do
-        [{{:timeout, timer_ref}, :cancel} | actions]
-      else
-        actions
-      end
-    end)
-  end
-
   defp deregister_bound_data(data) do
     Application.deregister_bound_socket(data.local_addr, data.local_port)
-  end
-
-  defp deregister_listen_data(data) do
-    Enum.each(data.children, fn {child, {ref, _status}} ->
-      Process.demonitor(ref, [:flush])
-      Process.exit(child, :shutdown)
-    end)
-
-    Application.deregister_listener(data.local_addr, data.local_port)
-    deregister_bound_data(data)
   end
 
   defp send_syn_ack(%__MODULE__{} = state) do
@@ -2070,20 +1795,20 @@ defmodule Tricep.Socket do
     {:keep_state, new_state, {{:timeout, :rto}, new_rto, :syn_ack_timeout}}
   end
 
-  defp notify_passive_listener(
-         %__MODULE__{passive_listener: listener},
+  defp notify_passive_owner(
+         %__MODULE__{passive_owner: owner},
          {:passive_failed, reason}
        )
-       when is_pid(listener) do
-    send(listener, {:passive_failed, self(), reason})
+       when is_pid(owner) do
+    send(owner, {:passive_failed, self(), reason})
   end
 
-  defp notify_passive_listener(%__MODULE__{passive_listener: listener}, message)
-       when is_pid(listener) do
-    send(listener, {message, self()})
+  defp notify_passive_owner(%__MODULE__{passive_owner: owner}, message)
+       when is_pid(owner) do
+    send(owner, {message, self()})
   end
 
-  defp notify_passive_listener(%__MODULE__{}, _message), do: :ok
+  defp notify_passive_owner(%__MODULE__{}, _message), do: :ok
 
   defp retransmit_syn(state, timeout_event) do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
@@ -2605,7 +2330,7 @@ defmodule Tricep.Socket do
           syn_retransmit_count: 0,
           rto_ms: @initial_rto_ms,
           soft_error: nil,
-          passive_listener: nil
+          passive_owner: nil
       }
       |> open_receive_window()
 
@@ -2880,14 +2605,6 @@ defmodule Tricep.Socket do
   end
 
   defp validate_sockaddr_in6(_address, _port_range), do: {:error, :einval}
-
-  defp sockaddr_in6(addr, port) do
-    %{family: :inet6, addr: ipv6_tuple(addr), port: port}
-  end
-
-  defp ipv6_tuple(<<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>) do
-    {a, b, c, d, e, f, g, h}
-  end
 
   defp valid_ipv6_address(addr) do
     Tricep.Address.from(addr)

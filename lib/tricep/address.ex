@@ -5,6 +5,12 @@ defmodule Tricep.Address do
     <<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>
   end
 
+  @spec sockaddr_in6(binary(), non_neg_integer()) :: :socket.sockaddr_in6()
+  def sockaddr_in6(<<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>, port)
+      when is_integer(port) and port >= 0 do
+    %{family: :inet6, addr: {a, b, c, d, e, f, g, h}, port: port}
+  end
+
   def from(addr) when is_binary(addr) do
     case parse_ipv6_string(addr) do
       {:ok, addr_tuple} ->
