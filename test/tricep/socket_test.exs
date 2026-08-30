@@ -5,6 +5,7 @@ defmodule Tricep.SocketTest do
 
   alias Tricep.DummyLink
   alias Tricep.Tcp
+  alias Tricep.Tcp.ReceiveReassembly
 
   # Test addresses
   # local_addr: the address Socket connects TO (like ifaddr in TunLink)
@@ -4537,7 +4538,7 @@ defmodule Tricep.SocketTest do
       remote_addr: remote_addr
     } do
       socket =
-        establish_connection(link, local_addr, remote_addr, open_opts: %{recv_buffer_size: 17})
+        establish_connection(link, local_addr, remote_addr, open_opts: %{recv_buffer_size: 2_048})
 
       on_exit(fn -> stop_socket(socket) end)
       assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
@@ -4545,7 +4546,7 @@ defmodule Tricep.SocketTest do
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
 
-      for {offset, payload, expected_window} <- [{5, "world", 12}, {7, "rld!!", 10}] do
+      for {offset, payload, expected_window} <- [{5, "world", 2_043}, {7, "rld!!", 2_041}] do
         segment =
           Tcp.build_segment(
             {{local_addr, @port}, {remote_addr, src_port}},
@@ -4571,7 +4572,8 @@ defmodule Tricep.SocketTest do
       assert {:established, queued_state} = :sys.get_state(socket)
 
       assert queued_state.out_of_order_segments == [
-               {state.tcb.rcv_nxt + 5, state.tcb.rcv_nxt + 12, "world!!"}
+               {state.tcb.rcv_nxt + 5, state.tcb.rcv_nxt + 10, "world"},
+               {state.tcb.rcv_nxt + 10, state.tcb.rcv_nxt + 12, "!!"}
              ]
 
       available = queued_state.recv_buffer_size - byte_size(queued_state.recv_buffer) - 7
@@ -4596,9 +4598,265 @@ defmodule Tricep.SocketTest do
       assert final_ack.flags == [:ack]
       assert final_ack.seq == state.tcb.snd_nxt
       assert final_ack.ack == wrap_seq(state.tcb.rcv_nxt + 12)
-      assert final_ack.window == 5
+      assert final_ack.window == 2_036
       refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 100
       assert Tricep.recv(socket, 0, 1000) == {:ok, "helloworld!!"}
+    end
+
+    test "recovers a realistic large receive window after reassembly tail eviction", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      max_fragments = ReceiveReassembly.max_fragment_count()
+      recv_buffer_size = 4 * 1024 * 1024
+      chunk_size = 1460
+      first_queued = chunk_size * 2
+      front_payload = :binary.copy("a", chunk_size)
+      queued_payload = :binary.copy("x", chunk_size)
+      last_queued_end = first_queued + max_fragments * chunk_size
+      dropped_sequence = last_queued_end + chunk_size
+
+      socket =
+        establish_connection(
+          link,
+          local_addr,
+          remote_addr,
+          open_opts: %{recv_buffer_size: recv_buffer_size},
+          window_scale: 14
+        )
+
+      on_exit(fn -> stop_socket(socket) end)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+
+      {:established, initial_state} = :sys.get_state(socket)
+      {{_, src_port}, _} = initial_state.pair
+
+      peer_segment = fn sequence, payload ->
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(initial_state.tcb.rcv_nxt + sequence),
+          initial_state.tcb.snd_nxt,
+          [:ack, :psh],
+          32_768,
+          payload: payload
+        )
+      end
+
+      for offset <- first_queued..(last_queued_end - chunk_size)//chunk_size do
+        DummyLink.inject_packet(link, peer_segment.(offset, queued_payload))
+      end
+
+      assert {:established, saturated_state} = :sys.get_state(socket)
+      assert length(saturated_state.out_of_order_segments) == max_fragments
+      assert saturated_state.recv_buffer_size == recv_buffer_size
+      assert saturated_state.tcb.rcv_wnd > div(recv_buffer_size, 2)
+
+      log =
+        capture_log(fn ->
+          for {sequence, payload} <- [
+                {dropped_sequence, :binary.copy("z", chunk_size)},
+                {dropped_sequence + chunk_size, :binary.copy("y", chunk_size)},
+                {dropped_sequence + chunk_size * 2, :binary.copy("w", chunk_size)}
+              ] do
+            DummyLink.inject_packet(link, peer_segment.(sequence, payload))
+          end
+        end)
+
+      assert {:established, dropped_state} = :sys.get_state(socket)
+      assert length(dropped_state.out_of_order_segments) == max_fragments
+      assert dropped_state.reassembly_eviction_count == 3
+      refute log =~ "[warning]"
+      assert log =~ "[debug]"
+      assert log =~ "cumulative eviction count is 1"
+      assert log =~ "cumulative eviction count is 2"
+      refute log =~ "cumulative eviction count is 3"
+
+      refute Enum.any?(dropped_state.out_of_order_segments, fn {start, _ending, _payload} ->
+               start == wrap_seq(initial_state.tcb.rcv_nxt + dropped_sequence)
+             end)
+
+      DummyLink.inject_packet(link, peer_segment.(0, front_payload))
+
+      assert {:established, advanced_state} = :sys.get_state(socket)
+
+      assert advanced_state.tcb.rcv_nxt ==
+               wrap_seq(initial_state.tcb.rcv_nxt + byte_size(front_payload))
+
+      assert length(advanced_state.out_of_order_segments) == max_fragments
+
+      DummyLink.inject_packet(
+        link,
+        peer_segment.(byte_size(front_payload), :binary.copy("b", chunk_size))
+      )
+
+      assert {:established, reassembled_state} = :sys.get_state(socket)
+
+      assert reassembled_state.tcb.rcv_nxt ==
+               wrap_seq(initial_state.tcb.rcv_nxt + last_queued_end)
+
+      assert reassembled_state.out_of_order_segments == []
+
+      retransmitted_tail =
+        :binary.copy("c", chunk_size) <>
+          :binary.copy("z", chunk_size) <>
+          :binary.copy("y", chunk_size) <>
+          :binary.copy("w", chunk_size)
+
+      DummyLink.inject_packet(link, peer_segment.(last_queued_end, retransmitted_tail))
+
+      assert {:established, completed_state} = :sys.get_state(socket)
+
+      assert completed_state.tcb.rcv_nxt ==
+               wrap_seq(initial_state.tcb.rcv_nxt + last_queued_end + chunk_size * 4)
+
+      assert completed_state.out_of_order_segments == []
+      assert completed_state.reassembly_eviction_count == 3
+
+      expected_payload =
+        front_payload <>
+          :binary.copy("b", chunk_size) <>
+          :binary.copy("x", max_fragments * chunk_size) <>
+          retransmitted_tail
+
+      assert Tricep.recv(socket, 0, 1_000) == {:ok, expected_payload}
+
+      drain_packets(max_fragments + 16)
+
+      {{_, src_port}, _} = completed_state.pair
+
+      exact_rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          completed_state.tcb.rcv_nxt,
+          completed_state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, exact_rst)
+      assert {:closed, _} = :sys.get_state(socket)
+
+      reconnect_socket(socket, link, local_addr, remote_addr, 6_000)
+      assert {:established, reconnected_state} = :sys.get_state(socket)
+      assert reconnected_state.reassembly_eviction_count == 0
+    end
+
+    test "reserves an MSS for front recovery under out-of-order byte pressure", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      recv_buffer_size = 65_535
+
+      socket =
+        establish_connection(link, local_addr, remote_addr,
+          open_opts: %{recv_buffer_size: recv_buffer_size}
+        )
+
+      on_exit(fn -> stop_socket(socket) end)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+
+      {:established, initial_state} = :sys.get_state(socket)
+      {{_, src_port}, _} = initial_state.pair
+      local_mss = initial_state.tcb.rcv_mss
+
+      peer_segment = fn sequence, payload ->
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(initial_state.tcb.rcv_nxt + sequence),
+          initial_state.tcb.snd_nxt,
+          [:ack, :psh],
+          32_768,
+          payload: payload
+        )
+      end
+
+      log =
+        capture_log(fn ->
+          for {start, ending} <- descending_chunks(1, recv_buffer_size, local_mss) do
+            DummyLink.inject_packet(link, peer_segment.(start, :binary.copy("x", ending - start)))
+          end
+        end)
+
+      assert {:established, saturated_state} = :sys.get_state(socket)
+
+      assert saturated_state.tcb.rcv_wnd >= local_mss
+      assert saturated_state.reassembly_eviction_count == 1
+      refute log =~ "[warning]"
+      assert log =~ "[debug]"
+      assert log =~ "cumulative eviction count is 1"
+      assert length(String.split(log, "cumulative eviction count is 1")) == 2
+
+      DummyLink.inject_packet(link, peer_segment.(0, :binary.copy("a", local_mss)))
+
+      assert {:established, recovered_state} = :sys.get_state(socket)
+
+      assert recovered_state.tcb.rcv_nxt ==
+               wrap_seq(initial_state.tcb.rcv_nxt + recv_buffer_size - local_mss)
+
+      assert recovered_state.out_of_order_segments == []
+
+      DummyLink.inject_packet(
+        link,
+        peer_segment.(recv_buffer_size - local_mss, :binary.copy("x", local_mss))
+      )
+
+      assert {:established, completed_state} = :sys.get_state(socket)
+      assert completed_state.tcb.rcv_nxt == wrap_seq(initial_state.tcb.rcv_nxt + recv_buffer_size)
+      assert completed_state.out_of_order_segments == []
+
+      assert Tricep.recv(socket, 0, 1_000) ==
+               {:ok, "a" <> :binary.copy("x", recv_buffer_size - 1)}
+    end
+
+    test "reserves all free capacity when it is below the local MSS", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      recv_buffer_size = 1_000
+
+      socket =
+        establish_connection(link, local_addr, remote_addr,
+          open_opts: %{recv_buffer_size: recv_buffer_size}
+        )
+
+      on_exit(fn -> stop_socket(socket) end)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+
+      {:established, initial_state} = :sys.get_state(socket)
+      {{_, src_port}, _} = initial_state.pair
+
+      peer_segment = fn sequence, payload ->
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          wrap_seq(initial_state.tcb.rcv_nxt + sequence),
+          initial_state.tcb.snd_nxt,
+          [:ack, :psh],
+          32_768,
+          payload: payload
+        )
+      end
+
+      log =
+        capture_log(fn ->
+          DummyLink.inject_packet(link, peer_segment.(1, :binary.copy("x", recv_buffer_size - 1)))
+        end)
+
+      assert {:established, queued_state} = :sys.get_state(socket)
+      assert queued_state.out_of_order_segments == []
+      assert queued_state.reassembly_eviction_count == 1
+      assert queued_state.tcb.rcv_wnd == recv_buffer_size
+      assert log =~ "[debug]"
+      refute log =~ "[warning]"
+
+      DummyLink.inject_packet(link, peer_segment.(0, :binary.copy("a", recv_buffer_size)))
+
+      assert {:established, full_state} = :sys.get_state(socket)
+      assert full_state.tcb.rcv_nxt == wrap_seq(initial_state.tcb.rcv_nxt + recv_buffer_size)
+      assert byte_size(full_state.recv_buffer) == recv_buffer_size
+      assert full_state.tcb.rcv_wnd == 0
     end
 
     test "drains queued payload and FIN in sequence before entering CLOSE_WAIT", %{
@@ -8721,6 +8979,17 @@ defmodule Tricep.SocketTest do
     assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1_000
   end
 
+  defp descending_chunks(start, ending, chunk_size) do
+    Stream.unfold(ending, fn
+      cursor when cursor <= start ->
+        nil
+
+      cursor ->
+        chunk_start = max(start, cursor - chunk_size)
+        {{chunk_start, cursor}, chunk_start}
+    end)
+  end
+
   defp assert_challenge_ack(link, state) do
     assert_receive {:dummy_link_packet, ^link, packet}, 1_000
     <<_ip_header::binary-size(40), tcp_segment::binary>> = packet
@@ -9824,7 +10093,8 @@ defmodule Tricep.SocketTest do
     assert attacked_state.recv_buffer == <<>>
 
     assert attacked_state.out_of_order_segments == [
-             {wrap_seq(state.tcb.rcv_nxt + 5), wrap_seq(state.tcb.rcv_nxt + 14), "worldWXYZ"}
+             {wrap_seq(state.tcb.rcv_nxt + 5), wrap_seq(state.tcb.rcv_nxt + 10), "world"},
+             {wrap_seq(state.tcb.rcv_nxt + 10), wrap_seq(state.tcb.rcv_nxt + 14), "WXYZ"}
            ]
 
     assert attacked_state.out_of_order_fin == nil

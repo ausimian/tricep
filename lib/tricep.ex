@@ -58,7 +58,16 @@ defmodule Tricep do
     * `type` - The socket type, must be `:stream`
     * `protocol` - The protocol (`:tcp`, `:default`, or a map of options)
       * `:recv_buffer_size` - Maximum buffered receive bytes and advertised receive window
-        before TCP window scaling (default: 65535, capped at 65535)
+        (default: 65535, capped at 1073725440; windows above 65535 require TCP window-scale
+        negotiation). This is a byte/window bound, not an unbounded out-of-order segment
+        allowance: reassembly retains at most 128 chunks, evicts the highest-sequence tail
+        under pressure, and reserves up to one local MSS for receive-front retransmission.
+        TCP retransmits an evicted tail after preceding gaps drain; a zero window still applies
+        when unread in-order application data fills the buffer.
+        When this value is no larger than the path-derived local receive MSS (1220 bytes on the
+        default minimum-MTU IPv6 path), no out-of-order byte budget remains: out-of-order data is
+        discarded and recovered through TCP retransmission/go-back-N. Small buffers are not
+        clamped, so callers retain their chosen memory bound.
       * `:fin_wait_2_timeout_ms` - Milliseconds to wait in `FIN_WAIT_2` for the peer FIN
         before closing locally (default: 60000)
       * `:challenge_ack_limit` - When supplied, must be a positive maximum RFC 5961 challenge
@@ -106,7 +115,16 @@ defmodule Tricep do
     * `protocol` - The protocol (`:tcp` or `:default`)
     * `opts` - A map of socket options:
       * `:recv_buffer_size` - Maximum buffered receive bytes and advertised receive window
-        before TCP window scaling (default: 65535, capped at 65535)
+        (default: 65535, capped at 1073725440; windows above 65535 require TCP window-scale
+        negotiation). This is a byte/window bound, not an unbounded out-of-order segment
+        allowance: reassembly retains at most 128 chunks, evicts the highest-sequence tail
+        under pressure, and reserves up to one local MSS for receive-front retransmission.
+        TCP retransmits an evicted tail after preceding gaps drain; a zero window still applies
+        when unread in-order application data fills the buffer.
+        When this value is no larger than the path-derived local receive MSS (1220 bytes on the
+        default minimum-MTU IPv6 path), no out-of-order byte budget remains: out-of-order data is
+        discarded and recovered through TCP retransmission/go-back-N. Small buffers are not
+        clamped, so callers retain their chosen memory bound.
       * `:fin_wait_2_timeout_ms` - Milliseconds to wait in `FIN_WAIT_2` for the peer FIN
         before closing locally (default: 60000)
       * `:challenge_ack_limit` - When supplied, must be a positive maximum RFC 5961 challenge
@@ -239,6 +257,12 @@ defmodule Tricep do
 
   Incoming SYNs for the bound local address and port are answered with SYN-ACKs,
   and completed connections are returned by `accept/2`.
+
+  Accepted connections inherit the listener's receive-buffer option. If its
+  `:recv_buffer_size` is no larger than the path-derived local receive MSS
+  (1220 bytes on the default minimum-MTU IPv6 path), no out-of-order byte
+  budget is retained: out-of-order data is discarded and recovered through
+  TCP retransmission/go-back-N. The option is not clamped.
   """
   @spec listen(pid(), pos_integer()) :: :ok | {:error, atom()}
   def listen(socket, backlog \\ 5)
