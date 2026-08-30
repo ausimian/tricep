@@ -56,6 +56,13 @@ jobs:
         if: matrix.coverage
         run: mix precommit
 
+      # Run only the tagged FIN+ACK RTO pair on the canonical coverage toolchain;
+      # `--only` selects it without enabling inherited slow or integration tests.
+      - name: Run FIN ACK RTO regression
+        if: matrix.coverage
+        timeout-minutes: 5
+        run: mix test --only fin_ack_rto
+
       # coveralls.github uploads a fresh run but does not enforce minimum_coverage;
       # the canonical leg's mix precommit above owns the 80% threshold.
       - name: Upload coverage

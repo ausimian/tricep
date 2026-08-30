@@ -1378,7 +1378,6 @@ defmodule Tricep.Socket do
       true ->
         flags = drop_ackless_out_of_order_fin(state, flags, ack?, fin?, seq, payload?)
         fin? = :fin in flags
-        fin_at_entry? = fin? and seq == state.tcb.rcv_nxt
 
         handle_established_received_segment(state, %{
           flags: flags,
@@ -1388,8 +1387,7 @@ defmodule Tricep.Socket do
           payload: payload,
           fin?: fin?,
           ack?: ack?,
-          payload?: payload?,
-          fin_at_entry?: fin_at_entry?
+          payload?: payload?
         })
     end
   end
@@ -1402,8 +1400,7 @@ defmodule Tricep.Socket do
          payload: payload,
          fin?: fin?,
          ack?: ack?,
-         payload?: payload?,
-         fin_at_entry?: fin_at_entry?
+         payload?: payload?
        }) do
     cond do
       payload? or fin? ->
@@ -1411,14 +1408,7 @@ defmodule Tricep.Socket do
           deliver_received_segment(state, seq, payload, flags)
 
         if fin_ready? do
-          handle_established_fin_ready(
-            receive_state,
-            fin_at_entry?,
-            ack?,
-            ack,
-            window,
-            recv_actions
-          )
+          handle_established_fin_ready(receive_state, ack?, ack, window, recv_actions)
         else
           {new_state, timer_actions} = process_ack_if_present(receive_state, ack?, ack, window)
           send_ack(new_state.tcb.rcv_nxt, new_state)
@@ -1434,38 +1424,9 @@ defmodule Tricep.Socket do
     end
   end
 
-  # Bug #121 preserves only an in-order FIN carried by this segment. A FIN
-  # reached while reconstructing an overlap must still process this segment's
-  # ACK through the normal retransmission and persist bookkeeping path.
-  defp handle_established_fin_ready(receive_state, true, ack?, ack, window, recv_actions) do
-    handle_established_received_fin(receive_state, ack?, ack, window, recv_actions)
-  end
-
-  defp handle_established_fin_ready(receive_state, false, ack?, ack, window, recv_actions) do
-    handle_established_drained_fin(receive_state, ack?, ack, window, recv_actions)
-  end
-
-  defp handle_established_received_fin(receive_state, ack?, ack, window, recv_actions) do
-    acknowledged_new_data? =
-      ack? and Sequence.gt?(ack, receive_state.tcb.snd_una) and
-        Sequence.lte?(ack, receive_state.tcb.snd_nxt)
-
-    send_unacknowledged =
-      if acknowledged_new_data?,
-        do: ack,
-        else: receive_state.tcb.snd_una
-
-    # Preserve legacy FIN-carried ACK bookkeeping; bug #121 owns its fix.
-    receive_state = %{
-      receive_state
-      | tcb: Tcb.acknowledge(receive_state.tcb, send_unacknowledged, window),
-        soft_error: if(acknowledged_new_data?, do: nil, else: receive_state.soft_error)
-    }
-
-    transition_established_after_fin(receive_state, recv_actions)
-  end
-
-  defp handle_established_drained_fin(receive_state, ack?, ack, window, recv_actions) do
+  # Direct and reassembly-drained FINs share send bookkeeping. Issue #120 owns
+  # ACK-less admission and waiter-wake semantics, including its known wedge.
+  defp handle_established_fin_ready(receive_state, ack?, ack, window, recv_actions) do
     {ack_state, ack_actions} = process_ack_if_present(receive_state, ack?, ack, window)
     transition_established_after_fin(ack_state, recv_actions ++ ack_actions)
   end
