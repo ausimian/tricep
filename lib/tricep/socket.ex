@@ -214,6 +214,10 @@ defmodule Tricep.Socket do
     field :send_buffer, DataBuffer.t(), default: DataBuffer.new()
     field :recv_buffer, binary(), default: <<>>
     field :out_of_order_segments, list(), default: []
+    # Count chunks evicted by the hard receive-reassembly cap during this TCP
+    # incarnation. It is intentionally connection-local: a fresh connection
+    # starts at zero, even when a closed socket reconnects.
+    field :reassembly_eviction_count, non_neg_integer(), default: 0
     # The FIN sequence-space marker may arrive before the queued data that
     # precedes it. Its payload start proves that the marker was carried by
     # queued data rather than an unrelated bare out-of-order FIN.
@@ -2972,8 +2976,22 @@ defmodule Tricep.Socket do
   defp valid_socket_options?(opts), do: ChallengeAckLimiter.valid_options?(opts)
 
   defp available_receive_window(%__MODULE__{} = state) do
-    buffered_bytes = byte_size(state.recv_buffer) + out_of_order_size(state)
-    max(0, state.recv_buffer_size - buffered_bytes)
+    max(0, application_receive_capacity(state) - out_of_order_size(state))
+  end
+
+  # Keep up to one locally advertised MSS out of the reassembly queue. This
+  # prevents out-of-order data from consuming the last bytes of the advertised
+  # window before a receive-front retransmission can be admitted. If unread
+  # in-order data already fills the application buffer, zero window remains
+  # the correct TCP behavior.
+  defp out_of_order_byte_budget(%__MODULE__{} = state) do
+    application_capacity = application_receive_capacity(state)
+    front_recovery_reserve = min(application_capacity, state.tcb.rcv_mss || @default_mss)
+    application_capacity - front_recovery_reserve
+  end
+
+  defp application_receive_capacity(%__MODULE__{} = state) do
+    max(0, state.recv_buffer_size - byte_size(state.recv_buffer))
   end
 
   defp advertised_syn_window(%__MODULE__{} = state) do
@@ -3007,6 +3025,7 @@ defmodule Tricep.Socket do
   defp receive_segment(%__MODULE__{} = state, sequence, payload, flags) do
     %{
       delivered: delivered,
+      evicted_count: evicted_count,
       fin?: fin?,
       pending_fin: pending_fin,
       out_of_order_segments: segments,
@@ -3017,6 +3036,7 @@ defmodule Tricep.Socket do
         pending_fin_hint(state),
         state.tcb.rcv_nxt,
         receive_window(state),
+        out_of_order_byte_budget(state),
         %{flags: flags, payload: payload, seq: sequence}
       )
 
@@ -3029,7 +3049,38 @@ defmodule Tricep.Socket do
         tcb: Tcb.receive_next(state.tcb, receive_next)
     }
 
+    new_state = record_reassembly_evictions(new_state, evicted_count)
+
     {new_state, byte_size(delivered), fin?}
+  end
+
+  defp record_reassembly_evictions(state, 0), do: state
+
+  defp record_reassembly_evictions(%__MODULE__{} = state, evicted_count) do
+    previous = state.reassembly_eviction_count
+    total = previous + evicted_count
+
+    log_reassembly_evictions(previous, total, evicted_count)
+
+    %{state | reassembly_eviction_count: total}
+  end
+
+  # Emit the first eviction and later powers-of-two samples at debug level.
+  # A hostile peer therefore cannot turn eviction-per-packet traffic into
+  # unbounded operator-visible log volume.
+  defp log_reassembly_evictions(previous, total, evicted_count) do
+    if reassembly_eviction_log_due?(previous, total) do
+      Logger.debug(
+        "TCP receive reassembly evicted #{evicted_count} chunk(s); " <>
+          "cumulative eviction count is #{total}"
+      )
+    end
+  end
+
+  defp reassembly_eviction_log_due?(0, _total), do: true
+
+  defp reassembly_eviction_log_due?(previous, total) do
+    length(Integer.digits(previous, 2)) < length(Integer.digits(total, 2))
   end
 
   defp pending_fin_hint(%__MODULE__{out_of_order_fin: nil}), do: nil
