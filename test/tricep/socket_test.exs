@@ -3063,6 +3063,173 @@ defmodule Tricep.SocketTest do
   end
 
   describe "established state edge cases" do
+    test "RST cancels an armed RTO and leaves the closed socket alive", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      Process.unlink(socket)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack_packet}, 1000
+
+      assert {:established, %{rto_ms: 100}} =
+               :sys.replace_state(socket, fn
+                 {:established, state} -> {:established, %{state | rto_ms: 100}}
+               end)
+
+      assert Tricep.send(socket, "unacknowledged") == :ok
+      assert_receive {:dummy_link_packet, ^link, _data_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      assert state.rto_timer_active
+      {{_, src_port}, _} = state.pair
+
+      rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+
+      # The old 100 ms RTO deadline must not terminate this socket process.
+      Process.sleep(200)
+      assert Process.alive?(socket)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+    end
+
+    test "reconnects after RTO teardown without stale retransmission", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      Process.unlink(socket)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack_packet}, 1000
+
+      assert {:established, %{rto_ms: 100}} =
+               :sys.replace_state(socket, fn
+                 {:established, state} -> {:established, %{state | rto_ms: 100}}
+               end)
+
+      assert Tricep.send(socket, "old data") == :ok
+      assert_receive {:dummy_link_packet, ^link, _old_data_packet}, 1000
+
+      {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+
+      # Prove the old RTO deadline is past before a new connection can arm a
+      # replacement timer.
+      Process.sleep(200)
+      assert Process.alive?(socket)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+
+      reconnect_socket(socket, link, local_addr, remote_addr, 6_000)
+      assert {:established, reconnected_state} = :sys.get_state(socket)
+      assert reconnected_state.unacked_segments == []
+
+      assert Tricep.send(socket, "fresh data") == :ok
+      assert_receive {:dummy_link_packet, ^link, fresh_data_packet}, 1000
+      <<_::binary-size(40), fresh_data_segment::binary>> = fresh_data_packet
+      fresh_data = Tcp.parse_segment(fresh_data_segment)
+      assert fresh_data.payload == "fresh data"
+
+      {{_, reconnected_port}, _} = reconnected_state.pair
+
+      fresh_ack =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, reconnected_port}},
+          reconnected_state.tcb.rcv_nxt,
+          wrap_seq(fresh_data.seq + byte_size(fresh_data.payload)),
+          [:ack],
+          32_768
+        )
+
+      DummyLink.inject_packet(link, fresh_ack)
+
+      wait_for_socket(socket, fn
+        {:established, %{unacked_segments: [], rto_timer_active: false}} -> true
+        _state -> false
+      end)
+
+      # The former 100 ms RTO cannot retransmit the previous incarnation.
+      refute_receive {:dummy_link_packet, ^link, _unexpected_packet}, 200
+      assert Process.alive?(socket)
+      assert {:established, %{unacked_segments: []}} = :sys.get_state(socket)
+    end
+
+    test "RST in CLOSE_WAIT cancels an armed RTO", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      Process.unlink(socket)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack_packet}, 1000
+      assert {:established, state} = :sys.get_state(socket)
+      {{_, src_port}, _} = state.pair
+
+      peer_fin =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          state.tcb.rcv_nxt,
+          state.tcb.snd_nxt,
+          [:fin, :ack],
+          32_768
+        )
+
+      DummyLink.inject_packet(link, peer_fin)
+      assert_receive {:dummy_link_packet, ^link, _peer_fin_ack}, 1000
+      assert {:close_wait, _close_wait_state} = :sys.get_state(socket)
+
+      assert {:close_wait, %{rto_ms: 100}} =
+               :sys.replace_state(socket, fn
+                 {:close_wait, current_state} -> {:close_wait, %{current_state | rto_ms: 100}}
+               end)
+
+      assert Tricep.send(socket, "unacknowledged") == :ok
+      assert_receive {:dummy_link_packet, ^link, _data_packet}, 1000
+      assert {:close_wait, armed_state} = :sys.get_state(socket)
+      assert armed_state.rto_timer_active
+
+      rst =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, src_port}},
+          armed_state.tcb.rcv_nxt,
+          armed_state.tcb.snd_nxt,
+          [:rst],
+          0
+        )
+
+      DummyLink.inject_packet(link, rst)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+
+      Process.sleep(200)
+      assert Process.alive?(socket)
+    end
+
     test "RST notifies waiting receivers", %{
       link: link,
       local_addr: local_addr,
@@ -5462,6 +5629,8 @@ defmodule Tricep.SocketTest do
       remote_addr: remote_addr
     } do
       socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      Process.unlink(socket)
 
       # Drain ACK
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
@@ -5469,6 +5638,12 @@ defmodule Tricep.SocketTest do
       # Get state
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
+
+      assert {:established, %{rto_ms: 100}} =
+               :sys.replace_state(socket, fn
+                 {:established, current_state} ->
+                   {:established, %{current_state | rto_ms: 100}}
+               end)
 
       # Close to enter FIN_WAIT_1
       assert Tricep.close(socket) == :ok
@@ -5503,6 +5678,12 @@ defmodule Tricep.SocketTest do
       assert ack.flags == [:ack]
       assert ack.ack == state.tcb.rcv_nxt + 1
       refute_receive {:dummy_link_packet, _link, _unexpected_packet}, 100
+
+      Process.sleep(200)
+      assert Process.alive?(socket)
+
+      assert {:time_wait, %{unacked_segments: [], rto_timer_active: false}} =
+               :sys.get_state(socket)
     end
 
     test "simultaneous close (FIN without ACK) goes to CLOSING", %{
@@ -6824,6 +7005,8 @@ defmodule Tricep.SocketTest do
       remote_addr: remote_addr
     } do
       socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      Process.unlink(socket)
 
       # Drain ACK
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
@@ -6831,6 +7014,12 @@ defmodule Tricep.SocketTest do
       # Get state
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
+
+      assert {:established, %{rto_ms: 100}} =
+               :sys.replace_state(socket, fn
+                 {:established, current_state} ->
+                   {:established, %{current_state | rto_ms: 100}}
+               end)
 
       # Close to enter FIN_WAIT_1
       assert Tricep.close(socket) == :ok
@@ -6866,8 +7055,11 @@ defmodule Tricep.SocketTest do
         )
 
       DummyLink.inject_packet(link, rst_segment)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
 
-      {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+      # The FIN RTO armed before simultaneous close was cancelled as well.
+      Process.sleep(200)
+      assert Process.alive?(socket)
     end
 
     test "in-window non-exact RST in CLOSING gets a challenge ACK", %{
@@ -6918,6 +7110,8 @@ defmodule Tricep.SocketTest do
       remote_addr: remote_addr
     } do
       socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      Process.unlink(socket)
 
       # Drain ACK
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
@@ -6925,6 +7119,12 @@ defmodule Tricep.SocketTest do
       # Get state
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
+
+      assert {:established, %{rto_ms: 100}} =
+               :sys.replace_state(socket, fn
+                 {:established, current_state} ->
+                   {:established, %{current_state | rto_ms: 100}}
+               end)
 
       # Close to enter FIN_WAIT_1
       assert Tricep.close(socket) == :ok
@@ -6962,6 +7162,12 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, our_fin_ack)
 
       {:time_wait, _} = :sys.get_state(socket)
+
+      Process.sleep(200)
+      assert Process.alive?(socket)
+
+      assert {:time_wait, %{unacked_segments: [], rto_timer_active: false}} =
+               :sys.get_state(socket)
     end
 
     test "ignores malformed segment in CLOSING", %{
@@ -7451,6 +7657,8 @@ defmodule Tricep.SocketTest do
       remote_addr: remote_addr
     } do
       socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      Process.unlink(socket)
 
       # Drain ACK
       assert_receive {:dummy_link_packet, _link, _ack_packet}, 1000
@@ -7458,6 +7666,12 @@ defmodule Tricep.SocketTest do
       # Get state
       {:established, state} = :sys.get_state(socket)
       {{_, src_port}, _} = state.pair
+
+      assert {:established, %{rto_ms: 100}} =
+               :sys.replace_state(socket, fn
+                 {:established, current_state} ->
+                   {:established, %{current_state | rto_ms: 100}}
+               end)
 
       # Send FIN from peer to get to CLOSE_WAIT
       fin_segment =
@@ -7495,6 +7709,10 @@ defmodule Tricep.SocketTest do
       DummyLink.inject_packet(link, our_fin_ack)
 
       {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+
+      Process.sleep(200)
+      assert Process.alive?(socket)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
     end
 
     test "retransmits lost FIN in LAST_ACK", %{

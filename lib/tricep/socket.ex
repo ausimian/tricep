@@ -1059,7 +1059,7 @@ defmodule Tricep.Socket do
         handle_fin_wait_1_segment(state, parsed)
 
       outcome ->
-        synchronized_rejection(state, outcome, {:connection, [{{:timeout, :rto}, :cancel}]})
+        synchronized_rejection(state, outcome)
     end
   end
 
@@ -1084,9 +1084,7 @@ defmodule Tricep.Socket do
         :fin_wait_2,
         %__MODULE__{} = state
       ) do
-    reset_state(state)
-    actions = notify_waiters_error(state, :etimedout)
-    {:next_state, :closed, closed_data(state), actions}
+    reset_connection(state, :etimedout, [{{:timeout, :fin_wait_2}, :cancel}])
   end
 
   def handle_event(:info, segment, :fin_wait_2, %__MODULE__{} = state) when is_binary(segment) do
@@ -1116,6 +1114,9 @@ defmodule Tricep.Socket do
   # --- TIME_WAIT state ---
 
   def handle_event({:timeout, :time_wait}, :time_wait_expired, :time_wait, %__MODULE__{} = state) do
+    # Entering TIME_WAIT has already consumed or cancelled any RTO. This is
+    # the TIME_WAIT timer's own expiry event, so no additional cancellation is
+    # required before releasing the tuple.
     reset_state(state)
     {:next_state, :closed, closed_data(state)}
   end
@@ -1681,6 +1682,8 @@ defmodule Tricep.Socket do
 
     cond do
       ack? and ack == state.tcb.snd_nxt ->
+        # process_ack_if_present/4 supplies the RTO cancellation with this
+        # advancing ACK before LAST_ACK releases the tuple.
         reset_state(ack_state)
         {:next_state, :closed, closed_data(ack_state), ack_actions}
 
@@ -2098,7 +2101,6 @@ defmodule Tricep.Socket do
     {:keep_state, new_state, actions}
   end
 
-  # Preserve legacy retry-exhaustion teardown behavior; bug #122 owns its fix.
   defp do_retransmit(%__MODULE__{unacked_segments: []} = state) do
     # Nothing to retransmit, clear timer state
     {:keep_state, %{state | rto_timer_active: false}}
@@ -2107,9 +2109,7 @@ defmodule Tricep.Socket do
   defp do_retransmit(%__MODULE__{unacked_segments: [{seq, seq_end, :fin, count} | rest]} = state) do
     if count >= @max_retransmit_count do
       # Max retries exceeded - connection failure
-      reset_state(state)
-      actions = notify_waiters_error(state, retry_exhaustion_error(state))
-      {:next_state, :closed, closed_data(state), actions}
+      reset_connection(state, retry_exhaustion_error(state))
     else
       send_fin_segment(state, seq)
 
@@ -2139,9 +2139,7 @@ defmodule Tricep.Socket do
        when is_binary(payload) do
     if count >= @max_retransmit_count do
       # Max retries exceeded - connection failure
-      reset_state(state)
-      actions = notify_waiters_error(state, retry_exhaustion_error(state))
-      {:next_state, :closed, closed_data(state), actions}
+      reset_connection(state, retry_exhaustion_error(state))
     else
       # Retransmit the oldest unacked segment
       {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
@@ -2486,8 +2484,11 @@ defmodule Tricep.Socket do
   defp apply_icmpv6_error(_event, _state_name, _state), do: :keep_state_and_data
 
   defp reset_connection(%__MODULE__{} = state, error, timer_actions \\ []) do
+    # A reset tears down states that may own a named RTO. gen_statem cancellation
+    # removes its queued delivery; a missed cancellation must fail loudly rather
+    # than being absorbed after closure.
     reset_state(state)
-    actions = timer_actions ++ notify_waiters_error(state, error)
+    actions = [{{:timeout, :rto}, :cancel} | timer_actions] ++ notify_waiters_error(state, error)
     {:next_state, :closed, closed_data(state), actions}
   end
 
@@ -2504,6 +2505,9 @@ defmodule Tricep.Socket do
   end
 
   defp synchronized_rejection(state, :acceptable_reset, :close) do
+    # CLOSING and LAST_ACK reach this path only after their send buffer and
+    # close waiters are settled, so no persist timer or caller remains. The
+    # unacknowledged FIN may still own an RTO and is cancelled explicitly.
     reset_state(state)
     {:next_state, :closed, closed_data(state), {{:timeout, :rto}, :cancel}}
   end
