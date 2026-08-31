@@ -11,6 +11,30 @@ defmodule Tricep.SocketTest do
   alias Tricep.Tcp.Listener.{Accepted, Child, Waiter}
   alias Tricep.Tcp.ReceiveReassembly
 
+  defmodule RouteSink do
+    use GenServer
+
+    def start_link(owner), do: GenServer.start_link(__MODULE__, owner)
+
+    def register_route(pid, srcaddr, dstaddr, prefix_len, mtu) do
+      GenServer.call(pid, {:register_route, srcaddr, dstaddr, prefix_len, mtu})
+    end
+
+    @impl true
+    def init(owner), do: {:ok, owner}
+
+    @impl true
+    def handle_call({:register_route, srcaddr, dstaddr, prefix_len, mtu}, _from, owner) do
+      {:reply, Tricep.Application.register_route(srcaddr, dstaddr, prefix_len, mtu), owner}
+    end
+
+    @impl true
+    def handle_call({:send, packet}, _from, owner) do
+      send(owner, {:route_sink_packet, self(), packet})
+      {:reply, :ok, owner}
+    end
+  end
+
   # Test addresses
   # local_addr: the address Socket connects TO (like ifaddr in TunLink)
   # remote_addr: the address Socket uses as source (like dstaddr in TunLink)
@@ -190,11 +214,9 @@ defmodule Tricep.SocketTest do
     } do
       {:ok, routed_addr} = Tricep.Address.from("fd00::abcd")
 
-      on_exit(fn ->
-        Tricep.Application.deregister_route(local_addr, 64)
-      end)
+      route_sink = start_supervised!({RouteSink, self()})
 
-      :ok = Tricep.Application.register_route(remote_addr, local_addr, 64, 1500)
+      :ok = RouteSink.register_route(route_sink, remote_addr, local_addr, 64, 1500)
 
       {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
 
@@ -203,7 +225,7 @@ defmodule Tricep.SocketTest do
           Tricep.connect(socket, %{family: :inet6, addr: "fd00::abcd", port: @port})
         end)
 
-      assert_receive {:send, packet}, 1000
+      assert_receive {:route_sink_packet, ^route_sink, packet}, 1000
 
       <<6::4, _::4, _::24, _payload_len::16, 6::8, _hop::8, pkt_src::binary-size(16),
         pkt_dst::binary-size(16), tcp_segment::binary>> = packet
@@ -4146,6 +4168,750 @@ defmodule Tricep.SocketTest do
       parsed = Tcp.parse_segment(segment)
       assert parsed.payload == "abc"
       refute_receive {:dummy_link_packet, _link, _packet}, 100
+    end
+
+    test "bounds total send ownership and wakes a selector after ACK drain", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(link, local_addr, remote_addr,
+          window: 4,
+          open_opts: %{send_buffer_size: 4, send_buffer_low_watermark: 2}
+        )
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+      assert Tricep.send(socket, "abcd") == :ok
+      assert_receive {:dummy_link_packet, ^link, packet}, 1000
+
+      <<_::binary-size(40), segment::binary>> = packet
+      sent = Tcp.parse_segment(segment)
+      assert sent.payload == "abcd"
+
+      assert {:select, {:select_info, :send, ref}} = Tricep.send(socket, "e", :nowait)
+      assert {:established, full_state} = :sys.get_state(socket)
+      assert Tricep.DataBuffer.size(full_state.send_buffer) == 0
+      assert [{_start, _ending, "abcd", 0}] = full_state.unacked_segments
+      assert length(full_state.send_waiters) == 1
+
+      {{_, source_port}, _} = full_state.pair
+
+      ack =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, source_port}},
+          full_state.tcb.irs + 1,
+          sent.seq + byte_size(sent.payload),
+          [:ack],
+          4
+        )
+
+      DummyLink.inject_packet(link, ack)
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+      assert Tricep.send(socket, "e", :nowait) == :ok
+      assert_receive {:dummy_link_packet, ^link, drained_packet}, 1000
+      <<_::binary-size(40), drained_segment::binary>> = drained_packet
+      assert Tcp.parse_segment(drained_segment).payload == "e"
+    end
+
+    test "queues a full-size blocking write until ACK drain", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 65_535)
+      first_write = :binary.copy("a", 32_768)
+      second_write = :binary.copy("b", 32_768)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+      assert Tricep.send(socket, first_write) == :ok
+
+      {:established, first_state} =
+        wait_for_socket(socket, fn
+          {:established, state} ->
+            Enum.reduce(state.unacked_segments, 0, fn {_start, _end, payload, _count}, total ->
+              total + byte_size(payload)
+            end) == byte_size(first_write)
+
+          _ ->
+            false
+        end)
+
+      second_task = Task.async(fn -> Tricep.send(socket, second_write, :infinity) end)
+      wait_for_send_waiters(socket)
+
+      assert {:established, waiting_state} = :sys.get_state(socket)
+      assert [{:wait, _from, ^second_write, nil, _monitor_ref}] = waiting_state.send_waiters
+
+      owned_bytes =
+        Enum.reduce(waiting_state.unacked_segments, 0, fn {_start, _end, payload, _count},
+                                                          total ->
+          total + byte_size(payload)
+        end)
+
+      assert owned_bytes == byte_size(first_write)
+      assert byte_size(second_write) <= waiting_state.send_buffer_size
+      assert owned_bytes + byte_size(second_write) > waiting_state.send_buffer_size
+      assert length(waiting_state.send_waiters) <= waiting_state.send_waiter_limit
+
+      assert owned_bytes + byte_size(second_write) <=
+               waiting_state.send_buffer_size +
+                 waiting_state.send_waiter_limit * waiting_state.send_buffer_size
+
+      {{_, source_port}, _} = first_state.pair
+
+      ack =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, source_port}},
+          first_state.tcb.irs + 1,
+          first_state.tcb.snd_nxt,
+          [:ack],
+          65_535
+        )
+
+      DummyLink.inject_packet(link, ack)
+      assert Task.await(second_task, 1_000) == :ok
+    end
+
+    test "preserves retransmit budget while a saturated link rejects data", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+      assert Tricep.send(socket, "payload") == :ok
+      assert_receive {:dummy_link_packet, ^link, _data_packet}, 1000
+
+      {:established, state} =
+        wait_for_socket(socket, fn
+          {:established, %{unacked_segments: [{_seq, _end, "payload", 0}]}} -> true
+          _ -> false
+        end)
+
+      :ok = DummyLink.clear_packets(link)
+      :ok = DummyLink.set_send_result(link, {:error, :eagain})
+
+      {stalled_state, deadline} =
+        Enum.reduce(1..6, {state, nil}, fn _attempt, {current_state, deadline} ->
+          rto_ms = current_state.rto_ms
+          retry_ms = current_state.link_retry_ms
+
+          retry_result =
+            if current_state.link_retry_path do
+              Tricep.Socket.retry_link_retransmit(current_state)
+            else
+              Tricep.Socket.do_retransmit(current_state)
+            end
+
+          assert {:keep_state, retry_state,
+                  {{:timeout, :link_retry}, ^retry_ms, {:retry, :retransmit}}} = retry_result
+
+          assert retry_state.rto_ms == rto_ms
+          assert retry_state.unacked_segments == current_state.unacked_segments
+          assert retry_state.link_retry_path == :retransmit
+          assert retry_state.link_retry_ms == min(current_state.link_retry_ms * 2, 1_000)
+
+          deadline = deadline || retry_state.link_stall_deadline_ms
+          assert retry_state.link_stall_deadline_ms == deadline
+          {retry_state, deadline}
+        end)
+
+      assert DummyLink.get_packets(link) == []
+      assert is_integer(deadline)
+
+      :ok = DummyLink.set_send_result(link, :ok)
+
+      assert {:keep_state, retransmitted_state, {{:timeout, :rto}, retransmit_rto, :retransmit}} =
+               Tricep.Socket.retry_link_retransmit(stalled_state)
+
+      assert retransmit_rto == stalled_state.rto_ms * 2
+      assert [{seq, seq_end, "payload", 1}] = retransmitted_state.unacked_segments
+      assert retransmitted_state.link_stall_deadline_ms == nil
+      assert retransmitted_state.link_retry_path == nil
+      assert retransmitted_state.link_retry_ms == 10
+      assert_receive {:dummy_link_packet, ^link, _retransmitted_packet}, 1000
+
+      :sys.replace_state(socket, fn {:established, _state} ->
+        {:established, retransmitted_state}
+      end)
+
+      {{_, source_port}, _} = retransmitted_state.pair
+
+      ack =
+        Tcp.build_segment(
+          {{local_addr, @port}, {remote_addr, source_port}},
+          retransmitted_state.tcb.irs + 1,
+          seq_end,
+          [:ack],
+          32_768
+        )
+
+      DummyLink.inject_packet(link, ack)
+
+      assert {:established, %{unacked_segments: [], rto_timer_active: false}} =
+               wait_for_socket(socket, fn
+                 {:established, %{unacked_segments: []}} -> true
+                 _ -> false
+               end)
+
+      assert seq == state.tcb.snd_una
+    end
+
+    test "preserves SYN, SYN-ACK, and FIN retry state while link admission fails", %{
+      link: link,
+      local_addr: _local_addr,
+      remote_addr: _remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      connect_task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, ^link, _syn_packet}, 1_000
+      assert {{:syn_sent, _from}, state} = :sys.get_state(socket)
+
+      :ok = DummyLink.clear_packets(link)
+      :ok = DummyLink.set_send_result(link, {:error, :eagain})
+      rto_ms = state.rto_ms
+      retry_ms = state.link_retry_ms
+
+      assert {:keep_state, syn_state,
+              {{:timeout, :link_retry}, ^retry_ms, {:retry, {:syn, :syn_timeout_nowait}}}} =
+               Tricep.Socket.retransmit_syn(state, :syn_timeout_nowait)
+
+      assert syn_state.syn_retransmit_count == state.syn_retransmit_count
+      assert syn_state.rto_ms == rto_ms
+      assert is_integer(syn_state.link_stall_deadline_ms)
+      assert syn_state.link_retry_path == {:syn, :syn_timeout_nowait}
+      assert syn_state.link_retry_ms == 20
+
+      syn_ack_input = %{state | tcb: %{state.tcb | rcv_mss: 1460, rcv_nxt: 0}}
+
+      assert {:keep_state, syn_ack_state,
+              {{:timeout, :link_retry}, ^retry_ms, {:retry, :syn_ack}}} =
+               Tricep.Socket.retransmit_syn_ack(syn_ack_input)
+
+      assert syn_ack_state.syn_retransmit_count == state.syn_retransmit_count
+      assert syn_ack_state.rto_ms == rto_ms
+      assert is_integer(syn_ack_state.link_stall_deadline_ms)
+      assert syn_ack_state.link_retry_path == :syn_ack
+      assert syn_ack_state.link_retry_ms == 20
+
+      fin_tcb = %{state.tcb | rcv_nxt: 0, rcv_adv_wnd: 65_535}
+
+      fin_state = %{
+        state
+        | tcb: fin_tcb,
+          unacked_segments: [{fin_tcb.snd_nxt, fin_tcb.snd_nxt + 1, :fin, 0}],
+          rto_timer_active: true
+      }
+
+      assert {:keep_state, retained_fin_state,
+              {{:timeout, :link_retry}, ^retry_ms, {:retry, :retransmit}}} =
+               Tricep.Socket.do_retransmit(fin_state)
+
+      assert retained_fin_state.unacked_segments == fin_state.unacked_segments
+      assert retained_fin_state.rto_ms == rto_ms
+      assert is_integer(retained_fin_state.link_stall_deadline_ms)
+      assert retained_fin_state.link_retry_path == :retransmit
+      assert retained_fin_state.link_retry_ms == 20
+      assert DummyLink.get_packets(link) == []
+
+      expired_deadline = System.monotonic_time(:millisecond) - 1
+
+      exhausted_state = %{
+        state
+        | link_stall_deadline_ms: expired_deadline,
+          link_retry_path: {:syn, :syn_timeout_nowait},
+          link_retry_ms: 1_000
+      }
+
+      assert {:link_stall_exhausted, _syn_exhausted_state, :enobufs} =
+               Tricep.Socket.retry_link_syn(exhausted_state, :syn_timeout_nowait)
+
+      exhausted_syn_ack_state = %{
+        syn_ack_input
+        | link_stall_deadline_ms: expired_deadline,
+          link_retry_path: :syn_ack,
+          link_retry_ms: 1_000
+      }
+
+      assert {:link_stall_exhausted, _syn_ack_exhausted_state, :enobufs} =
+               Tricep.Socket.retry_link_syn_ack(exhausted_syn_ack_state)
+
+      exhausted_fin_state = %{
+        fin_state
+        | link_stall_deadline_ms: expired_deadline,
+          link_retry_path: :retransmit,
+          link_retry_ms: 1_000
+      }
+
+      assert {:next_state, :closed, _closed_data, _actions} =
+               Tricep.Socket.retry_link_retransmit(exhausted_fin_state)
+
+      :ok = DummyLink.set_send_result(link, {:error, :emsgsize})
+
+      assert {:link_stall_exhausted, _syn_oversized_state, :emsgsize} =
+               Tricep.Socket.retransmit_syn(state, :syn_timeout_nowait)
+
+      assert {:link_stall_exhausted, _syn_ack_oversized_state, :emsgsize} =
+               Tricep.Socket.retransmit_syn_ack(syn_ack_input)
+
+      assert {:next_state, :closed, _closed_data, _actions} =
+               Tricep.Socket.do_retransmit(fin_state)
+
+      Task.shutdown(connect_task, :brutal_kill)
+      stop_socket(socket)
+    end
+
+    test "bounds data-link stalls and rejects a permanently oversized packet", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1_000
+      assert {:established, state} = :sys.get_state(socket)
+
+      :ok = DummyLink.set_send_result(link, {:error, :eagain})
+
+      {stalled_state, deadline} =
+        Enum.reduce(
+          1..6,
+          {%{state | send_buffer: Tricep.DataBuffer.append(state.send_buffer, "x")}, nil},
+          fn
+            attempt, {current_state, deadline} ->
+              expected_delay = (10 * 2 ** (attempt - 1)) |> min(1_000)
+
+              retry_result =
+                if current_state.link_retry_path do
+                  Tricep.Socket.retry_link_send(current_state)
+                else
+                  Tricep.Socket.do_flush_send_buffer(current_state)
+                end
+
+              assert {:keep_state, next_state,
+                      {{:timeout, :link_retry}, ^expected_delay, {:retry, :flush}}} = retry_result
+
+              deadline = deadline || next_state.link_stall_deadline_ms
+              assert next_state.link_stall_deadline_ms == deadline
+              assert next_state.link_retry_path == :flush
+              {next_state, deadline}
+          end
+        )
+
+      assert is_integer(deadline)
+
+      expired_state = %{
+        stalled_state
+        | link_stall_deadline_ms: System.monotonic_time(:millisecond) - 1
+      }
+
+      assert {:next_state, :closed, _closed_data, terminal_actions} =
+               Tricep.Socket.retry_link_send(expired_state)
+
+      refute Enum.any?(terminal_actions, fn
+               {{:timeout, :link_retry}, _, {:retry, :flush}} -> true
+               _action -> false
+             end)
+
+      :ok = DummyLink.set_send_result(link, {:error, :emsgsize})
+
+      oversized_state = %{state | send_buffer: Tricep.DataBuffer.append(state.send_buffer, "x")}
+
+      assert {:next_state, :closed, _closed_data, oversized_actions} =
+               Tricep.Socket.do_flush_send_buffer(oversized_state)
+
+      refute Enum.any?(oversized_actions, fn
+               {{:timeout, :link_retry}, _, {:retry, :flush}} -> true
+               _action -> false
+             end)
+
+      stop_socket(socket)
+    end
+
+    test "starts a fresh link-stall episode after an unsendable retry", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1_000
+      assert {:established, state} = :sys.get_state(socket)
+      :ok = DummyLink.set_send_result(link, {:error, :eagain})
+
+      pending_state = %{
+        state
+        | send_buffer: Tricep.DataBuffer.append(state.send_buffer, "pending")
+      }
+
+      assert {:keep_state, stalled_state, {{:timeout, :link_retry}, 10, {:retry, :flush}}} =
+               Tricep.Socket.do_flush_send_buffer(pending_state)
+
+      original_deadline = System.monotonic_time(:millisecond) + 500
+      stalled_state = %{stalled_state | link_stall_deadline_ms: original_deadline}
+      attempts = DummyLink.send_attempts(link)
+      window_closed_state = %{stalled_state | tcb: %{stalled_state.tcb | snd_wnd: 0}}
+
+      assert {:keep_state, paused_state, paused_actions} =
+               Tricep.Socket.retry_link_send(window_closed_state)
+
+      assert paused_state.link_stall_deadline_ms == nil
+      assert paused_state.link_retry_path == nil
+      assert paused_state.link_retry_ms == 10
+
+      refute Enum.any?(List.wrap(paused_actions), fn
+               {{:timeout, :link_retry}, _, {:retry, :flush}} -> true
+               _action -> false
+             end)
+
+      assert DummyLink.send_attempts(link) == attempts
+
+      reopened_state = %{paused_state | tcb: %{paused_state.tcb | snd_wnd: 32_768}}
+
+      assert {:keep_state, fresh_state, {{:timeout, :link_retry}, 10, {:retry, :flush}}} =
+               Tricep.Socket.do_flush_send_buffer(reopened_state)
+
+      assert fresh_state.link_stall_deadline_ms > original_deadline
+      assert fresh_state.link_retry_path == :flush
+    end
+
+    test "rearms the named RTO when a deferred flush retry finds a full window", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1_000
+      assert {:established, state} = :sys.get_state(socket)
+      attempts = DummyLink.send_attempts(link)
+
+      payload = "flight"
+      payload_size = byte_size(payload)
+      seq_start = state.tcb.snd_una
+      seq_end = seq_start + payload_size
+
+      full_window_state = %{
+        state
+        | tcb: %{
+            state.tcb
+            | snd_nxt: seq_end,
+              snd_wnd: payload_size
+          },
+          unacked_segments: [{seq_start, seq_end, payload, 0}],
+          send_buffer: Tricep.DataBuffer.append(state.send_buffer, "queued"),
+          rto_timer_active: true,
+          link_stall_deadline_ms: System.monotonic_time(:millisecond) + 5_000,
+          link_retry_path: :flush,
+          link_retry_ms: 20
+      }
+
+      # The actual named RTO event is deferred while the named flush retry
+      # owns link admission. Its timer has fired, so the retry's unsendable
+      # exit must install a new named RTO for the in-flight payload.
+      assert {:keep_state, deferred_rto_state} = Tricep.Socket.do_retransmit(full_window_state)
+      refute deferred_rto_state.rto_timer_active
+      assert deferred_rto_state.link_retry_path == :flush
+      assert deferred_rto_state.tcb.snd_wnd > 0
+      assert deferred_rto_state.tcb.snd_nxt != deferred_rto_state.tcb.snd_una
+
+      assert {:keep_state, recovered_state, [{{:timeout, :rto}, rto_ms, :retransmit}]} =
+               Tricep.Socket.retry_link_send(deferred_rto_state)
+
+      assert rto_ms == state.rto_ms
+      assert recovered_state.rto_timer_active
+      assert recovered_state.unacked_segments == full_window_state.unacked_segments
+      assert recovered_state.link_stall_deadline_ms == nil
+      assert recovered_state.link_retry_path == nil
+      assert recovered_state.link_retry_ms == 10
+      assert recovered_state.tcb.snd_wnd > 0
+      assert recovered_state.tcb.snd_nxt != recovered_state.tcb.snd_una
+      assert DummyLink.send_attempts(link) == attempts
+    end
+
+    test "coalesces rapid writes and ACK bursts behind an armed link retry", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1_000
+      assert {:established, state} = :sys.get_state(socket)
+
+      :ok = DummyLink.set_send_result(link, {:error, :eagain})
+
+      pending_state = %{
+        state
+        | send_buffer: Tricep.DataBuffer.append(state.send_buffer, "first")
+      }
+
+      assert {:keep_state, retry_state, {{:timeout, :link_retry}, 10, {:retry, :flush}}} =
+               Tricep.Socket.do_flush_send_buffer(pending_state)
+
+      deadline = retry_state.link_stall_deadline_ms
+      attempts = DummyLink.send_attempts(link)
+
+      write_state =
+        Enum.reduce(1..12, retry_state, fn number, current_state ->
+          assert {:keep_state, next_state, _actions} =
+                   Tricep.Socket.handle_send_call(
+                     current_state,
+                     {self(), make_ref()},
+                     "write-#{number}",
+                     :infinity
+                   )
+
+          assert :keep_state_and_data = Tricep.Socket.do_flush_send_buffer(next_state)
+          assert next_state.link_stall_deadline_ms == deadline
+          assert next_state.link_retry_path == :flush
+          next_state
+        end)
+
+      ack = %{
+        flags: [:ack],
+        seq: write_state.tcb.irs + 1,
+        ack: write_state.tcb.snd_una,
+        window: 65_535,
+        payload: <<>>
+      }
+
+      Enum.each(1..12, fn _ ->
+        assert {:keep_state, ack_state, _actions} =
+                 Tricep.Socket.handle_established_segment(write_state, ack)
+
+        assert :keep_state_and_data = Tricep.Socket.do_flush_send_buffer(ack_state)
+        assert ack_state.link_stall_deadline_ms == deadline
+        assert ack_state.link_retry_path == :flush
+      end)
+
+      assert DummyLink.send_attempts(link) == attempts
+      assert deadline > System.monotonic_time(:millisecond)
+      stop_socket(socket)
+    end
+
+    test "shares one stall deadline across retransmit and flush paths", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1_000
+      assert Tricep.send(socket, "payload") == :ok
+      assert_receive {:dummy_link_packet, ^link, _payload}, 1_000
+      assert {:established, state} = :sys.get_state(socket)
+
+      :ok = DummyLink.set_send_result(link, {:error, :eagain})
+
+      assert {:keep_state, retry_state, {{:timeout, :link_retry}, _delay, {:retry, :retransmit}}} =
+               Tricep.Socket.do_retransmit(state)
+
+      deadline = retry_state.link_stall_deadline_ms
+
+      retry_state = %{
+        retry_state
+        | send_buffer: Tricep.DataBuffer.append(retry_state.send_buffer, "queued")
+      }
+
+      attempts = DummyLink.send_attempts(link)
+
+      assert :keep_state_and_data = Tricep.Socket.do_flush_send_buffer(retry_state)
+      assert {:keep_state, deferred_rto_state} = Tricep.Socket.do_retransmit(retry_state)
+      assert deferred_rto_state.link_stall_deadline_ms == deadline
+      assert deferred_rto_state.link_retry_path == :retransmit
+      assert DummyLink.send_attempts(link) == attempts
+      stop_socket(socket)
+    end
+
+    test "closes only when an armed link retry reaches its elapsed deadline", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      Process.unlink(socket)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1_000
+      :ok = DummyLink.clear_packets(link)
+      :ok = DummyLink.set_send_result(link, {:error, :eagain})
+      assert Tricep.send(socket, "pending") == :ok
+
+      {:established, stalled_state} =
+        wait_for_socket(socket, fn
+          {:established, %{link_retry_path: :flush}} -> true
+          _ -> false
+        end)
+
+      short_deadline = System.monotonic_time(:millisecond) + 75
+
+      assert {:established, %{link_stall_deadline_ms: ^short_deadline}} =
+               :sys.replace_state(socket, fn {:established, state} ->
+                 {:established,
+                  %{state | link_stall_deadline_ms: short_deadline, link_retry_ms: 10}}
+               end)
+
+      assert stalled_state.link_stall_deadline_ms > System.monotonic_time(:millisecond)
+      assert {:closed, %{socket_opts: %{}}} = wait_for_state_name(socket, :closed, 1_000)
+      assert DummyLink.get_packets(link) == []
+
+      Process.sleep(100)
+      assert Process.alive?(socket)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+    end
+
+    test "rejects writes larger than the configured high watermark", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(link, local_addr, remote_addr, open_opts: %{send_buffer_size: 4})
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+      assert Tricep.send(socket, "abcde") == {:error, :emsgsize}
+      refute_receive {:dummy_link_packet, ^link, _packet}, 100
+
+      assert {:established, state} = :sys.get_state(socket)
+      assert Tricep.DataBuffer.empty?(state.send_buffer)
+      assert state.unacked_segments == []
+    end
+
+    test "releases a dead blocking sender and its retained bytes", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(link, local_addr, remote_addr,
+          window: 0,
+          open_opts: %{send_buffer_size: 4, send_waiter_limit: 2}
+        )
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+      task = Task.async(fn -> Tricep.send(socket, "abcd", :infinity) end)
+      wait_for_send_waiters(socket)
+
+      assert {:established, %{send_waiters: [{:wait, _from, "abcd", nil, _monitor}]}} =
+               :sys.get_state(socket)
+
+      Task.shutdown(task, :brutal_kill)
+
+      wait_for_socket(socket, fn
+        {:established, %{send_waiters: []}} -> true
+        _ -> false
+      end)
+
+      assert Tricep.send(socket, "abcd", 0) == {:error, :timeout}
+    end
+
+    test "link termination resets the socket and settles blocked sends", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr, window: 0)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1000
+      task = Task.async(fn -> Tricep.send(socket, "blocked", :infinity) end)
+      wait_for_send_waiters(socket)
+
+      Process.unlink(link)
+      GenServer.stop(link, :shutdown)
+
+      assert Task.await(task, 1_000) == {:error, :enetdown}
+      assert {:closed, %{socket_opts: %{}}} = wait_for_state_name(socket, :closed, 1_000)
+    end
+
+    test "link termination settles a pending blocking connect", %{
+      link: link,
+      local_addr: _local_addr,
+      remote_addr: _remote_addr
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      task =
+        Task.async(fn ->
+          Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port})
+        end)
+
+      assert_receive {:dummy_link_packet, ^link, _syn}, 1_000
+      Process.unlink(link)
+      GenServer.stop(link, :shutdown)
+
+      assert Task.await(task, 1_000) == {:error, :enetdown}
+      assert {:closed, %{socket_opts: %{}}} = wait_for_state_name(socket, :closed, 1_000)
+    end
+
+    test "link termination cancels the FIN_WAIT_2 timer", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket =
+        establish_connection(link, local_addr, remote_addr,
+          open_opts: %{fin_wait_2_timeout_ms: 25}
+        )
+
+      on_exit(fn -> stop_socket(socket) end)
+      Process.unlink(socket)
+
+      shutdown_write_to_fin_wait_2(socket, link, local_addr, remote_addr)
+      assert {:fin_wait_2, _state} = :sys.get_state(socket)
+
+      Process.unlink(link)
+      GenServer.stop(link, :shutdown)
+
+      assert {:closed, %{socket_opts: %{fin_wait_2_timeout_ms: 25}}} =
+               wait_for_state_name(socket, :closed, 1_000)
+
+      Process.sleep(75)
+      assert Process.alive?(socket)
+      assert {:closed, %{socket_opts: %{fin_wait_2_timeout_ms: 25}}} = :sys.get_state(socket)
+    end
+
+    test "link termination cancels the TIME_WAIT timer", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+      Process.unlink(socket)
+
+      assert_receive {:dummy_link_packet, ^link, _handshake_ack}, 1_000
+
+      {_established_state, _time_wait_state} =
+        enter_time_wait(socket, link, local_addr, remote_addr)
+
+      Process.unlink(link)
+      GenServer.stop(link, :shutdown)
+
+      assert {:closed, %{socket_opts: %{}}} = wait_for_state_name(socket, :closed, 1_000)
+
+      # The socket would have crashed after this state-owned timer fired if
+      # link-down teardown had left it armed during the callback transition.
+      Process.sleep(2_100)
+      assert Process.alive?(socket)
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+    end
+
+    test "rejects invalid send-capacity options at open time" do
+      assert {:error, :einval} =
+               Tricep.open(:inet6, :stream, :tcp, %{send_buffer_size: 0})
+
+      assert {:error, :einval} =
+               Tricep.open(:inet6, :stream, :tcp, %{
+                 send_buffer_size: 8,
+                 send_buffer_low_watermark: 8
+               })
     end
 
     test "returns error when not connected" do

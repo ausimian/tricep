@@ -56,6 +56,15 @@ defmodule Tricep.Tcp.Socket.Callback do
         Socket.handle_icmpv6_error_event(event, quoted_tcp, state_name, state_data)
       end
 
+      def handle_event(
+            :info,
+            {:DOWN, monitor_ref, :process, _pid, _reason},
+            state_name,
+            %Socket{} = state_data
+          ) do
+        Socket.handle_process_down(state_name, state_data, monitor_ref)
+      end
+
       def handle_event({:call, from}, :sockname, state_name, state_data) do
         Socket.handle_sockname(from, state_name, state_data)
       end
@@ -64,6 +73,12 @@ defmodule Tricep.Tcp.Socket.Callback do
       # transition occurs. State-specific handlers own live persist probes;
       # this catch-all absorbs the stale delivery in every active family.
       def handle_event({:timeout, :persist}, :persist_probe, _state_name, _state_data),
+        do: :keep_state_and_data
+
+      def handle_event({:timeout, :link_retry}, :link_retry, _state_name, _state_data),
+        do: :keep_state_and_data
+
+      def handle_event({:timeout, :link_retry}, {:retry, _path}, _state_name, _state_data),
         do: :keep_state_and_data
 
       def handle_event(:info, _message, _state_name, _state_data), do: :keep_state_and_data

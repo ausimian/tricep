@@ -12,14 +12,24 @@ defmodule Tricep.DummyLink do
 
   use GenServer
 
-  defstruct [:local_addr, :remote_addr, :mtu, :packets, :owner]
+  defstruct [
+    :local_addr,
+    :remote_addr,
+    :mtu,
+    :packets,
+    :owner,
+    send_result: :ok,
+    send_attempts: 0
+  ]
 
   @type t :: %__MODULE__{
           local_addr: binary(),
           remote_addr: binary(),
           mtu: pos_integer(),
           packets: [binary()],
-          owner: pid()
+          owner: pid(),
+          send_result: :ok | {:error, :eagain | :emsgsize},
+          send_attempts: non_neg_integer()
         }
 
   @doc """
@@ -53,6 +63,17 @@ defmodule Tricep.DummyLink do
     GenServer.call(pid, :clear_packets)
   end
 
+  @doc false
+  @spec send_attempts(pid()) :: non_neg_integer()
+  def send_attempts(pid) do
+    GenServer.call(pid, :send_attempts)
+  end
+
+  @spec set_send_result(pid(), :ok | {:error, :eagain | :emsgsize}) :: :ok
+  def set_send_result(pid, result) when result in [:ok, {:error, :eagain}, {:error, :emsgsize}] do
+    GenServer.call(pid, {:set_send_result, result})
+  end
+
   @doc """
   Waits for a packet to be captured, with timeout.
   Returns `{:ok, packet}` or `{:error, :timeout}`.
@@ -68,7 +89,17 @@ defmodule Tricep.DummyLink do
   """
   @spec inject_packet(pid(), binary()) :: :ok
   def inject_packet(pid, tcp_segment) do
-    GenServer.call(pid, {:inject_packet, tcp_segment})
+    case GenServer.call(pid, {:inject_packet, tcp_segment}) do
+      {:barrier, socket} ->
+        # DummyLink has already sent the packet before replying.  This call is
+        # therefore ordered after it in the socket mailbox without keeping the
+        # link server busy while the socket transmits a response.
+        :sys.get_state(socket)
+        :ok
+
+      :ok ->
+        :ok
+    end
   end
 
   # Server callbacks
@@ -91,7 +122,9 @@ defmodule Tricep.DummyLink do
            remote_addr: remote_addr,
            mtu: mtu,
            packets: [],
-           owner: owner
+           owner: owner,
+           send_result: :ok,
+           send_attempts: 0
          }}
 
       {:error, reason} ->
@@ -106,6 +139,14 @@ defmodule Tricep.DummyLink do
 
   def handle_call(:clear_packets, _from, state) do
     {:reply, :ok, %{state | packets: []}}
+  end
+
+  def handle_call(:send_attempts, _from, state) do
+    {:reply, state.send_attempts, state}
+  end
+
+  def handle_call({:set_send_result, result}, _from, state) do
+    {:reply, :ok, %{state | send_result: result}}
   end
 
   def handle_call({:await_packet, timeout}, from, state) do
@@ -126,30 +167,28 @@ defmodule Tricep.DummyLink do
     socket = target_socket(state, tcp_segment)
     Tricep.Socket.handle_packet(state.local_addr, state.remote_addr, tcp_segment)
 
-    # The barrier must come from this process so it queues behind the injected segment.
-    if socket, do: :sys.get_state(socket)
+    if socket, do: {:reply, {:barrier, socket}, state}, else: {:reply, :ok, state}
+  end
 
-    {:reply, :ok, state}
+  def handle_call({:send, packet}, _from, state) do
+    state = %{state | send_attempts: state.send_attempts + 1}
+
+    case state.send_result do
+      :ok ->
+        new_state = record_packet(state, packet)
+        {:reply, :ok, new_state}
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
   end
 
   @impl true
   def handle_info({:send, packet}, state) do
-    new_state = %{state | packets: [packet | state.packets]}
-
-    # Notify owner
-    send(state.owner, {:dummy_link_packet, self(), packet})
-
-    # If someone is waiting for a packet, reply to them
-    case Map.get(new_state, :awaiting) do
-      nil ->
-        {:noreply, new_state}
-
-      from ->
-        GenServer.reply(from, {:ok, packet})
-        {:noreply, Map.delete(new_state, :awaiting) |> Map.put(:packets, [])}
-    end
+    {:noreply, record_packet(state, packet)}
   end
 
+  @impl true
   def handle_info({:await_timeout, from}, state) do
     case Map.get(state, :awaiting) do
       ^from ->
@@ -163,6 +202,23 @@ defmodule Tricep.DummyLink do
 
   def handle_info({:stop, _reason}, state) do
     {:stop, :normal, state}
+  end
+
+  defp record_packet(state, packet) do
+    new_state = %{state | packets: [packet | state.packets]}
+
+    # Notify owner
+    send(state.owner, {:dummy_link_packet, self(), packet})
+
+    # If someone is waiting for a packet, reply to them
+    case Map.get(new_state, :awaiting) do
+      nil ->
+        new_state
+
+      from ->
+        GenServer.reply(from, {:ok, packet})
+        Map.delete(new_state, :awaiting) |> Map.put(:packets, [])
+    end
   end
 
   @impl true

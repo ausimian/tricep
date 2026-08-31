@@ -11,7 +11,7 @@ defmodule Tricep.TunLinkTest do
   @local_addr_str "fd00::1"
   @remote_addr_str "fd00::2"
   @port 8080
-  @read_tun_again {:keep_state_and_data, {:next_event, :internal, :read_tun}}
+  @read_tun_again :keep_state_and_data
 
   setup do
     {:ok, local_addr} = Tricep.Address.from(@local_addr_str)
@@ -484,13 +484,155 @@ defmodule Tricep.TunLinkTest do
 
       log =
         capture_log(fn ->
-          assert {:keep_state, state, {:next_event, :internal, :read_tun}} =
+          assert {:keep_state, state} =
                    TunLink.handle_ip_packet(packet, tun_state())
 
           assert state.fragment_buffers == %{}
         end)
 
       assert log =~ "Dropping malformed IPv6 fragment"
+    end
+  end
+
+  describe "bounded transmit queue" do
+    test "yields each ready read before admitting a socket send" do
+      state = tun_state()
+
+      # Model a continuously readable device. Every completed packet queues an
+      # ordinary mailbox message instead of chaining another internal event, so a
+      # socket admission already in the mailbox is serviced before the next
+      # read. The bound is one additional read packet.
+      packet = <<>>
+
+      Enum.each(1..31, fn _ ->
+        assert TunLink.handle_ip_packet(packet, state) == @read_tun_again
+        assert_receive :read_tun
+      end)
+
+      from = {self(), make_ref()}
+      send(self(), {:queued_socket_admission, from})
+
+      assert TunLink.handle_ip_packet(packet, state) == @read_tun_again
+
+      queued_message =
+        receive do
+          message -> message
+        after
+          100 -> :timeout
+        end
+
+      assert {:queued_socket_admission, ^from} = queued_message
+
+      assert_receive :read_tun
+
+      assert {:keep_state, admitted, [{:reply, ^from, :ok}, {:next_event, :internal, :drain_tx}]} =
+               TunLink.handle_event({:call, from}, {:send, "payload"}, :ready, state)
+
+      assert admitted.tx_queued_packets == 1
+      assert admitted.tx_queued_bytes == byte_size("payload")
+    end
+
+    test "caps queued packet and byte ownership while the TUN writer is stalled" do
+      handle = make_ref()
+
+      state = %TunLink{
+        tun: self(),
+        name: "testtun0",
+        mtu: 1500,
+        tx_queue_packets_limit: 2,
+        tx_queue_bytes_limit: 5
+      }
+
+      from = {self(), make_ref()}
+
+      assert {:keep_state, queued, [{:reply, ^from, :ok}]} =
+               TunLink.handle_event(
+                 {:call, from},
+                 {:send, <<1, 2>>},
+                 {:waiting, handle},
+                 state
+               )
+
+      assert queued.tx_queued_packets == 1
+      assert queued.tx_queued_bytes == 2
+
+      assert {:keep_state, queued, [{:reply, ^from, :ok}]} =
+               TunLink.handle_event(
+                 {:call, from},
+                 {:send, <<3, 4, 5>>},
+                 {:waiting, handle},
+                 queued
+               )
+
+      assert queued.tx_queued_packets == 2
+      assert queued.tx_queued_bytes == 5
+
+      assert {:keep_state_and_data, {:reply, ^from, {:error, :eagain}}} =
+               TunLink.handle_event(
+                 {:call, from},
+                 {:send, <<6>>},
+                 {:waiting, handle},
+                 queued
+               )
+    end
+
+    test "drains queued sources round-robin after a stalled writer recovers" do
+      handle = make_ref()
+      source_a = self()
+      source_b = spawn(fn -> Process.sleep(:infinity) end)
+
+      on_exit(fn -> Process.exit(source_b, :kill) end)
+
+      state = %TunLink{
+        tun: self(),
+        name: "testtun0",
+        mtu: 1500,
+        tx_queue_packets_limit: 4,
+        tx_queue_bytes_limit: 16
+      }
+
+      {:keep_state, state, _} =
+        TunLink.handle_event(
+          {:call, {source_a, make_ref()}},
+          {:send, "a1"},
+          {:waiting, handle},
+          state
+        )
+
+      {:keep_state, state, _} =
+        TunLink.handle_event(
+          {:call, {source_a, make_ref()}},
+          {:send, "a2"},
+          {:waiting, handle},
+          state
+        )
+
+      {:keep_state, state, _} =
+        TunLink.handle_event(
+          {:call, {source_b, make_ref()}},
+          {:send, "b1"},
+          {:waiting, handle},
+          state
+        )
+
+      assert {:keep_state, first, {:next_event, :internal, :send_pending_tx}} =
+               TunLink.handle_event(:internal, :drain_tx, :ready, state)
+
+      assert first.pending_tx == {source_a, "a1"}
+
+      # Model completion without invoking the platform TUN NIF, then prove
+      # the next owner is B rather than A's second packet.
+      completed = %{
+        first
+        | pending_tx: nil,
+          tx_queued_packets: first.tx_queued_packets - 1,
+          tx_queued_bytes: first.tx_queued_bytes - 2
+      }
+
+      assert {:keep_state, second, {:next_event, :internal, :send_pending_tx}} =
+               TunLink.handle_event(:internal, :drain_tx, :ready, completed)
+
+      assert second.pending_tx == {source_b, "b1"}
     end
   end
 
@@ -589,7 +731,7 @@ defmodule Tricep.TunLinkTest do
   defp handle_fragment_packet(state, src, dst, identification, offset, more_fragments?, payload) do
     packet = fragment_packet(src, dst, 6, identification, offset, more_fragments?, payload)
 
-    assert {:keep_state, new_state, {:next_event, :internal, :read_tun}} =
+    assert {:keep_state, new_state} =
              TunLink.handle_ip_packet(packet, state)
 
     new_state
@@ -607,7 +749,7 @@ defmodule Tricep.TunLinkTest do
     packet =
       hop_by_hop_fragment_packet(src, dst, 6, identification, offset, more_fragments?, payload)
 
-    assert {:keep_state, new_state, {:next_event, :internal, :read_tun}} =
+    assert {:keep_state, new_state} =
              TunLink.handle_ip_packet(packet, state)
 
     new_state

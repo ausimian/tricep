@@ -22,12 +22,14 @@ defmodule Tricep.SocketLoopbackTest do
 
     @impl true
     def handle_info({:send, packet}, state) do
-      with {:ok, %{next_header: 6, src: src, dst: dst, payload: segment}} <-
-             Tricep.Ip.parse(packet) do
-        Tricep.Socket.handle_packet(src, dst, segment)
-      end
-
+      route_packet(packet)
       {:noreply, state}
+    end
+
+    @impl true
+    def handle_call({:send, packet}, _from, state) do
+      route_packet(packet)
+      {:reply, :ok, state}
     end
 
     @impl true
@@ -35,6 +37,13 @@ defmodule Tricep.SocketLoopbackTest do
       Tricep.Application.deregister_link(state.client_addr)
       Tricep.Application.deregister_link(state.server_addr)
       :ok
+    end
+
+    defp route_packet(packet) do
+      with {:ok, %{next_header: 6, src: src, dst: dst, payload: segment}} <-
+             Tricep.Ip.parse(packet) do
+        Tricep.Socket.handle_packet(src, dst, segment)
+      end
     end
   end
 

@@ -45,6 +45,28 @@ defmodule Tricep.Tcp.Established do
     Socket.flush_send_buffer(state)
   end
 
+  def handle_event({:timeout, :link_retry}, :link_retry, :established, %Socket{} = state) do
+    Socket.retry_link_send(state)
+  end
+
+  def handle_event(
+        {:timeout, :link_retry},
+        {:retry, :flush},
+        :established,
+        %Socket{} = state
+      ) do
+    Socket.retry_link_send(state)
+  end
+
+  def handle_event(
+        {:timeout, :link_retry},
+        {:retry, :retransmit},
+        :established,
+        %Socket{} = state
+      ) do
+    Socket.retry_link_retransmit(state) |> transition()
+  end
+
   def handle_event(:internal, :send_pending_fin, :established, %Socket{} = state) do
     Socket.send_pending_fin(state, :fin_wait_1) |> transition()
   end
