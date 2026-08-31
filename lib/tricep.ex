@@ -300,7 +300,8 @@ defmodule Tricep do
 
     * `{:ok, socket}` - A connected child socket
     * `{:error, :timeout}` - Timed out waiting for a connection
-    * `{:select, select_info}` - No connection is ready with `:nowait`
+    * `{:select, select_info}` - No connection is ready with `:nowait`, or a
+      queued child is completing its asynchronous ownership handoff
 
   A blocking accept that is settled while the listener closes returns
   `{:error, :closed}`. Once the listener has entered its closed state, a later

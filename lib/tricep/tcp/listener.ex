@@ -15,7 +15,11 @@ defmodule Tricep.Tcp.Listener do
     use TypedStruct
 
     typedstruct enforce: true do
-      field :status, :pending | :queued
+      field :status,
+            :pending
+            | :queued
+            | {:claimed, reference(), reference(), reference() | nil}
+            | {:handoff, reference()}
     end
   end
 
@@ -42,6 +46,22 @@ defmodule Tricep.Tcp.Listener do
     end
   end
 
+  defmodule Handoff do
+    @moduledoc false
+
+    use TypedStruct
+
+    typedstruct enforce: true do
+      field :id, reference()
+      field :child, pid()
+      field :caller, pid()
+      field :from, term() | nil
+      field :monitor, reference()
+      field :timer, reference() | nil
+      field :select_ref, reference() | nil
+    end
+  end
+
   typedstruct enforce: true do
     field :local_addr, binary()
     field :local_port, non_neg_integer()
@@ -55,6 +75,7 @@ defmodule Tricep.Tcp.Listener do
     field :accept_waiters, [Waiter.t()], default: []
     field :accept_selects, list(), default: []
     field :children, %{optional(pid()) => Child.t()}, default: %{}
+    field :handoffs, %{optional(reference()) => Handoff.t()}, default: %{}
   end
 
   @spec new(pid(), map(), pos_integer()) :: {:ok, t()} | {:error, atom()}
@@ -121,27 +142,14 @@ defmodule Tricep.Tcp.Listener do
   end
 
   def handle_event({:call, from}, {:accept, timeout}, state) do
-    {caller, _tag} = from
-
-    case take_accepted_child(state, caller) do
-      {:ok, child, state} ->
-        if Process.alive?(caller) do
-          {:keep_state, state, {:reply, from, {:ok, child}}}
-        else
-          # This is the same handoff race handled for queued waiters below.
-          # A dead direct caller cannot receive a reply, so reaping is safer
-          # than leaving the child outside the supervisor failure domain.
-          Process.exit(child, :shutdown)
-          {:keep_state, state}
-        end
+    case begin_accept_handoff(state, from, timeout) do
+      {:started, state, actions} ->
+        {:keep_state, state, actions}
 
       {:empty, state} ->
         wait_for_accept(state, from, timeout)
 
       {:closed, state} ->
-        {:keep_state, state, {:reply, from, {:error, :closed}}}
-
-      {:caller_down, state} ->
         {:keep_state, state, {:reply, from, {:error, :closed}}}
     end
   end
@@ -174,14 +182,17 @@ defmodule Tricep.Tcp.Listener do
     {:keep_state_and_data, {:reply, from, {:error, :einval}}}
   end
 
-  def handle_event({:timeout, timer}, {:accept_timeout, id}, state) do
-    case take_waiter_by_id(state, id) do
+  def handle_event({:timeout, timer}, {:accept_timeout, _operation_id}, state) do
+    # A finite accept retains its deadline only while waiting or in the
+    # asynchronous handoff. A claimed child is accepted by a local atomic map
+    # claim, so no peer-paced second phase can outlive this timer.
+    case take_waiter_by_timer(state, timer) do
       {:ok, %Waiter{timer: ^timer} = waiter, state} ->
         release_waiter_monitor(waiter)
         {:keep_state, state, {:reply, waiter.from, {:error, :timeout}}}
 
       _other ->
-        :keep_state_and_data
+        timeout_pending_accept(state, timer)
     end
   end
 
@@ -210,7 +221,7 @@ defmodule Tricep.Tcp.Listener do
   end
 
   def handle_event(:info, {:passive_failed, child}, state) do
-    {:keep_state, remove_child(state, child)}
+    settle_failed_child(state, child, :stale)
   end
 
   def handle_event(:info, {:passive_failed, child, reason}, state) do
@@ -218,7 +229,68 @@ defmodule Tricep.Tcp.Listener do
       "Passive TCP handshake failed after SYN-ACK retry exhaustion: #{inspect(reason)}"
     )
 
-    {:keep_state, remove_child(state, child)}
+    settle_failed_child(state, child, reason)
+  end
+
+  def handle_event(
+        :info,
+        {:passive_handoff_ready, supervisor, id, child},
+        %__MODULE__{connection_supervisor: supervisor} = state
+      ) do
+    case Map.get(state.handoffs, id) do
+      %Handoff{child: ^child} = handoff ->
+        finish_listener_handoff(state, Map.delete(state.handoffs, id), handoff, child)
+
+      %Handoff{} ->
+        Logger.warning("TCP passive handoff ready token named a different child; ignoring")
+        :keep_state_and_data
+
+      nil ->
+        # Prepare can win listener-side timeout or caller-DOWN settlement.
+        # The supervisor has already promoted this child but the listener
+        # still mirrors the earlier handoff. Restore that mirror to a queued
+        # claimed child so the next accept can make the local claim.
+        case Map.get(state.children, child) do
+          %Child{status: {:handoff, ^id}} ->
+            recover_ready_handoff(state, id, child)
+
+          %Child{status: {:claimed, ^id, _child_monitor, _caller_monitor}} ->
+            # A duplicate ready notification has no further transition.
+            :keep_state_and_data
+
+          _ ->
+            Logger.warning("Ignoring unknown TCP passive handoff ready token")
+            :keep_state_and_data
+        end
+    end
+  end
+
+  def handle_event(
+        :info,
+        {:passive_handoff_cancelled, supervisor, id, child, _reason},
+        %__MODULE__{connection_supervisor: supervisor} = state
+      ) do
+    {state, actions} = discard_handoff(state, id)
+    state = restore_handoff_child(state, child, id)
+    {state, actions} = fulfill_accept_waiter(state, actions)
+    {:keep_state, state, actions}
+  end
+
+  def handle_event(
+        :info,
+        {:passive_handoff_failed, supervisor, id, child, reason},
+        %__MODULE__{connection_supervisor: supervisor} = state
+      ) do
+    # The supervisor normally reaps before sending this, but a failed
+    # handoff must never make a live child invisible to both owners.
+    if Process.alive?(child) do
+      Logger.warning("TCP passive handoff failed with a live child; reaping invariant breach")
+    end
+
+    reap_claimed_child(child)
+    state = remove_child(state, child)
+    {state, actions} = resume_or_discard_failed_handoff(state, id, reason)
+    {:keep_state, state, actions}
   end
 
   def handle_event(
@@ -240,7 +312,7 @@ defmodule Tricep.Tcp.Listener do
         {:keep_state, state, cancel_waiter_timer_actions(waiter)}
 
       :error ->
-        :keep_state_and_data
+        settle_passive_down(state, monitor)
     end
   end
 
@@ -312,7 +384,12 @@ defmodule Tricep.Tcp.Listener do
   defp listen_addr_matches?(local_addr, dst_addr), do: local_addr == dst_addr
 
   defp backlog_full?(state) do
-    state.pending_count + length(state.accept_queue) >= state.backlog
+    # Every passive child remains in this registry through pending, queued,
+    # handoff, and supervisor-owned claimed states. Counting the one source
+    # of truth prevents a claimed handoff from creating a phantom backlog
+    # slot. Issue #141 owns replacing this O(children) count if profiling
+    # warrants a counter.
+    map_size(state.children) >= state.backlog
   end
 
   defp passive_link(peer_addr, local_addr) do
@@ -389,8 +466,54 @@ defmodule Tricep.Tcp.Listener do
         accept_queue = Enum.reject(state.accept_queue, &(&1.child == child))
         %{state | children: children, accept_queue: accept_queue}
 
+      {%Child{status: {:claimed, _id, child_monitor, caller_monitor}}, children} ->
+        release_claimed_monitors(child_monitor, caller_monitor)
+        accept_queue = Enum.reject(state.accept_queue, &(&1.child == child))
+        %{state | children: children, accept_queue: accept_queue}
+
+      {%Child{status: {:handoff, _id}}, children} ->
+        %{state | children: children}
+
       {nil, _children} ->
         state
+    end
+  end
+
+  defp settle_failed_child(state, child, reason) do
+    case Map.get(state.children, child) do
+      %Child{status: {:handoff, id}} ->
+        # A peer RST can reach the supervisor after prepare has made the child
+        # claimable but before its notification reaches this listener. Retire
+        # both mirrors and let the original accept resume or time out.
+        state = remove_child(state, child)
+        {state, actions} = resume_or_discard_failed_handoff(state, id, reason)
+        {:keep_state, state, actions}
+
+      _ ->
+        {:keep_state, remove_child(state, child)}
+    end
+  end
+
+  defp recover_ready_handoff(state, id, child) do
+    if Process.alive?(child) do
+      state =
+        %{
+          state
+          | children:
+              Map.put(
+                state.children,
+                child,
+                %Child{status: {:claimed, id, Process.monitor(child), nil}}
+              ),
+            accept_queue: state.accept_queue ++ [%Accepted{child: child}]
+        }
+
+      {state, actions} = fulfill_accept_waiter(state)
+      {:keep_state, state, actions}
+    else
+      Logger.warning("TCP passive handoff became ready after its child exited")
+      ConnectionSupervisor.discard_claimed(state.connection_supervisor, id, child)
+      {:keep_state, remove_child(state, child)}
     end
   end
 
@@ -404,21 +527,15 @@ defmodule Tricep.Tcp.Listener do
   defp fulfill_accept_waiter(state, actions) do
     case take_live_waiter(state, actions) do
       {:ok, waiter, state, actions} ->
-        caller = waiter_caller(waiter)
+        case take_handoff_child(state, waiter.id) do
+          {:claimed, child, id, state} ->
+            claim_waiter_child_or_restore(state, id, child, waiter, actions)
 
-        case take_accepted_child(state, caller) do
           {:ok, child, state} ->
-            reply_or_reap_claimed_child(waiter, caller, child, state, actions)
+            start_waiter_handoff_or_restore(state, waiter, child, actions)
 
           {:empty, state} ->
             {%{state | accept_waiters: [waiter | state.accept_waiters]}, actions}
-
-          {:closed, state} ->
-            {%{state | accept_waiters: [waiter | state.accept_waiters]}, actions}
-
-          {:caller_down, state} ->
-            release_waiter_monitor(waiter)
-            fulfill_accept_waiter(state, actions ++ cancel_waiter_timer_actions(waiter))
         end
 
       {:none, state, actions} ->
@@ -426,41 +543,245 @@ defmodule Tricep.Tcp.Listener do
     end
   end
 
-  defp fulfill_accept_selects(%{accept_selects: selects} = state, actions) when selects != [] do
-    notify_selects(selects)
+  defp fulfill_accept_selects(
+         %{accept_selects: [{caller, ref} = select | selects]} = state,
+         actions
+       ) do
+    state = %{state | accept_selects: selects}
 
-    {%{state | accept_selects: []}, actions}
+    if Process.alive?(caller) do
+      id = make_ref()
+
+      case take_handoff_child(state, id) do
+        {:ok, child, state} ->
+          handoff = %Handoff{
+            id: id,
+            child: child,
+            caller: caller,
+            from: nil,
+            monitor: Process.monitor(caller),
+            timer: nil,
+            select_ref: ref
+          }
+
+          ConnectionSupervisor.begin_handoff(
+            state.connection_supervisor,
+            id,
+            child,
+            caller
+          )
+
+          {%{state | handoffs: Map.put(state.handoffs, id, handoff)}, actions}
+
+        {:claimed, child, id, state} ->
+          state = restore_claimed_child(state, child, id, caller)
+          send(caller, {:"$socket", self(), :select, ref})
+          {state, actions}
+
+        {:empty, state} ->
+          {%{state | accept_selects: [select | state.accept_selects]}, actions}
+      end
+    else
+      fulfill_accept_selects(state, actions)
+    end
   end
 
   defp fulfill_accept_selects(state, actions), do: {state, actions}
 
-  defp reply_or_reap_claimed_child(waiter, caller, child, state, actions) do
-    if Process.alive?(caller) do
-      release_waiter_monitor(waiter)
+  defp begin_accept_handoff(state, from, timeout) do
+    id = make_ref()
 
-      {state,
-       actions ++ cancel_waiter_timer_actions(waiter) ++ [{:reply, waiter.from, {:ok, child}}]}
+    if state.accept_queue != [] and not Process.alive?(state.connection_supervisor) do
+      # This is a narrow fallback for a supervisor that disappeared between
+      # listener events. Its monitor will close the listener shortly; retain
+      # queue/waiter bookkeeping rather than consuming a child locally.
+      {:closed, state}
     else
-      # A caller can die after the supervisor has released the child. It must
-      # not become an unowned pre-accept connection. Reaping it leaves the
-      # listener's backlog and registry reusable; #131 will define any future
-      # post-accept ownership transfer protocol.
-      Process.exit(child, :shutdown)
-      release_waiter_monitor(waiter)
-      fulfill_accept_waiter(state, actions ++ cancel_waiter_timer_actions(waiter))
+      case take_handoff_child(state, id) do
+        {:claimed, child, claimed_id, state} ->
+          claim_direct_child_or_restore(state, claimed_id, child, from, timeout)
+
+        {:ok, child, state} ->
+          start_direct_handoff_or_restore(state, id, child, from, timeout)
+
+        {:empty, state} ->
+          {:empty, state}
+      end
     end
   end
 
-  defp take_accepted_child(state, caller) do
+  defp begin_waiter_handoff(state, waiter, child) do
+    caller = waiter_caller(waiter)
+
+    handoff = %Handoff{
+      id: waiter.id,
+      child: child,
+      caller: caller,
+      from: waiter.from,
+      monitor: waiter.monitor,
+      timer: waiter.timer,
+      select_ref: nil
+    }
+
+    ConnectionSupervisor.begin_handoff(
+      state.connection_supervisor,
+      handoff.id,
+      child,
+      caller
+    )
+
+    %{state | handoffs: Map.put(state.handoffs, handoff.id, handoff)}
+  end
+
+  defp start_waiter_handoff_or_restore(state, waiter, child, actions) do
+    if Process.alive?(state.connection_supervisor) do
+      state = begin_waiter_handoff(state, waiter, child)
+      {state, actions}
+    else
+      state = restore_handoff_child(state, child, waiter.id)
+      {%{state | accept_waiters: [waiter | state.accept_waiters]}, actions}
+    end
+  end
+
+  defp claim_waiter_child_or_restore(state, id, child, waiter, actions) do
+    if Process.alive?(state.connection_supervisor) do
+      case ConnectionSupervisor.claim_child(
+             state.connection_supervisor,
+             id,
+             child,
+             waiter_caller(waiter)
+           ) do
+        :ok ->
+          release_waiter_monitor(waiter)
+
+          {remove_child(state, child),
+           actions ++ cancel_waiter_timer_actions(waiter) ++ [{:reply, waiter.from, {:ok, child}}]}
+
+        {:error, :caller_down} ->
+          release_waiter_monitor(waiter)
+          state = restore_claimed_child(state, child, id, nil)
+          fulfill_accept_waiter(state, actions ++ cancel_waiter_timer_actions(waiter))
+
+        {:error, :stale} ->
+          state = remove_child(state, child)
+          state = %{state | accept_waiters: [waiter | state.accept_waiters]}
+          fulfill_accept_waiter(state, actions)
+
+        {:error, :closed} ->
+          state = restore_claimed_child(state, child, id, waiter_caller(waiter))
+          {%{state | accept_waiters: [waiter | state.accept_waiters]}, actions}
+      end
+    else
+      state = restore_claimed_child(state, child, id, waiter_caller(waiter))
+      {%{state | accept_waiters: [waiter | state.accept_waiters]}, actions}
+    end
+  end
+
+  defp start_direct_handoff_or_restore(state, id, child, from, timeout) do
+    if Process.alive?(state.connection_supervisor) do
+      {caller, _tag} = from
+      {handoff, actions} = new_direct_handoff(id, child, from, caller, timeout)
+      state = %{state | handoffs: Map.put(state.handoffs, id, handoff)}
+
+      ConnectionSupervisor.begin_handoff(
+        state.connection_supervisor,
+        id,
+        child,
+        caller
+      )
+
+      {:started, state, actions}
+    else
+      {:closed, restore_handoff_child(state, child, id)}
+    end
+  end
+
+  defp claim_direct_child_or_restore(state, id, child, from, timeout) do
+    if Process.alive?(state.connection_supervisor) do
+      {caller, _tag} = from
+
+      case ConnectionSupervisor.claim_child(state.connection_supervisor, id, child, caller) do
+        :ok ->
+          {:started, remove_child(state, child), [{:reply, from, {:ok, child}}]}
+
+        {:error, :caller_down} ->
+          {:started, restore_claimed_child(state, child, id, nil), []}
+
+        {:error, :stale} ->
+          begin_accept_handoff(remove_child(state, child), from, timeout)
+
+        {:error, :closed} ->
+          {:closed, restore_claimed_child(state, child, id, nil)}
+      end
+    else
+      {:closed, restore_claimed_child(state, child, id, nil)}
+    end
+  end
+
+  defp new_direct_handoff(id, child, from, caller, :nowait) do
+    select_ref = make_ref()
+
+    handoff = %Handoff{
+      id: id,
+      child: child,
+      caller: caller,
+      from: nil,
+      monitor: Process.monitor(caller),
+      timer: nil,
+      select_ref: select_ref
+    }
+
+    {handoff, [{:reply, from, {:select, {:select_info, :accept, select_ref}}}]}
+  end
+
+  defp new_direct_handoff(id, child, from, caller, :infinity) do
+    {%Handoff{
+       id: id,
+       child: child,
+       caller: caller,
+       from: from,
+       monitor: Process.monitor(caller),
+       timer: nil,
+       select_ref: nil
+     }, []}
+  end
+
+  defp new_direct_handoff(id, child, from, caller, timeout)
+       when is_integer(timeout) and timeout >= 0 do
+    timer = make_ref()
+
+    handoff = %Handoff{
+      id: id,
+      child: child,
+      caller: caller,
+      from: from,
+      monitor: Process.monitor(caller),
+      timer: timer,
+      select_ref: nil
+    }
+
+    {handoff, [{{:timeout, timer}, timeout, {:accept_timeout, id}}]}
+  end
+
+  defp new_direct_handoff(id, child, from, caller, _timeout) do
+    new_direct_handoff(id, child, from, caller, :infinity)
+  end
+
+  defp take_handoff_child(state, id) do
     case state.accept_queue do
-      [%Accepted{child: child} = accepted | rest] ->
+      [%Accepted{child: child} | rest] ->
         state = %{state | accept_queue: rest}
 
-        case claim_child(state, child, caller) do
-          {:ok, state} -> {:ok, child, state}
-          {:stale, state} -> take_accepted_child(state, caller)
-          {:closed, state} -> {:closed, %{state | accept_queue: [accepted | rest]}}
-          {:caller_down, state} -> {:caller_down, %{state | accept_queue: [accepted | rest]}}
+        case Map.get(state.children, child) do
+          %Child{status: {:claimed, claimed_id, _child_monitor, _caller_monitor}} ->
+            take_claimed_handoff_child(state, child, claimed_id, id)
+
+          %Child{status: :queued} = entry ->
+            children = Map.put(state.children, child, %{entry | status: {:handoff, id}})
+            {:ok, child, %{state | children: children}}
+
+          _ ->
+            take_handoff_child(remove_child(state, child), id)
         end
 
       [] ->
@@ -468,13 +789,160 @@ defmodule Tricep.Tcp.Listener do
     end
   end
 
-  defp claim_child(state, child, caller) do
-    case ConnectionSupervisor.claim(state.connection_supervisor, child, caller) do
-      :ok -> {:ok, %{state | children: Map.delete(state.children, child)}}
-      {:error, :not_queued} -> {:stale, remove_child(state, child)}
-      {:error, :closed} -> {:closed, state}
-      {:error, :caller_down} -> {:caller_down, state}
+  defp take_claimed_handoff_child(state, child, claimed_id, id) do
+    case take_claimed_child(state, child) do
+      :ok -> {:claimed, child, claimed_id, state}
+      :stale -> take_handoff_child(remove_child(state, child), id)
     end
+  end
+
+  defp timeout_pending_accept(state, timer) do
+    case take_handoff_by_timer(state, timer) do
+      {:ok, %Handoff{from: from} = handoff, state} when not is_nil(from) ->
+        ConnectionSupervisor.cancel_handoff(state.connection_supervisor, handoff.id, :timeout)
+        release_handoff_monitor(handoff)
+
+        {:keep_state, state,
+         cancel_handoff_timer_actions(handoff) ++ [{:reply, from, {:error, :timeout}}]}
+
+      {:ok, %Handoff{} = handoff, state} ->
+        {:keep_state, %{state | handoffs: Map.put(state.handoffs, handoff.id, handoff)}}
+
+      :error ->
+        :keep_state_and_data
+    end
+  end
+
+  defp discard_handoff(state, id) do
+    case Map.pop(state.handoffs, id) do
+      {%Handoff{} = handoff, handoffs} ->
+        release_handoff_monitor(handoff)
+        {%{state | handoffs: handoffs}, cancel_handoff_timer_actions(handoff)}
+
+      {nil, _handoffs} ->
+        {state, []}
+    end
+  end
+
+  defp resume_or_discard_failed_handoff(state, id, reason) do
+    case Map.pop(state.handoffs, id) do
+      {%Handoff{from: from} = handoff, handoffs}
+      when not is_nil(from) and reason != :caller_down ->
+        if Process.alive?(handoff.caller) do
+          waiter = %Waiter{
+            from: from,
+            id: handoff.id,
+            timer: handoff.timer,
+            monitor: handoff.monitor
+          }
+
+          state = %{state | handoffs: handoffs, accept_waiters: state.accept_waiters ++ [waiter]}
+          fulfill_accept_waiter(state)
+        else
+          release_handoff_monitor(handoff)
+          {%{state | handoffs: handoffs}, cancel_handoff_timer_actions(handoff)}
+        end
+
+      {%Handoff{select_ref: ref} = handoff, handoffs}
+      when is_reference(ref) and reason != :caller_down ->
+        release_handoff_monitor(handoff)
+
+        state = %{state | handoffs: handoffs}
+
+        if Process.alive?(handoff.caller) do
+          state = %{state | accept_selects: state.accept_selects ++ [{handoff.caller, ref}]}
+          fulfill_accept_selects(state, [])
+        else
+          {state, []}
+        end
+
+      {%Handoff{} = handoff, handoffs} ->
+        release_handoff_monitor(handoff)
+        {%{state | handoffs: handoffs}, cancel_handoff_timer_actions(handoff)}
+
+      {nil, _handoffs} ->
+        {state, []}
+    end
+  end
+
+  defp restore_handoff_child(state, child, id) do
+    case Map.get(state.children, child) do
+      %Child{status: {:handoff, ^id}} = entry ->
+        %{
+          state
+          | children: Map.put(state.children, child, %{entry | status: :queued}),
+            accept_queue: state.accept_queue ++ [%Accepted{child: child}]
+        }
+
+      _ ->
+        Logger.warning("TCP passive handoff cancellation lost its queued child")
+        state
+    end
+  end
+
+  defp take_handoff_by_monitor(state, monitor) do
+    case Enum.find(state.handoffs, fn {_id, handoff} -> handoff.monitor == monitor end) do
+      {id, handoff} -> {:ok, handoff, %{state | handoffs: Map.delete(state.handoffs, id)}}
+      nil -> :error
+    end
+  end
+
+  defp take_handoff_by_timer(state, timer) do
+    case Enum.find(state.handoffs, fn {_id, handoff} -> handoff.timer == timer end) do
+      {id, handoff} -> {:ok, handoff, %{state | handoffs: Map.delete(state.handoffs, id)}}
+      nil -> :error
+    end
+  end
+
+  defp claimed_child_by_monitor(state, monitor) do
+    Enum.find_value(state.children, :error, fn
+      {child, %Child{status: {:claimed, id, ^monitor, _caller_monitor}}} -> {:child, child, id}
+      {child, %Child{status: {:claimed, id, _child_monitor, ^monitor}}} -> {:caller, child, id}
+      {_child, _entry} -> nil
+    end)
+  end
+
+  defp settle_passive_down(state, monitor) do
+    case take_handoff_by_monitor(state, monitor) do
+      {:ok, handoff, state} ->
+        ConnectionSupervisor.cancel_handoff(
+          state.connection_supervisor,
+          handoff.id,
+          :caller_down
+        )
+
+        release_handoff_monitor(handoff)
+        {:keep_state, state, cancel_handoff_timer_actions(handoff)}
+
+      :error ->
+        settle_claimed_down(state, monitor)
+    end
+  end
+
+  defp settle_claimed_down(state, monitor) do
+    case claimed_child_by_monitor(state, monitor) do
+      {:child, child, _id} ->
+        {:keep_state, remove_child(state, child)}
+
+      {:caller, child, id} ->
+        state = restore_claimed_child(state, child, id, nil)
+        {state, actions} = fulfill_accept_waiter(state)
+        {:keep_state, state, actions}
+
+      :error ->
+        :keep_state_and_data
+    end
+  end
+
+  defp release_handoff_monitor(%Handoff{monitor: monitor}) do
+    Process.demonitor(monitor, [:flush])
+    :ok
+  end
+
+  defp cancel_handoff_timer_actions(%Handoff{timer: nil}), do: []
+
+  defp cancel_handoff_timer_actions(%Handoff{timer: timer}) do
+    [{{:timeout, timer}, :cancel}]
   end
 
   defp wait_for_accept(state, from, timeout) do
@@ -498,7 +966,8 @@ defmodule Tricep.Tcp.Listener do
     settle_accepts(state, fn waiter ->
       release_waiter_monitor(waiter)
       cancel_waiter_timer_actions(waiter) ++ [{:reply, waiter.from, {:error, :closed}}]
-    end)
+    end) ++
+      close_handoff_actions(state) ++ close_claimed_children(state)
   end
 
   defp notify_accept_closure(state) do
@@ -508,12 +977,201 @@ defmodule Tricep.Tcp.Listener do
       []
     end)
 
+    notify_handoff_closure(state)
+    close_claimed_children(state)
+
     :ok
   end
 
   defp settle_accepts(state, settle_waiter) do
     notify_selects(state.accept_selects)
     Enum.flat_map(state.accept_waiters, settle_waiter)
+  end
+
+  defp close_handoff_actions(state) do
+    Enum.flat_map(state.handoffs, fn {_id, handoff} ->
+      ConnectionSupervisor.cancel_handoff(state.connection_supervisor, handoff.id, :closed)
+      release_handoff_monitor(handoff)
+      # close/1 may race a ready notification that the listener has not yet
+      # processed. Reaping defensively keeps a closed listener from leaving
+      # an in-flight child orphaned while terminal state drops bookkeeping.
+      reap_claimed_child(handoff.child)
+
+      actions = cancel_handoff_timer_actions(handoff)
+
+      case handoff do
+        %Handoff{from: from} when not is_nil(from) ->
+          actions ++ [{:reply, from, {:error, :closed}}]
+
+        %Handoff{select_ref: ref} when is_reference(ref) ->
+          send(handoff.caller, {:"$socket", self(), :select, ref})
+          actions
+      end
+    end)
+  end
+
+  defp notify_handoff_closure(state) do
+    Enum.each(state.handoffs, fn {_id, handoff} ->
+      ConnectionSupervisor.cancel_handoff(state.connection_supervisor, handoff.id, :closed)
+      release_handoff_monitor(handoff)
+      reap_claimed_child(handoff.child)
+
+      case handoff do
+        %Handoff{from: from} when not is_nil(from) ->
+          :gen_statem.reply(from, {:error, :closed})
+
+        %Handoff{select_ref: ref} when is_reference(ref) ->
+          send(handoff.caller, {:"$socket", self(), :select, ref})
+      end
+    end)
+
+    :ok
+  end
+
+  defp close_claimed_children(state) do
+    Enum.each(state.children, fn
+      {_child, %Child{status: {:claimed, _id, child_monitor, caller_monitor}}} ->
+        release_claimed_monitors(child_monitor, caller_monitor)
+
+      {_child, _entry} ->
+        :ok
+    end)
+
+    []
+  end
+
+  defp finish_listener_handoff(state, handoffs, handoff, child) do
+    if Process.alive?(handoff.caller) do
+      child_monitor = Process.monitor(child)
+
+      state = %{
+        state
+        | handoffs: handoffs,
+          children:
+            Map.put(
+              state.children,
+              child,
+              %Child{status: {:claimed, handoff.id, child_monitor, handoff.monitor}}
+            ),
+          accept_queue: state.accept_queue ++ [%Accepted{child: child}]
+      }
+
+      finish_claimed_handoff(state, handoff, child)
+    else
+      release_handoff_monitor(handoff)
+      ConnectionSupervisor.discard_claimed(state.connection_supervisor, handoff.id, child)
+      state = %{state | handoffs: handoffs, children: Map.delete(state.children, child)}
+      {:keep_state, state, cancel_handoff_timer_actions(handoff)}
+    end
+  end
+
+  defp finish_claimed_handoff(state, %Handoff{from: from} = handoff, child)
+       when not is_nil(from) do
+    case ConnectionSupervisor.claim_child(
+           state.connection_supervisor,
+           handoff.id,
+           child,
+           handoff.caller
+         ) do
+      :ok ->
+        state = remove_child(state, child)
+
+        {:keep_state, state,
+         cancel_handoff_timer_actions(handoff) ++ [{:reply, from, {:ok, child}}]}
+
+      {:error, :caller_down} ->
+        state = restore_claimed_child(state, child, handoff.id, nil)
+        {state, actions} = fulfill_accept_waiter(state, cancel_handoff_timer_actions(handoff))
+        {:keep_state, state, actions}
+
+      {:error, :stale} ->
+        state = remove_child(state, child)
+        waiter = new_waiter(from, handoff.id, handoff.timer)
+        state = %{state | accept_waiters: [waiter | state.accept_waiters]}
+        {state, actions} = fulfill_accept_waiter(state, [])
+        {:keep_state, state, actions}
+
+      {:error, :closed} ->
+        state = restore_claimed_child(state, child, handoff.id, handoff.caller)
+        {:keep_state, state}
+    end
+  end
+
+  defp finish_claimed_handoff(state, %Handoff{select_ref: ref} = handoff, _child)
+       when is_reference(ref) do
+    # The selector retains no reservation: once the supervisor has marked the
+    # child claimed, any subsequent accept performs a local atomic claim.
+    send(handoff.caller, {:"$socket", self(), :select, ref})
+    {state, actions} = fulfill_accept_waiter(state)
+    {:keep_state, state, actions}
+  end
+
+  defp take_claimed_child(state, child) do
+    case Map.get(state.children, child) do
+      %Child{status: {:claimed, _id, _child_monitor, _caller_monitor}} ->
+        if Process.alive?(child), do: :ok, else: :stale
+
+      _ ->
+        Logger.warning("TCP listener lost selected passive child bookkeeping")
+        :stale
+    end
+  end
+
+  defp restore_claimed_child(state, child, id, caller) do
+    case Map.get(state.children, child) do
+      %Child{status: {:claimed, ^id, child_monitor, caller_monitor}} ->
+        release_claimed_caller_monitor(caller_monitor)
+        caller_monitor = monitor_claimed_caller(caller)
+
+        state
+        |> put_claimed_child(child, id, child_monitor, caller_monitor)
+        |> enqueue_claimed_child(child)
+
+      _ ->
+        Logger.warning("TCP listener lost claimed child bookkeeping")
+        state
+    end
+  end
+
+  defp put_claimed_child(state, child, id, child_monitor, caller_monitor) do
+    %{
+      state
+      | children:
+          Map.put(
+            state.children,
+            child,
+            %Child{status: {:claimed, id, child_monitor, caller_monitor}}
+          )
+    }
+  end
+
+  defp enqueue_claimed_child(state, child) do
+    if Enum.any?(state.accept_queue, &(&1.child == child)) do
+      state
+    else
+      %{state | accept_queue: state.accept_queue ++ [%Accepted{child: child}]}
+    end
+  end
+
+  defp monitor_claimed_caller(caller) when is_pid(caller), do: Process.monitor(caller)
+  defp monitor_claimed_caller(nil), do: nil
+
+  defp release_claimed_caller_monitor(nil), do: :ok
+
+  defp release_claimed_caller_monitor(caller_monitor) do
+    Process.demonitor(caller_monitor, [:flush])
+    :ok
+  end
+
+  defp reap_claimed_child(child) do
+    if Process.alive?(child), do: Process.exit(child, :shutdown)
+    :ok
+  end
+
+  defp release_claimed_monitors(child_monitor, caller_monitor) do
+    Process.demonitor(child_monitor, [:flush])
+    release_claimed_caller_monitor(caller_monitor)
+    :ok
   end
 
   defp notify_selects(selects) do
@@ -556,7 +1214,7 @@ defmodule Tricep.Tcp.Listener do
     end
   end
 
-  defp take_waiter_by_id(state, id), do: take_waiter(state, &(&1.id == id))
+  defp take_waiter_by_timer(state, timer), do: take_waiter(state, &(&1.timer == timer))
   defp take_waiter_by_monitor(state, monitor), do: take_waiter(state, &(&1.monitor == monitor))
 
   defp take_waiter(state, predicate) do
