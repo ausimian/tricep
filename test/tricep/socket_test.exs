@@ -5,6 +5,7 @@ defmodule Tricep.SocketTest do
 
   alias Tricep.DummyLink
   alias Tricep.Tcp
+  alias Tricep.Tcp.Closing
   alias Tricep.Tcp.ConnectionSupervisor
   alias Tricep.Tcp.Listener
   alias Tricep.Tcp.Listener.{Accepted, Child, Waiter}
@@ -34,6 +35,33 @@ defmodule Tricep.SocketTest do
     on_exit(fn -> stop_link(link) end)
 
     %{link: link, local_addr: local_addr, remote_addr: remote_addr}
+  end
+
+  describe "callback module transitions" do
+    test "supports status and code changes through each active callback family", %{
+      link: link,
+      local_addr: local_addr,
+      remote_addr: remote_addr
+    } do
+      {opening_socket, opening_task} = start_pending_blocking_connect()
+
+      assert_callback_upgrade(opening_socket)
+
+      Task.shutdown(opening_task, :brutal_kill)
+      Process.unlink(opening_socket)
+      stop_socket(opening_socket)
+
+      socket = establish_connection(link, local_addr, remote_addr)
+      on_exit(fn -> stop_socket(socket) end)
+
+      assert_callback_upgrade(socket)
+
+      assert Tricep.close(socket) == :ok
+      assert_receive {:dummy_link_packet, ^link, _fin_packet}, 1_000
+      assert {:fin_wait_1, _state} = :sys.get_state(socket)
+
+      assert_callback_upgrade(socket)
+    end
   end
 
   describe "connect/2" do
@@ -5119,6 +5147,8 @@ defmodule Tricep.SocketTest do
       send_task = Task.async(fn -> Tricep.send(socket, "blocked", :infinity) end)
       wait_for_send_waiters(socket)
 
+      assert {:established, %{persist_timer_active: true}} = :sys.get_state(socket)
+
       rst_segment =
         Tcp.build_segment(
           {{local_addr, @port}, {remote_addr, src_port}},
@@ -5132,6 +5162,43 @@ defmodule Tricep.SocketTest do
 
       assert Task.await(send_task, 1000) == {:error, :econnreset}
       {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+
+      # The first persist timer is one second. It must not kill the closed
+      # socket (or its linked owner) if cancellation raced with the reset.
+      Process.sleep(1_100)
+      assert Process.alive?(socket)
+      assert Process.alive?(self())
+    end
+
+    test "stray persist probes are absorbed by root and closing callbacks" do
+      assert :keep_state_and_data =
+               Tricep.Socket.handle_event(
+                 {:timeout, :persist},
+                 :persist_probe,
+                 :closed,
+                 %{socket_opts: %{}}
+               )
+
+      state = %Tricep.Socket{
+        link: self(),
+        pair: {{<<0::128>>, 0}, {<<1::128>>, 1}},
+        persist_timer_active: true
+      }
+
+      assert {:next_state, :closed, %{socket_opts: %{}}, actions} =
+               Tricep.Socket.synchronized_rejection(state, :acceptable_reset, :close)
+
+      assert {{:timeout, :persist}, :cancel} in actions
+
+      for state_name <- [:fin_wait_2, :closing, :last_ack, :time_wait] do
+        assert :keep_state_and_data =
+                 Closing.handle_event(
+                   {:timeout, :persist},
+                   :persist_probe,
+                   state_name,
+                   state
+                 )
+      end
     end
 
     test "RST cancels timed send waiters", %{
@@ -10728,6 +10795,18 @@ defmodule Tricep.SocketTest do
     socket
   end
 
+  defp assert_callback_upgrade(socket) do
+    assert :ok = :sys.suspend(socket)
+
+    try do
+      assert :ok = :sys.change_code(socket, Tricep.Socket, :old, [])
+    after
+      assert :ok = :sys.resume(socket)
+    end
+
+    assert {:status, ^socket, {:module, :gen_statem}, _status} = :sys.get_status(socket)
+  end
+
   defp reconnect_socket(socket, link, local_addr, remote_addr, server_sequence) do
     task =
       Task.async(fn ->
@@ -11262,6 +11341,34 @@ defmodule Tricep.SocketTest do
   end
 
   describe "connect with :nowait edge cases" do
+    test "hard ICMPv6 failure notifies and returns its errno on retry", %{
+      link: link
+    } do
+      {:ok, socket} = Tricep.open(:inet6, :stream, :tcp)
+
+      {:select, {:select_info, :connect, ref}} =
+        Tricep.connect(socket, %{family: :inet6, addr: @local_addr_str, port: @port}, :nowait)
+
+      assert_receive {:dummy_link_packet, ^link, syn_packet}, 1000
+      <<_ip_header::binary-size(40), syn_segment::binary>> = syn_packet
+      %{seq: sequence} = Tcp.parse_segment(syn_segment)
+
+      send(socket, {:icmpv6_error, {:hard, :eacces}, %{seq: sequence, syn?: true}})
+
+      assert_receive {:"$socket", ^socket, :select, ^ref}, 1000
+      assert {{:connect_failed, _selects, :eacces}, %{socket_opts: %{}}} = :sys.get_state(socket)
+
+      # This response is handled only by Socket's root callback, so the retry
+      # also proves the active-open callback switched to its destination owner.
+      assert Tricep.connect(
+               socket,
+               %{family: :inet6, addr: @local_addr_str, port: @port},
+               :nowait
+             ) == {:error, :eacces}
+
+      assert {:closed, %{socket_opts: %{}}} = :sys.get_state(socket)
+    end
+
     test "RST during :nowait connect notifies and returns econnrefused on retry", %{
       link: link,
       local_addr: local_addr,
