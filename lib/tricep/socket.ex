@@ -258,8 +258,13 @@ defmodule Tricep.Socket do
     # Per-connection RFC 5961 challenge-ACK accounting. The socket owns the
     # limiter because it owns the connection's receive path and TCB.
     field :challenge_ack_limiter, ChallengeAckLimiter.t(), default: ChallengeAckLimiter.new()
-    # The passive connection supervisor owns this socket until accept claims it.
+    # The passive connection supervisor owns this socket until its local
+    # accept claim transfers it to a caller.
     field :passive_owner, pid() | nil, default: nil
+    # A token-scoped prepare marks this socket claimable while keeping the
+    # supervisor as owner. A later local claim can then detach it without
+    # waiting on this peer-fed state machine.
+    field :passive_handoff, reference() | {:claimed, reference()} | nil, default: nil
   end
 
   # TIME_WAIT duration (2*MSL - using short value for TUN-based stack)
@@ -542,6 +547,66 @@ defmodule Tricep.Socket do
   end
 
   # --- Passive open: SYN_RECEIVED child socket ---
+
+  # The connection supervisor drives an asynchronous prepare. The child stays
+  # linked and owner-managed until a later supervisor-local accept claim, so a
+  # peer RST cannot race a late acknowledgement into an orphaned socket.
+  def handle_event(
+        :info,
+        {:passive_handoff_prepare, owner, id},
+        _state_name,
+        %__MODULE__{passive_owner: owner, passive_handoff: nil} = state
+      )
+      when is_pid(owner) and is_reference(id) do
+    send(owner, {:passive_handoff_prepared, self(), owner, id})
+    {:keep_state, %{state | passive_handoff: {:claimed, id}}}
+  end
+
+  def handle_event(
+        :info,
+        {:passive_handoff_prepare, owner, id},
+        _state_name,
+        %__MODULE__{passive_owner: owner, passive_handoff: {:claimed, id}}
+      )
+      when is_pid(owner) and is_reference(id) do
+    send(owner, {:passive_handoff_prepared, self(), owner, id})
+    :keep_state_and_data
+  end
+
+  def handle_event(
+        :info,
+        {:passive_handoff_prepare, owner, id},
+        _state_name,
+        %__MODULE__{}
+      )
+      when is_pid(owner) and is_reference(id) do
+    send(owner, {:passive_handoff_rejected, self(), owner, id})
+    :keep_state_and_data
+  end
+
+  def handle_event(
+        :info,
+        {:passive_handoff_cancel, owner, id},
+        _state_name,
+        %__MODULE__{passive_owner: owner, passive_handoff: {:claimed, id}} = state
+      )
+      when is_pid(owner) and is_reference(id) do
+    {:keep_state, %{state | passive_handoff: nil}}
+  end
+
+  # The supervisor's local claim map is the accept linearization point. This
+  # cleanup message is intentionally fire-and-forget: it does not participate
+  # in claiming, never delays accept, and merely stops pre-accept failure
+  # notifications after the supervisor has detached the child.
+  def handle_event(
+        :info,
+        {:passive_handoff_claimed, owner, id},
+        _state_name,
+        %__MODULE__{passive_owner: owner, passive_handoff: {:claimed, id}} = state
+      )
+      when is_pid(owner) and is_reference(id) do
+    {:keep_state, %{state | passive_owner: nil, passive_handoff: nil}}
+  end
 
   def handle_event(:info, :send_syn_ack, :syn_received, %__MODULE__{} = state) do
     send_syn_ack(state)
@@ -2225,6 +2290,22 @@ defmodule Tricep.Socket do
 
   defp synchronized_rejection(_state, :malformed, _reset), do: :keep_state_and_data
 
+  defp synchronized_rejection(
+         %__MODULE__{passive_owner: owner, passive_handoff: nil} = state,
+         :acceptable_reset,
+         _reset
+       )
+       when is_pid(owner) do
+    # A queued child has not prepared for an accept claim yet. A peer reset
+    # therefore terminates it and removes the queued entry instead of leaving
+    # a closed socket for a later accept/2 call. Once prepare has marked it
+    # claimed, the generic reset path keeps a live closed socket so a local
+    # claim can never hand the caller a dead pid.
+    reset_state(state)
+    notify_passive_owner(state, :passive_failed)
+    {:stop, :normal}
+  end
+
   defp synchronized_rejection(state, :acceptable_reset, :connection) do
     reset_connection(state, :econnreset)
   end
@@ -2329,8 +2410,7 @@ defmodule Tricep.Socket do
         | tcb: Tcb.acknowledge(state.tcb, acknowledgment, window),
           syn_retransmit_count: 0,
           rto_ms: @initial_rto_ms,
-          soft_error: nil,
-          passive_owner: nil
+          soft_error: nil
       }
       |> open_receive_window()
 
