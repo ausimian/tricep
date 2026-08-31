@@ -78,6 +78,16 @@ defmodule Tricep do
         clamped, so callers retain their chosen memory bound.
       * `:fin_wait_2_timeout_ms` - Milliseconds to wait in `FIN_WAIT_2` for the peer FIN
         before closing locally (default: 60000)
+      * `:send_buffer_size` - Strict positive byte high watermark for application data
+        admitted to transmission (unsent and unacknowledged; default: 65535). A write
+        larger than this returns `{:error, :emsgsize}`.
+      * `:send_buffer_low_watermark` - Non-negative byte threshold below
+        `:send_buffer_size` at which blocked senders and send selectors are woken
+        (default: half the high watermark).
+      * `:send_waiter_limit` - Strict positive bound on retained blocking and `:nowait`
+        send registrations (default: 64). A blocking waiter retains its complete payload,
+        so total socket transmit retention can exceed `:send_buffer_size` by at most this
+        many individual writes, each no larger than the high watermark.
       * `:challenge_ack_limit` - When supplied, must be a positive maximum RFC 5961 challenge
         ACK count per socket interval; omitted defaults to 10
       * `:challenge_ack_interval_ms` - When supplied, must be a positive RFC 5961 challenge-ACK
@@ -87,7 +97,7 @@ defmodule Tricep do
 
     * `{:ok, socket}` - A socket pid on success
     * `{:error, :unsupported}` - If the domain/type/protocol combination is not supported
-    * `{:error, :einval}` - If a supplied challenge-ACK option is not a positive integer
+    * `{:error, :einval}` - If a supplied strict challenge-ACK or send-capacity option is invalid
 
   ## Lifecycle
 
@@ -141,6 +151,15 @@ defmodule Tricep do
         clamped, so callers retain their chosen memory bound.
       * `:fin_wait_2_timeout_ms` - Milliseconds to wait in `FIN_WAIT_2` for the peer FIN
         before closing locally (default: 60000)
+      * `:send_buffer_size` - Strict positive byte high watermark for application data
+        admitted to transmission (unsent and unacknowledged; default: 65535). Oversized
+        writes return `{:error, :emsgsize}`.
+      * `:send_buffer_low_watermark` - Non-negative byte threshold below the high
+        watermark which wakes blocked senders and send selectors (default: half high).
+      * `:send_waiter_limit` - Strict positive maximum for retained blocking and
+        `:nowait` send registrations (default: 64). A blocking waiter retains its
+        complete payload, so total socket transmit retention can exceed the high watermark
+        by at most this many individual writes, each no larger than the high watermark.
       * `:challenge_ack_limit` - When supplied, must be a positive maximum RFC 5961 challenge
         ACK count per socket interval; omitted defaults to 10
       * `:challenge_ack_interval_ms` - When supplied, must be a positive RFC 5961 challenge-ACK
@@ -150,7 +169,7 @@ defmodule Tricep do
 
     * `{:ok, socket}` - A socket pid on success
     * `{:error, :unsupported}` - If the domain/type/protocol combination is not supported
-    * `{:error, :einval}` - If a supplied challenge-ACK option is not a positive integer
+    * `{:error, :einval}` - If a supplied strict challenge-ACK or send-capacity option is invalid
 
   ## Lifecycle
 
@@ -335,14 +354,24 @@ defmodule Tricep do
     * `:ok` - Data queued for transmission
     * `{:error, :enotconn}` - Socket is not connected
     * `{:error, :epipe}` - Socket is closing or closed
-    * `{:error, :timeout}` - Timed out waiting for send window (with integer timeout)
-    * `{:select, select_info}` - Send window exhausted (with `:nowait` timeout)
+    * `{:error, :timeout}` - Timed out waiting for send capacity (with integer timeout)
+    * `{:error, :emsgsize}` - The complete write exceeds `:send_buffer_size`
+    * `{:error, :enobufs}` - The bounded send-registration set is full, or
+      a selected link remained saturated through its bounded retry budget
+    * `{:error, :enetdown}` - The selected link terminated and the connection was reset
+    * `{:select, select_info}` - Send capacity is unavailable (with `:nowait` timeout)
 
   ## Flow Control
 
-  If the remote peer's receive window is full, the send operation will block
-  (or return a select tuple with `:nowait`) until the window opens. ACKs from
-  the peer advance the window and allow more data to be sent.
+  Sends are all-or-error: Tricep never accepts only a prefix of `data`. If the
+  remote peer's receive window or the local transmit high watermark is full,
+  the send operation blocks (or returns a select tuple with `:nowait`) until
+  ACK progress drains below the low watermark. Blocking writes retain their
+  complete payload outside the high watermark, bounded by `:send_waiter_limit`.
+  Dead callers are removed from retained send registrations automatically. If
+  the selected link is temporarily saturated, Tricep retries admission with a
+  bounded exponential delay without consuming the TCP retransmission budget;
+  exhaustion resets the connection with `:enobufs`.
 
   ## Examples
 

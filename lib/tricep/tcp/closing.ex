@@ -113,6 +113,29 @@ defmodule Tricep.Tcp.Closing do
     Socket.flush_send_buffer(state)
   end
 
+  def handle_event({:timeout, :link_retry}, :link_retry, :close_wait, %Socket{} = state) do
+    Socket.retry_link_send(state)
+  end
+
+  def handle_event(
+        {:timeout, :link_retry},
+        {:retry, :flush},
+        :close_wait,
+        %Socket{} = state
+      ) do
+    Socket.retry_link_send(state)
+  end
+
+  def handle_event(
+        {:timeout, :link_retry},
+        {:retry, :retransmit},
+        state_name,
+        %Socket{} = state
+      )
+      when state_name in [:close_wait, :fin_wait_1, :fin_wait_2, :closing, :last_ack] do
+    Socket.retry_link_retransmit(state) |> transition()
+  end
+
   def handle_event(:internal, :send_pending_fin, :close_wait, %Socket{} = state) do
     Socket.send_pending_fin(state, :last_ack)
   end

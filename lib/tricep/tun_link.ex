@@ -7,10 +7,11 @@ defmodule Tricep.TunLink do
 
   require Logger
 
-  @read_tun_again {:keep_state_and_data, {:next_event, :internal, :read_tun}}
   @fragment_timeout_ms 60_000
   @max_fragment_buffers 64
   @max_fragment_reassembly_size 65_535
+  @default_tx_queue_packets 256
+  @default_tx_queue_bytes 1_048_576
 
   def child_spec(opts) do
     %{
@@ -33,6 +34,17 @@ defmodule Tricep.TunLink do
     field :name, String.t()
     field :mtu, non_neg_integer() | nil, default: nil
     field :fragment_buffers, map(), default: %{}
+    # Packets are queued per originating socket and scheduled round-robin so
+    # one busy TCP connection cannot monopolise a stalled TUN writer.
+    field :tx_queues, map(), default: %{}
+    field :tx_order, :queue.queue(pid()), default: :queue.new()
+    field :tx_queued_packets, non_neg_integer(), default: 0
+    field :tx_queued_bytes, non_neg_integer(), default: 0
+    field :tx_queue_packets_limit, pos_integer(), default: @default_tx_queue_packets
+    field :tx_queue_bytes_limit, pos_integer(), default: @default_tx_queue_bytes
+    # The packet currently handed to Tundra remains accounted until it has
+    # accepted the write, including while the device has returned a select.
+    field :pending_tx, {pid(), binary()} | nil, default: nil
   end
 
   @impl true
@@ -51,7 +63,9 @@ defmodule Tricep.TunLink do
          :ok <- Tricep.Application.register_link(dstaddr_bin, {ifaddr_bin, mtu}),
          :ok <- register_prefix_route(dstaddr_bin, ifaddr_bin, mtu, opts) do
       state = %__MODULE__{tun: tun, mtu: mtu, name: name}
-      {:ok, :ready, state, {:next_event, :internal, :read_tun}}
+
+      schedule_read_tun()
+      {:ok, :ready, state}
     end
   end
 
@@ -85,7 +99,7 @@ defmodule Tricep.TunLink do
   end
 
   @impl true
-  def handle_event(:internal, :read_tun, _, %__MODULE__{} = state) do
+  def handle_event(:info, :read_tun, _, %__MODULE__{} = state) do
     case Tundra.recv(state.tun, state.mtu, :nowait) do
       {:ok, <<>>} ->
         # Empty read on macOS means socket was closed
@@ -99,31 +113,148 @@ defmodule Tricep.TunLink do
     end
   end
 
-  def handle_event(:info, {:send, packet}, :ready, %__MODULE__{} = state) do
-    case Tundra.send(state.tun, packet, :nowait) do
-      :ok ->
+  def handle_event({:call, from}, {:send, packet}, :ready, %__MODULE__{} = state) do
+    enqueue_tx(state, elem(from, 0), packet, from, [{:next_event, :internal, :drain_tx}])
+  end
+
+  def handle_event({:call, from}, {:send, packet}, {:waiting, _handle}, %__MODULE__{} = state) do
+    enqueue_tx(state, elem(from, 0), packet, from, [])
+  end
+
+  def handle_event(:internal, :drain_tx, :ready, %__MODULE__{pending_tx: nil} = state) do
+    case dequeue_tx(state) do
+      :empty ->
         :keep_state_and_data
 
-      {:select, {:select_info, :send, handle}} ->
-        {:next_state, {:waiting, handle}, state, :postpone}
+      {{source, packet}, state} ->
+        {:keep_state, %{state | pending_tx: {source, packet}},
+         {:next_event, :internal, :send_pending_tx}}
     end
   end
 
-  # Postpone send messages while waiting for TUN device to become ready
-  def handle_event(:info, {:send, _packet}, {:waiting, _handle}, _state) do
-    {:keep_state_and_data, :postpone}
+  def handle_event(:internal, :drain_tx, :ready, %__MODULE__{}), do: :keep_state_and_data
+
+  def handle_event(
+        :internal,
+        :send_pending_tx,
+        :ready,
+        %__MODULE__{pending_tx: {_source, packet}} = state
+      ) do
+    case Tundra.send(state.tun, packet, :nowait) do
+      :ok ->
+        {:keep_state, complete_pending_tx(state), {:next_event, :internal, :drain_tx}}
+
+      {:select, {:select_info, :send, handle}} ->
+        {:next_state, {:waiting, handle}, state}
+    end
   end
 
-  def handle_event(:info, {:"$socket", _tun, :select, handle}, {:waiting, handle}, state) do
-    {:next_state, :ready, state, {:next_event, :internal, :read_tun}}
+  def handle_event(
+        :info,
+        {:"$socket", _tun, :select, handle},
+        {:waiting, handle},
+        %__MODULE__{} = state
+      ) do
+    {:next_state, :ready, state, {:next_event, :internal, :send_pending_tx}}
   end
 
   def handle_event(:info, {:"$socket", tun, :select, _}, _, %__MODULE__{tun: tun}) do
-    {:keep_state_and_data, {:next_event, :internal, :read_tun}}
+    schedule_read_tun()
+  end
+
+  # `Tricep.Link.send/2` normally makes a synchronous admission call. A packet generated
+  # by this link while it is handling inbound traffic uses this self-message
+  # to avoid a synchronous self-call; it is admitted through the same queue.
+  def handle_event(:info, {:send, packet}, :ready, %__MODULE__{} = state) do
+    enqueue_unsolicited_tx(state, packet, [{:next_event, :internal, :drain_tx}])
+  end
+
+  def handle_event(:info, {:send, packet}, {:waiting, _handle}, %__MODULE__{} = state) do
+    enqueue_unsolicited_tx(state, packet, [])
   end
 
   def handle_event(:info, {:stop, reason}, _, %__MODULE__{} = state) do
     {:stop, reason, state}
+  end
+
+  defp enqueue_tx(state, source, packet, from, follow_up_actions) do
+    case enqueue_tx_packet(state, source, packet) do
+      {:ok, state} ->
+        {:keep_state, state, [{:reply, from, :ok} | follow_up_actions]}
+
+      {:error, reason} ->
+        {:keep_state_and_data, {:reply, from, {:error, reason}}}
+    end
+  end
+
+  defp enqueue_unsolicited_tx(state, packet, follow_up_actions) do
+    case enqueue_tx_packet(state, self(), packet) do
+      {:ok, state} ->
+        {:keep_state, state, follow_up_actions}
+
+      {:error, reason} ->
+        Logger.warning(
+          "Dropping link-originated packet because bounded transmit queue is #{reason}"
+        )
+
+        :keep_state_and_data
+    end
+  end
+
+  defp enqueue_tx_packet(state, source, packet) do
+    packet_size = byte_size(packet)
+
+    cond do
+      packet_size > state.tx_queue_bytes_limit -> {:error, :emsgsize}
+      state.tx_queued_packets >= state.tx_queue_packets_limit -> {:error, :eagain}
+      state.tx_queued_bytes + packet_size > state.tx_queue_bytes_limit -> {:error, :eagain}
+      true -> {:ok, put_tx_packet(state, source, packet)}
+    end
+  end
+
+  defp put_tx_packet(state, source, packet) do
+    source_queue = Map.get(state.tx_queues, source, :queue.new())
+    first_for_source? = :queue.is_empty(source_queue)
+    tx_queues = Map.put(state.tx_queues, source, :queue.in(packet, source_queue))
+    tx_order = if first_for_source?, do: :queue.in(source, state.tx_order), else: state.tx_order
+
+    %{
+      state
+      | tx_queues: tx_queues,
+        tx_order: tx_order,
+        tx_queued_packets: state.tx_queued_packets + 1,
+        tx_queued_bytes: state.tx_queued_bytes + byte_size(packet)
+    }
+  end
+
+  defp dequeue_tx(%__MODULE__{tx_order: order} = state) do
+    case :queue.out(order) do
+      {:empty, _} ->
+        :empty
+
+      {{:value, source}, remaining_order} ->
+        source_queue = Map.fetch!(state.tx_queues, source)
+        {{:value, packet}, remaining_source_queue} = :queue.out(source_queue)
+
+        {tx_queues, tx_order} =
+          if :queue.is_empty(remaining_source_queue) do
+            {Map.delete(state.tx_queues, source), remaining_order}
+          else
+            {Map.put(state.tx_queues, source, remaining_source_queue),
+             :queue.in(source, remaining_order)}
+          end
+
+        {{source, packet}, %{state | tx_queues: tx_queues, tx_order: tx_order}}
+    end
+  end
+
+  defp complete_pending_tx(%__MODULE__{pending_tx: {_source, packet}} = state) do
+    %{
+      state
+      | pending_tx: nil,
+        tx_queued_packets: state.tx_queued_packets - 1,
+        tx_queued_bytes: state.tx_queued_bytes - byte_size(packet)
+    }
   end
 
   @doc false
@@ -133,7 +264,7 @@ defmodule Tricep.TunLink do
         handle_ipv6_payload(next_header, payload, src, dst, state)
 
       _ ->
-        @read_tun_again
+        schedule_read_tun()
     end
   end
 
@@ -146,7 +277,7 @@ defmodule Tricep.TunLink do
     with {:ok, protocol, data} <- unwrap_ipv6_payload(next_header, payload) do
       handle_ipv6_packet(protocol, data, src, dst, state)
     else
-      _ -> @read_tun_again
+      _ -> schedule_read_tun()
     end
   end
 
@@ -165,10 +296,10 @@ defmodule Tricep.TunLink do
         handle_icmpv6(data, src, dst, state)
 
       59 ->
-        @read_tun_again
+        schedule_read_tun()
 
       _ ->
-        @read_tun_again
+        schedule_read_tun()
     end
   end
 
@@ -319,7 +450,7 @@ defmodule Tricep.TunLink do
     # credo:disable-for-next-line Credo.Check.Readability.WithSingleClause
     with {:ok, protocol, data} <- unwrap_ipv6_payload(next_header, payload) do
       handle_ipv6_packet(protocol, data, src, dst, state)
-      read_tun_again(state)
+      {:keep_state, state}
     else
       _ -> read_tun_again(state)
     end
@@ -352,18 +483,27 @@ defmodule Tricep.TunLink do
     %{state | fragment_buffers: Map.delete(state.fragment_buffers, key)}
   end
 
+  # Queue the next read as an ordinary mailbox message. This yields after one
+  # packet: a synchronous Link.send/2 call already waiting in the mailbox is
+  # handled before another ready read can schedule itself.
+  defp schedule_read_tun do
+    send(self(), :read_tun)
+    :keep_state_and_data
+  end
+
   defp read_tun_again(%__MODULE__{} = state) do
-    {:keep_state, state, {:next_event, :internal, :read_tun}}
+    schedule_read_tun()
+    {:keep_state, state}
   end
 
   defp handle_tcp(data, src, dst, _state) do
     Tricep.Socket.handle_packet(src, dst, data)
-    @read_tun_again
+    schedule_read_tun()
   end
 
   defp handle_udp(data, _src, _dst, _state) do
     Logger.warning("Ignoring UDP packet (#{byte_size(data)} bytes)")
-    @read_tun_again
+    schedule_read_tun()
   end
 
   defp handle_icmpv6(data, src, dst, state) do
@@ -373,15 +513,15 @@ defmodule Tricep.TunLink do
           handle_icmpv6_error(event, quoted_packet, src, dst, state)
 
         :ignore ->
-          @read_tun_again
+          schedule_read_tun()
 
         {:error, reason} ->
           Logger.debug("Ignoring malformed ICMPv6 packet: #{reason}")
-          @read_tun_again
+          schedule_read_tun()
       end
     else
       Logger.debug("Ignoring ICMPv6 packet with invalid checksum")
-      @read_tun_again
+      schedule_read_tun()
     end
   end
 
@@ -442,7 +582,7 @@ defmodule Tricep.TunLink do
         Logger.debug("Ignoring ICMPv6 error without quoted TCP packet")
     end
 
-    @read_tun_again
+    schedule_read_tun()
   end
 
   defp log_icmpv6_error(

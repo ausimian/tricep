@@ -185,6 +185,17 @@ defmodule Tricep.Socket do
   # the fixed 20-byte TCP header so Ip.wrap/4 can always encode data segments.
   @maximum_ipv6_tcp_mss 65_535 - 20
   @default_recv_buffer_size 65_535
+  # Keep application data admitted to transmission below this watermark. The
+  # count includes unsent chunks and retransmission payloads. Blocked calls
+  # retain their complete payload separately and are bounded by a count cap.
+  # A send is deliberately all-or-error: accepting a prefix would make retry
+  # semantics surprising and duplicate application bytes on a stream.
+  @default_send_buffer_size 65_535
+  @default_send_buffer_low_watermark div(@default_send_buffer_size, 2)
+  @default_send_waiter_limit 64
+  @initial_link_retry_ms 10
+  @max_link_retry_ms 1_000
+  @link_stall_timeout_ms 5_000
   @max_window Tcp.max_window()
   @max_window_scale 14
   @max_scaled_tcp_window @max_window <<< @max_window_scale
@@ -205,6 +216,13 @@ defmodule Tricep.Socket do
   typedstruct enforce: true do
     field :pair, {addr_port(), addr_port()}
     field :link, pid()
+    field :link_monitor, reference() | nil, default: nil
+    # Link admission uses one monotonic deadline for the connection. A named
+    # retry timer owns the next send attempt, so unrelated writes and ACKs do
+    # not turn a busy link into a burst of duplicate admission attempts.
+    field :link_stall_deadline_ms, integer() | nil, default: nil
+    field :link_retry_path, term() | nil, default: nil
+    field :link_retry_ms, pos_integer(), default: @initial_link_retry_ms
     # Immutable socket options survive a TCP incarnation so a closed socket
     # can reconnect with the same configuration and a fresh TCB.
     field :socket_opts, map() | keyword(), default: %{}
@@ -213,6 +231,14 @@ defmodule Tricep.Socket do
     field :tcb, Tcb.t(), default: %Tcb{}
     # Buffers for data transfer
     field :send_buffer, DataBuffer.t(), default: DataBuffer.new()
+    field :send_buffer_size, pos_integer(), default: @default_send_buffer_size
+
+    field :send_buffer_low_watermark, non_neg_integer(),
+      default: @default_send_buffer_low_watermark
+
+    # A waiting call owns its complete binary. Its data is outside the
+    # transmit high watermark, so cap registrations to bound retained memory.
+    field :send_waiter_limit, pos_integer(), default: @default_send_waiter_limit
     field :recv_buffer, binary(), default: <<>>
     field :out_of_order_segments, list(), default: []
     # Count chunks evicted by the hard receive-reassembly cap during this TCP
@@ -247,7 +273,8 @@ defmodule Tricep.Socket do
     field :connect_selects, [{pid(), reference()}], default: []
     # For :nowait recv - [{caller_pid, ref, length}]
     field :recv_selects, [{pid(), reference(), non_neg_integer()}], default: []
-    # For send backpressure - [{caller_pid, ref} | {from, ref, data, timer_ref}]
+    # Bounded send backpressure registrations.  Every entry has a monitor so
+    # an abandoned caller releases its retained payload promptly.
     field :send_waiters, list(), default: []
     # Track if read side has been shutdown
     field :read_shutdown, boolean(), default: false
@@ -427,6 +454,23 @@ defmodule Tricep.Socket do
     :keep_state_and_data
   end
 
+  def handle_event({:timeout, :link_retry}, :link_retry, _state, _state_data) do
+    :keep_state_and_data
+  end
+
+  def handle_event({:timeout, :link_retry}, {:retry, _path}, _state, _state_data) do
+    :keep_state_and_data
+  end
+
+  def handle_event(
+        :info,
+        {:DOWN, monitor_ref, :process, _pid, _reason},
+        state_name,
+        %__MODULE__{} = state
+      ) do
+    handle_process_down(state_name, state, monitor_ref)
+  end
+
   def handle_event(:info, _message, _state, _state_data) do
     :keep_state_and_data
   end
@@ -529,49 +573,209 @@ defmodule Tricep.Socket do
 
   def handle_send_call(%__MODULE__{} = state, from, data, timeout) do
     available = Tcb.send_window_available(state.tcb)
+    data_size = byte_size(data)
 
     cond do
-      available > 0 ->
+      data_size > state.send_buffer_size ->
+        {:keep_state_and_data, {:reply, from, {:error, :emsgsize}}}
+
+      available > 0 and send_admissible?(state, data_size) ->
         new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
         {new_state, actions} = sync_persist_timer(new_state, [{:reply, from, :ok}])
         {:keep_state, new_state, actions ++ [{:next_event, :internal, :flush_send_buffer}]}
 
       timeout == :nowait ->
-        ref = make_ref()
-        {caller_pid, _} = from
-        new_state = %{state | send_waiters: state.send_waiters ++ [{caller_pid, ref}]}
-        {:keep_state, new_state, {:reply, from, {:select, {:select_info, :send, ref}}}}
+        register_send_select(state, from)
 
       timeout == :infinity ->
-        ref = make_ref()
-        new_state = %{state | send_waiters: state.send_waiters ++ [{from, ref, data, nil}]}
-        {new_state, actions} = sync_persist_timer(new_state, [])
-        {:keep_state, new_state, actions}
+        wait_for_send_capacity(state, from, data, nil)
 
       is_integer(timeout) ->
-        ref = make_ref()
         timer_ref = make_ref()
-        new_state = %{state | send_waiters: state.send_waiters ++ [{from, ref, data, timer_ref}]}
-
-        {new_state, actions} =
-          sync_persist_timer(new_state, [
-            {{:timeout, timer_ref}, timeout, {:send_timeout, timer_ref}}
-          ])
-
-        {:keep_state, new_state, actions}
+        wait_for_send_capacity(state, from, data, timer_ref, timeout)
     end
   end
 
   def handle_send_timeout(%__MODULE__{} = state, timer_ref) do
-    case List.keytake(state.send_waiters, timer_ref, 3) do
-      {{from, _ref, _data, ^timer_ref}, rest} ->
+    case take_send_waiter_by_timer(state.send_waiters, timer_ref) do
+      {{:wait, from, _data, ^timer_ref, monitor_ref}, rest} ->
+        demonitor_send_waiter(monitor_ref)
         new_state = %{state | send_waiters: rest}
-        {new_state, actions} = sync_persist_timer(new_state, [{:reply, from, {:error, :timeout}}])
+
+        {new_state, actions} =
+          sync_persist_timer(new_state, [{:reply, from, {:error, :timeout}}])
+
         {:keep_state, new_state, actions}
 
       nil ->
         :keep_state_and_data
     end
+  end
+
+  @doc false
+  def handle_process_down(
+        {:syn_sent, from},
+        %__MODULE__{link_monitor: monitor_ref} = state,
+        monitor_ref
+      )
+      when is_tuple(from) and is_reference(monitor_ref) do
+    reset_state(state)
+
+    {:next_state, :closed, closed_data(state),
+     [
+       {{:timeout, :rto}, :cancel},
+       {{:timeout, :link_retry}, :cancel},
+       {{:timeout, :connect_timeout}, :cancel},
+       {:reply, from, {:error, :enetdown}},
+       {:change_callback_module, __MODULE__}
+     ]}
+  end
+
+  def handle_process_down(
+        {:syn_sent, :nowait},
+        %__MODULE__{link_monitor: monitor_ref} = state,
+        monitor_ref
+      )
+      when is_reference(monitor_ref) do
+    {state_name, state_data} = nowait_connect_failure(state, :enetdown)
+
+    {:next_state, state_name, state_data,
+     [
+       {{:timeout, :rto}, :cancel},
+       {{:timeout, :link_retry}, :cancel},
+       {:change_callback_module, __MODULE__}
+     ]}
+  end
+
+  def handle_process_down(
+        :syn_received,
+        %__MODULE__{link_monitor: monitor_ref} = state,
+        monitor_ref
+      )
+      when is_reference(monitor_ref) do
+    reset_state(state)
+    notify_passive_owner(state, {:passive_failed, :enetdown})
+    {:stop, :normal}
+  end
+
+  def handle_process_down(
+        state_name,
+        %__MODULE__{link_monitor: monitor_ref} = state,
+        monitor_ref
+      )
+      when is_reference(monitor_ref) do
+    reset_connection(state, :enetdown, link_down_timer_actions(state_name))
+    |> switch_callback_on_terminal_state()
+  end
+
+  def handle_process_down(_state_name, %__MODULE__{} = state, monitor_ref) do
+    handle_send_waiter_down(state, monitor_ref)
+  end
+
+  defp link_down_timer_actions(:fin_wait_2), do: [{{:timeout, :fin_wait_2}, :cancel}]
+  defp link_down_timer_actions(:time_wait), do: [{{:timeout, :time_wait}, :cancel}]
+  defp link_down_timer_actions(_state_name), do: []
+
+  @doc false
+  def handle_send_waiter_down(%__MODULE__{} = state, monitor_ref) do
+    case take_send_waiter_by_monitor(state.send_waiters, monitor_ref) do
+      {{:wait, _from, _data, timer_ref, ^monitor_ref}, rest} ->
+        new_state = %{state | send_waiters: rest}
+        cancel_actions = if timer_ref, do: [{{:timeout, timer_ref}, :cancel}], else: []
+        {new_state, actions} = sync_persist_timer(new_state, cancel_actions)
+        {:keep_state, new_state, actions}
+
+      {{:select, _caller_pid, _ref, ^monitor_ref}, rest} ->
+        {:keep_state, %{state | send_waiters: rest}}
+
+      nil ->
+        :keep_state_and_data
+    end
+  end
+
+  defp register_send_select(%__MODULE__{} = state, from) do
+    if send_waiter_limit_reached?(state) do
+      {:keep_state_and_data, {:reply, from, {:error, :enobufs}}}
+    else
+      ref = make_ref()
+      {caller_pid, _} = from
+      monitor_ref = Process.monitor(caller_pid)
+      waiter = {:select, caller_pid, ref, monitor_ref}
+      new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
+      {:keep_state, new_state, {:reply, from, {:select, {:select_info, :send, ref}}}}
+    end
+  end
+
+  defp wait_for_send_capacity(%__MODULE__{} = state, from, data, timer_ref, timeout \\ nil) do
+    if send_waiter_limit_reached?(state) do
+      {:keep_state_and_data, {:reply, from, {:error, :enobufs}}}
+    else
+      {caller_pid, _} = from
+      monitor_ref = Process.monitor(caller_pid)
+      waiter = {:wait, from, data, timer_ref, monitor_ref}
+      new_state = %{state | send_waiters: state.send_waiters ++ [waiter]}
+
+      actions =
+        if timeout do
+          [{{:timeout, timer_ref}, timeout, {:send_timeout, timer_ref}}]
+        else
+          []
+        end
+
+      {new_state, actions} = sync_persist_timer(new_state, actions)
+      {:keep_state, new_state, actions}
+    end
+  end
+
+  defp send_admissible?(%__MODULE__{} = state, data_size) do
+    Tcb.send_window_available(state.tcb) > 0 and
+      not has_blocking_send_waiter?(state.send_waiters) and
+      send_owned_bytes(state) + data_size <= state.send_buffer_size
+  end
+
+  defp send_waiter_limit_reached?(%__MODULE__{} = state) do
+    length(state.send_waiters) >= state.send_waiter_limit
+  end
+
+  defp send_owned_bytes(%__MODULE__{} = state) do
+    DataBuffer.size(state.send_buffer) + unacked_payload_bytes(state.unacked_segments)
+  end
+
+  defp unacked_payload_bytes(segments) do
+    Enum.reduce(segments, 0, fn
+      {_seq_start, _seq_end, payload, _count}, total when is_binary(payload) ->
+        total + byte_size(payload)
+
+      _segment, total ->
+        total
+    end)
+  end
+
+  defp take_send_waiter_by_timer(waiters, timer_ref) do
+    take_send_waiter(waiters, fn
+      {:wait, _from, _data, ^timer_ref, _monitor_ref} -> true
+      _waiter -> false
+    end)
+  end
+
+  defp take_send_waiter_by_monitor(waiters, monitor_ref) do
+    take_send_waiter(waiters, fn
+      {:wait, _from, _data, _timer_ref, ^monitor_ref} -> true
+      {:select, _caller_pid, _ref, ^monitor_ref} -> true
+      _waiter -> false
+    end)
+  end
+
+  defp take_send_waiter(waiters, predicate) do
+    case Enum.split_while(waiters, fn waiter -> not predicate.(waiter) end) do
+      {_prefix, []} -> nil
+      {prefix, [waiter | rest]} -> {waiter, prefix ++ rest}
+    end
+  end
+
+  defp demonitor_send_waiter(monitor_ref) when is_reference(monitor_ref) do
+    Process.demonitor(monitor_ref, [:flush])
+    :ok
   end
 
   def flush_send_buffer(%__MODULE__{} = state) do
@@ -583,6 +787,24 @@ defmodule Tricep.Socket do
         {:keep_state, state, {:next_event, :internal, :send_pending_fin}}
 
       true ->
+        :keep_state_and_data
+    end
+  end
+
+  @doc false
+  def retry_link_send(%__MODULE__{} = state, retry_path \\ :flush) do
+    case take_link_retry(state, retry_path) do
+      {:retry, state} ->
+        if link_stall_expired?(state) do
+          reset_for_exhausted_link_stall(state) |> switch_callback_on_terminal_state()
+        else
+          # Run the named retry directly. This keeps the deadline scoped to
+          # the retry episode: a retry that finds nothing sendable clears the
+          # episode before returning control to unrelated writes or ACKs.
+          do_flush_send_buffer(state, retry?: true)
+        end
+
+      :stale ->
         :keep_state_and_data
     end
   end
@@ -999,6 +1221,7 @@ defmodule Tricep.Socket do
     %__MODULE__{
       pair: {{dst_addr, dst_port}, {src_addr, src_port}},
       link: link,
+      link_monitor: Process.monitor(link),
       socket_opts: socket_opts,
       tcb: %Tcb{
         iss: iss,
@@ -1018,6 +1241,9 @@ defmodule Tricep.Socket do
         window_scaling_negotiated: window_scaling_negotiated
       },
       recv_buffer_size: recv_buffer_size,
+      send_buffer_size: configured_send_buffer_size(socket_opts),
+      send_buffer_low_watermark: configured_send_buffer_low_watermark(socket_opts),
+      send_waiter_limit: configured_send_waiter_limit(socket_opts),
       rto_ms: @initial_rto_ms,
       soft_error: nil,
       syn_retransmit_count: 0,
@@ -1108,6 +1334,7 @@ defmodule Tricep.Socket do
     %__MODULE__{
       pair: pair,
       link: link,
+      link_monitor: Process.monitor(link),
       socket_opts: socket_opts,
       tcb: %Tcb{
         rcv_mss: local_send_mss(mtu),
@@ -1116,6 +1343,9 @@ defmodule Tricep.Socket do
       },
       soft_error: nil,
       recv_buffer_size: recv_buffer_size,
+      send_buffer_size: configured_send_buffer_size(socket_opts),
+      send_buffer_low_watermark: configured_send_buffer_low_watermark(socket_opts),
+      send_waiter_limit: configured_send_waiter_limit(socket_opts),
       fin_wait_2_timeout_ms: fin_wait_2_timeout_ms(data),
       challenge_ack_limiter: challenge_ack_limiter(data)
     }
@@ -1146,21 +1376,47 @@ defmodule Tricep.Socket do
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
-    :ok = Tricep.Link.send(state.link, packet)
+    Tricep.Link.send(state.link, packet)
   end
 
   def retransmit_syn_ack(%__MODULE__{} = state) do
-    send_syn_ack(state)
+    if link_retry_armed?(state) do
+      {:keep_state, state}
+    else
+      do_retransmit_syn_ack(state)
+    end
+  end
 
-    new_rto = min(state.rto_ms * 2, @max_rto_ms)
+  @doc false
+  def retry_link_syn_ack(%__MODULE__{} = state) do
+    case take_link_retry(state, :syn_ack) do
+      {:retry, state} ->
+        if link_stall_expired?(state),
+          do: link_stall_exhausted(state),
+          else: do_retransmit_syn_ack(state)
 
-    new_state = %{
-      state
-      | syn_retransmit_count: state.syn_retransmit_count + 1,
-        rto_ms: new_rto
-    }
+      :stale ->
+        :keep_state_and_data
+    end
+  end
 
-    {:keep_state, new_state, {{:timeout, :rto}, new_rto, :syn_ack_timeout}}
+  defp do_retransmit_syn_ack(%__MODULE__{} = state) do
+    case send_syn_ack(state) do
+      :ok ->
+        state = clear_link_stall(state)
+        new_rto = min(state.rto_ms * 2, @max_rto_ms)
+
+        new_state = %{
+          state
+          | syn_retransmit_count: state.syn_retransmit_count + 1,
+            rto_ms: new_rto
+        }
+
+        {:keep_state, new_state, {{:timeout, :rto}, new_rto, :syn_ack_timeout}}
+
+      {:error, reason} ->
+        retry_rto_after_link_failure(state, reason, :syn_ack_timeout)
+    end
   end
 
   def notify_passive_owner(
@@ -1179,6 +1435,27 @@ defmodule Tricep.Socket do
   def notify_passive_owner(%__MODULE__{}, _message), do: :ok
 
   def retransmit_syn(state, timeout_event) do
+    if link_retry_armed?(state) do
+      {:keep_state, state}
+    else
+      do_retransmit_syn(state, timeout_event)
+    end
+  end
+
+  @doc false
+  def retry_link_syn(%__MODULE__{} = state, timeout_event) do
+    case take_link_retry(state, {:syn, timeout_event}) do
+      {:retry, state} ->
+        if link_stall_expired?(state),
+          do: link_stall_exhausted(state),
+          else: do_retransmit_syn(state, timeout_event)
+
+      :stale ->
+        :keep_state_and_data
+    end
+  end
+
+  defp do_retransmit_syn(state, timeout_event) do
     {{src_addr, _src_port}, {dst_addr, _dst_port}} = state.pair
 
     tcp_segment =
@@ -1188,52 +1465,93 @@ defmodule Tricep.Socket do
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
-    :ok = Tricep.Link.send(state.link, packet)
 
-    # Exponential backoff
-    new_rto = min(state.rto_ms * 2, @max_rto_ms)
-    new_state = %{state | syn_retransmit_count: state.syn_retransmit_count + 1, rto_ms: new_rto}
+    case Tricep.Link.send(state.link, packet) do
+      :ok ->
+        state = clear_link_stall(state)
+        new_rto = min(state.rto_ms * 2, @max_rto_ms)
 
-    actions = [{{:timeout, :rto}, new_rto, timeout_event}]
-    {:keep_state, new_state, actions}
+        new_state = %{
+          state
+          | syn_retransmit_count: state.syn_retransmit_count + 1,
+            rto_ms: new_rto
+        }
+
+        {:keep_state, new_state, {{:timeout, :rto}, new_rto, timeout_event}}
+
+      {:error, reason} ->
+        retry_rto_after_link_failure(state, reason, timeout_event)
+    end
   end
 
-  def do_retransmit(%__MODULE__{unacked_segments: []} = state) do
+  def do_retransmit(%__MODULE__{} = state) do
+    if link_retry_armed?(state) do
+      # The RTO that delivered this event has fired, but the link-retry timer
+      # owns the sole next send attempt. If that retry cannot send because the
+      # window closes, its non-sending exit re-arms the RTO for these unacked
+      # bytes before it clears the retry episode.
+      {:keep_state, %{state | rto_timer_active: false}}
+    else
+      do_retransmit_segment(state)
+    end
+  end
+
+  @doc false
+  def retry_link_retransmit(%__MODULE__{} = state) do
+    result =
+      case take_link_retry(state, :retransmit) do
+        {:retry, state} ->
+          if link_stall_expired?(state) do
+            reset_for_exhausted_link_stall(state)
+          else
+            do_retransmit_segment(state)
+          end
+
+        :stale ->
+          :keep_state_and_data
+      end
+
+    schedule_deferred_flush_after_retransmit(result)
+  end
+
+  defp do_retransmit_segment(%__MODULE__{unacked_segments: []} = state) do
     # Nothing to retransmit, clear timer state
     {:keep_state, %{state | rto_timer_active: false}}
   end
 
-  def do_retransmit(%__MODULE__{unacked_segments: [{seq, seq_end, :fin, count} | rest]} = state) do
+  defp do_retransmit_segment(
+         %__MODULE__{unacked_segments: [{seq, seq_end, :fin, count} | rest]} = state
+       ) do
     if count >= @max_retransmit_count do
       # Max retries exceeded - connection failure
       reset_connection(state, retry_exhaustion_error(state))
     else
-      send_fin_segment(state, seq)
+      case send_fin_segment(state, seq) do
+        :ok ->
+          state = clear_link_stall(state)
+          updated_entry = {seq, seq_end, :fin, count + 1}
+          new_unacked = [updated_entry | rest]
+          new_rto = min(state.rto_ms * 2, @max_rto_ms)
 
-      # Update segment with incremented retransmit count
-      updated_entry = {seq, seq_end, :fin, count + 1}
-      new_unacked = [updated_entry | rest]
+          new_state = %{
+            state
+            | unacked_segments: new_unacked,
+              rto_ms: new_rto,
+              rto_timer_active: true
+          }
 
-      # Exponential backoff
-      new_rto = min(state.rto_ms * 2, @max_rto_ms)
+          {:keep_state, new_state, {{:timeout, :rto}, new_rto, :retransmit}}
 
-      new_state = %{
-        state
-        | unacked_segments: new_unacked,
-          rto_ms: new_rto,
-          rto_timer_active: true
-      }
-
-      # Schedule next RTO timer
-      actions = [{{:timeout, :rto}, new_rto, :retransmit}]
-      {:keep_state, new_state, actions}
+        {:error, reason} ->
+          retry_retransmit_after_link_failure(state, reason)
+      end
     end
   end
 
-  def do_retransmit(
-        %__MODULE__{unacked_segments: [{seq, _seq_end, payload, count} | rest]} = state
-      )
-      when is_binary(payload) do
+  defp do_retransmit_segment(
+         %__MODULE__{unacked_segments: [{seq, _seq_end, payload, count} | rest]} = state
+       )
+       when is_binary(payload) do
     if count >= @max_retransmit_count do
       # Max retries exceeded - connection failure
       reset_connection(state, retry_exhaustion_error(state))
@@ -1252,27 +1570,159 @@ defmodule Tricep.Socket do
         )
 
       packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
-      Tricep.Link.send(state.link, packet)
 
-      # Update segment with incremented retransmit count
-      updated_entry = {seq, Sequence.wrap(seq + byte_size(payload)), payload, count + 1}
-      new_unacked = [updated_entry | rest]
+      case Tricep.Link.send(state.link, packet) do
+        :ok ->
+          state = clear_link_stall(state)
+          updated_entry = {seq, Sequence.wrap(seq + byte_size(payload)), payload, count + 1}
+          new_unacked = [updated_entry | rest]
+          new_rto = min(state.rto_ms * 2, @max_rto_ms)
 
-      # Exponential backoff
-      new_rto = min(state.rto_ms * 2, @max_rto_ms)
+          new_state = %{
+            state
+            | unacked_segments: new_unacked,
+              rto_ms: new_rto,
+              rto_timer_active: true
+          }
+
+          {:keep_state, new_state, {{:timeout, :rto}, new_rto, :retransmit}}
+
+        {:error, reason} ->
+          retry_retransmit_after_link_failure(state, reason)
+      end
+    end
+  end
+
+  defp retry_rto_after_link_failure(state, reason, timeout_event) do
+    retry_path =
+      case timeout_event do
+        :syn_ack_timeout -> :syn_ack
+        _ -> {:syn, timeout_event}
+      end
+
+    case retry_after_link_failure(state, reason, retry_path) do
+      {:retry, state, action} -> {:keep_state, state, action}
+      {:exhausted, state, error} -> {:link_stall_exhausted, state, error}
+    end
+  end
+
+  defp retry_retransmit_after_link_failure(state, reason) do
+    case retry_after_link_failure(state, reason, :retransmit) do
+      {:retry, state, action} -> {:keep_state, state, action}
+      {:exhausted, state, error} -> reset_connection(state, error)
+    end
+  end
+
+  defp retry_after_link_failure(state, :eagain, retry_path) do
+    now = System.monotonic_time(:millisecond)
+    deadline = state.link_stall_deadline_ms || now + @link_stall_timeout_ms
+
+    if now >= deadline do
+      exhaust_link_stall(state)
+    else
+      delay = min(state.link_retry_ms, deadline - now)
+
+      if is_nil(state.link_stall_deadline_ms) do
+        Logger.warning("TCP link admission stalled; retrying in #{delay}ms")
+      end
 
       new_state = %{
         state
-        | unacked_segments: new_unacked,
-          rto_ms: new_rto,
-          rto_timer_active: true
+        | link_stall_deadline_ms: deadline,
+          link_retry_path: retry_path,
+          link_retry_ms: min(delay * 2, @max_link_retry_ms),
+          rto_timer_active: if(retry_path == :retransmit, do: false, else: state.rto_timer_active)
       }
 
-      # Schedule next RTO timer
-      actions = [{{:timeout, :rto}, new_rto, :retransmit}]
-      {:keep_state, new_state, actions}
+      {:retry, new_state, {{:timeout, :link_retry}, delay, {:retry, retry_path}}}
     end
   end
+
+  defp retry_after_link_failure(state, :emsgsize, _retry_path) do
+    Logger.error("TCP link rejected a packet that cannot fit its transmit queue")
+    {:exhausted, state, :emsgsize}
+  end
+
+  defp retry_after_link_failure(state, :closed, _retry_path) do
+    Logger.error("TCP link closed while admitting a packet")
+    {:exhausted, state, :enetdown}
+  end
+
+  defp retry_after_link_failure(state, _reason, _retry_path) do
+    Logger.error("TCP link failed while admitting a packet")
+    {:exhausted, state, :enetdown}
+  end
+
+  defp link_retry_armed?(%__MODULE__{link_retry_path: retry_path}), do: not is_nil(retry_path)
+
+  defp link_stall_expired?(%__MODULE__{link_stall_deadline_ms: deadline})
+       when is_integer(deadline) do
+    System.monotonic_time(:millisecond) >= deadline
+  end
+
+  defp link_stall_expired?(%__MODULE__{}), do: false
+
+  defp exhaust_link_stall(%__MODULE__{} = state) do
+    Logger.error(
+      "TCP link admission remained saturated through its #{@link_stall_timeout_ms}ms deadline"
+    )
+
+    {:exhausted, state, :enobufs}
+  end
+
+  defp reset_for_exhausted_link_stall(%__MODULE__{} = state) do
+    {:exhausted, state, error} = exhaust_link_stall(state)
+    reset_connection(state, error)
+  end
+
+  defp link_stall_exhausted(%__MODULE__{} = state) do
+    {:exhausted, state, error} = exhaust_link_stall(state)
+    {:link_stall_exhausted, state, error}
+  end
+
+  defp take_link_retry(%__MODULE__{link_retry_path: retry_path} = state, retry_path) do
+    {:retry, %{state | link_retry_path: nil}}
+  end
+
+  defp take_link_retry(%__MODULE__{}, _retry_path), do: :stale
+
+  @doc false
+  def complete_link_retry(%__MODULE__{} = state), do: clear_link_stall(state)
+
+  defp clear_link_stall(%__MODULE__{link_stall_deadline_ms: nil} = state), do: state
+
+  defp clear_link_stall(%__MODULE__{} = state) do
+    Logger.info("TCP link admission recovered before its bounded retry deadline")
+
+    %{
+      state
+      | link_stall_deadline_ms: nil,
+        link_retry_path: nil,
+        link_retry_ms: @initial_link_retry_ms
+    }
+  end
+
+  # A retry episode ends without recovery when its named retry finds no data
+  # or no usable peer window. Do not retain its elapsed deadline: a later,
+  # unrelated link refusal starts a new bounded episode.
+  defp abandon_link_stall(%__MODULE__{} = state) do
+    %{
+      state
+      | link_stall_deadline_ms: nil,
+        link_retry_path: nil,
+        link_retry_ms: @initial_link_retry_ms
+    }
+  end
+
+  defp schedule_deferred_flush_after_retransmit({:keep_state, state, actions}) do
+    if DataBuffer.empty?(state.send_buffer) do
+      {:keep_state, state, actions}
+    else
+      {:keep_state, state, List.wrap(actions) ++ [{:next_event, :internal, :flush_send_buffer}]}
+    end
+  end
+
+  defp schedule_deferred_flush_after_retransmit(result), do: result
 
   def retry_exhaustion_error(%__MODULE__{soft_error: error})
       when is_atom(error) and not is_nil(error),
@@ -1355,7 +1805,8 @@ defmodule Tricep.Socket do
 
   defp notify_send_waiters_error(waiters, error) do
     Enum.flat_map(waiters, fn
-      {from, _ref, _data, timer_ref} when is_tuple(from) ->
+      {:wait, from, _data, timer_ref, monitor_ref} ->
+        demonitor_send_waiter(monitor_ref)
         actions = [{:reply, from, {:error, error}}]
 
         if timer_ref do
@@ -1364,7 +1815,8 @@ defmodule Tricep.Socket do
           actions
         end
 
-      {caller_pid, ref} when is_pid(caller_pid) ->
+      {:select, caller_pid, ref, monitor_ref} when is_pid(caller_pid) ->
+        demonitor_send_waiter(monitor_ref)
         notify_select(caller_pid, ref)
         []
     end)
@@ -1409,14 +1861,24 @@ defmodule Tricep.Socket do
   end
 
   def do_flush_send_buffer(%__MODULE__{} = state) do
+    do_flush_send_buffer(state, retry?: false)
+  end
+
+  defp do_flush_send_buffer(%__MODULE__{} = state, retry?: retry?) do
     available = Tcb.send_window_available(state.tcb)
 
     cond do
+      not retry? and link_retry_armed?(state) ->
+        # A named retry owns the next link admission attempt. Let later
+        # writes and ACK-driven flushes accumulate in the bounded socket
+        # buffer rather than racing the retry or shortening its deadline.
+        :keep_state_and_data
+
       DataBuffer.empty?(state.send_buffer) ->
-        keep_state_sync_persist(state)
+        keep_state_after_unsent_flush(state, retry?)
 
       available <= 0 ->
-        keep_state_sync_persist(state)
+        keep_state_after_unsent_flush(state, retry?)
 
       true ->
         # Take only bytes the peer's advertised receive window currently permits.
@@ -1441,41 +1903,76 @@ defmodule Tricep.Socket do
           )
 
         packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
-        Tricep.Link.send(state.link, packet)
 
-        # Track segment for retransmission: {seq_start, seq_end, payload, retransmit_count}
-        unacked_entry = {seq_start, seq_end, payload, 0}
-        new_unacked = state.unacked_segments ++ [unacked_entry]
+        case Tricep.Link.send(state.link, packet) do
+          :ok ->
+            track_flushed_payload(state, new_send_buffer, payload, seq_start, seq_end)
 
-        new_state = %{
-          state
-          | tcb: Tcb.advance_send(state.tcb, byte_size(payload)),
-            send_buffer: new_send_buffer,
-            unacked_segments: new_unacked
-        }
-
-        actions =
-          new_state
-          |> schedule_flush_send_buffer([])
-          |> schedule_pending_fin(new_state)
-
-        {new_state, actions} = sync_persist_timer(new_state, actions)
-
-        # Start RTO timer if not already running
-        {new_state, actions} =
-          if state.rto_timer_active do
-            {new_state, actions}
-          else
-            {%{new_state | rto_timer_active: true},
-             [{{:timeout, :rto}, state.rto_ms, :retransmit} | actions]}
-          end
-
-        {:keep_state, new_state, actions}
+          {:error, reason} ->
+            handle_flush_link_failure(state, reason)
+        end
     end
+  end
+
+  defp handle_flush_link_failure(state, reason) do
+    case retry_after_link_failure(state, reason, :flush) do
+      {:retry, state, action} ->
+        {:keep_state, state, action}
+
+      {:exhausted, state, error} ->
+        reset_connection(state, error) |> switch_callback_on_terminal_state()
+    end
+  end
+
+  # Track a segment only after the bounded link queue has accepted it.
+  # Retaining the original send-buffer bytes on :eagain avoids both sequence
+  # advancement and a second payload copy.
+  defp track_flushed_payload(state, new_send_buffer, payload, seq_start, seq_end) do
+    state = clear_link_stall(state)
+    unacked_entry = {seq_start, seq_end, payload, 0}
+    new_unacked = state.unacked_segments ++ [unacked_entry]
+
+    new_state = %{
+      state
+      | tcb: Tcb.advance_send(state.tcb, byte_size(payload)),
+        send_buffer: new_send_buffer,
+        unacked_segments: new_unacked
+    }
+
+    actions =
+      new_state
+      |> schedule_flush_send_buffer([])
+      |> schedule_pending_fin(new_state)
+
+    {new_state, actions} = sync_persist_timer(new_state, actions)
+    {new_state, actions} = ensure_retransmit_timer(new_state, actions)
+    {:keep_state, new_state, actions}
+  end
+
+  defp ensure_retransmit_timer(%__MODULE__{rto_timer_active: true} = state, actions) do
+    {state, actions}
+  end
+
+  defp ensure_retransmit_timer(%__MODULE__{} = state, actions) do
+    {%{state | rto_timer_active: true}, [{{:timeout, :rto}, state.rto_ms, :retransmit} | actions]}
+  end
+
+  defp ensure_unacked_retransmit_timer(%__MODULE__{unacked_segments: []} = state, actions) do
+    {state, actions}
+  end
+
+  defp ensure_unacked_retransmit_timer(%__MODULE__{} = state, actions) do
+    ensure_retransmit_timer(state, actions)
   end
 
   def reset_state(%__MODULE__{} = state) do
     Application.deregister_socket_pair(state.pair)
+
+    if state.link_monitor do
+      Process.demonitor(state.link_monitor, [:flush])
+    end
+
+    :ok
   end
 
   def closed_data(%__MODULE__{socket_opts: socket_opts}), do: %{socket_opts: socket_opts}
@@ -1568,6 +2065,7 @@ defmodule Tricep.Socket do
 
     actions = [
       {{:timeout, :rto}, :cancel},
+      {{:timeout, :link_retry}, :cancel},
       {{:timeout, :connect_timeout}, :cancel},
       {:reply, from, {:error, reason}}
     ]
@@ -1578,7 +2076,9 @@ defmodule Tricep.Socket do
   defp apply_icmpv6_error({:hard, reason}, {:syn_sent, :nowait}, %__MODULE__{} = state) do
     Logger.debug("Applying ICMPv6 hard error #{inspect(reason)} during active handshake")
     {state_name, state_data} = nowait_connect_failure(state, reason)
-    {:next_state, state_name, state_data, {{:timeout, :rto}, :cancel}}
+
+    {:next_state, state_name, state_data,
+     [{{:timeout, :rto}, :cancel}, {{:timeout, :link_retry}, :cancel}]}
   end
 
   defp apply_icmpv6_error({:soft, reason}, {:syn_sent, _from}, %__MODULE__{} = state) do
@@ -1616,11 +2116,15 @@ defmodule Tricep.Socket do
   defp apply_icmpv6_error(_event, _state_name, _state), do: :keep_state_and_data
 
   def reset_connection(%__MODULE__{} = state, error, timer_actions \\ []) do
-    # A reset tears down states that may own named RTO and persist timers. The
-    # state-specific callbacks cancel live timers, while root callbacks absorb
-    # a delivery that raced with the transition.
+    # A reset tears down the common RTO/link-retry timers. Callers add the
+    # state-owned timer cancellation (for example FIN_WAIT_2 or TIME_WAIT).
+    # Root callbacks only absorb a delivery that raced with this transition.
     reset_state(state)
-    actions = [{{:timeout, :rto}, :cancel} | timer_actions] ++ notify_waiters_error(state, error)
+
+    actions =
+      [{{:timeout, :rto}, :cancel}, {{:timeout, :link_retry}, :cancel} | timer_actions] ++
+        notify_waiters_error(state, error)
+
     {:next_state, :closed, closed_data(state), actions}
   end
 
@@ -1658,7 +2162,13 @@ defmodule Tricep.Socket do
     # unacknowledged FIN may still own an RTO and is cancelled explicitly.
     reset_state(state)
 
-    actions = [{{:timeout, :rto}, :cancel} | cancel_persist_timer_action(state)]
+    actions =
+      [
+        {{:timeout, :rto}, :cancel},
+        {{:timeout, :link_retry}, :cancel}
+        | cancel_persist_timer_action(state)
+      ]
+
     {:next_state, :closed, closed_data(state), actions}
   end
 
@@ -2065,6 +2575,18 @@ defmodule Tricep.Socket do
 
   defp configured_recv_buffer_size(_opts), do: @default_recv_buffer_size
 
+  defp configured_send_buffer_size(opts) do
+    option(opts, :send_buffer_size, @default_send_buffer_size)
+  end
+
+  defp configured_send_buffer_low_watermark(opts) do
+    option(opts, :send_buffer_low_watermark, div(configured_send_buffer_size(opts), 2))
+  end
+
+  defp configured_send_waiter_limit(opts) do
+    option(opts, :send_waiter_limit, @default_send_waiter_limit)
+  end
+
   defp configured_fin_wait_2_timeout_ms(opts) when is_map(opts) do
     opts
     |> Map.get(:fin_wait_2_timeout_ms, @default_fin_wait_2_timeout_ms)
@@ -2108,9 +2630,40 @@ defmodule Tricep.Socket do
 
   defp normalize_fin_wait_2_timeout_ms(_timeout_ms), do: @default_fin_wait_2_timeout_ms
 
-  # Bug #125 owns making legacy socket-option validation uniform. Keep the
-  # RFC 5961 limiter strict without changing legacy fallback behavior here.
-  defp valid_socket_options?(opts), do: ChallengeAckLimiter.valid_options?(opts)
+  # Bug #125 owns making legacy socket-option validation uniform.  The new
+  # send-capacity controls are strict from introduction: silently replacing a
+  # supplied capacity would defeat the memory bound callers requested.
+  defp valid_socket_options?(opts) do
+    ChallengeAckLimiter.valid_options?(opts) and valid_send_buffer_options?(opts)
+  end
+
+  defp valid_send_buffer_options?(opts) when is_map(opts) do
+    valid_positive_option?(Map.fetch(opts, :send_buffer_size)) and
+      valid_low_watermark_option?(Map.fetch(opts, :send_buffer_low_watermark), opts) and
+      valid_positive_option?(Map.fetch(opts, :send_waiter_limit))
+  end
+
+  defp valid_send_buffer_options?(opts) when is_list(opts) do
+    Keyword.keyword?(opts) and
+      valid_positive_option?(Keyword.fetch(opts, :send_buffer_size)) and
+      valid_low_watermark_option?(Keyword.fetch(opts, :send_buffer_low_watermark), opts) and
+      valid_positive_option?(Keyword.fetch(opts, :send_waiter_limit))
+  end
+
+  defp valid_send_buffer_options?(_opts), do: false
+
+  defp valid_positive_option?(:error), do: true
+  defp valid_positive_option?({:ok, value}), do: is_integer(value) and value > 0
+
+  defp valid_low_watermark_option?(:error, _opts), do: true
+
+  defp valid_low_watermark_option?({:ok, low}, opts) do
+    is_integer(low) and low >= 0 and low < configured_send_buffer_size(opts)
+  end
+
+  defp option(opts, key, default) when is_map(opts), do: Map.get(opts, key, default)
+  defp option(opts, key, default) when is_list(opts), do: Keyword.get(opts, key, default)
+  defp option(_opts, _key, default), do: default
 
   defp available_receive_window(%__MODULE__{} = state) do
     max(0, application_receive_capacity(state) - out_of_order_size(state))
@@ -2312,8 +2865,10 @@ defmodule Tricep.Socket do
 
   defp notify_recv_select(%__MODULE__{} = state, _accepted_len), do: state
 
-  defp keep_state_sync_persist(state, actions \\ []) do
-    {new_state, actions} = sync_persist_timer(state, actions)
+  defp keep_state_after_unsent_flush(state, retry?) do
+    state = if retry?, do: abandon_link_stall(state), else: state
+    {new_state, actions} = sync_persist_timer(state, [])
+    {new_state, actions} = ensure_unacked_retransmit_timer(new_state, actions)
     {:keep_state, new_state, actions}
   end
 
@@ -2355,7 +2910,7 @@ defmodule Tricep.Socket do
 
   defp has_blocking_send_waiter?(waiters) do
     Enum.any?(waiters, fn
-      {from, _ref, data, _timer_ref} when is_tuple(from) -> byte_size(data) > 0
+      {:wait, _from, data, _timer_ref, _monitor_ref} -> byte_size(data) > 0
       _waiter -> false
     end)
   end
@@ -2393,7 +2948,7 @@ defmodule Tricep.Socket do
 
   defp blocking_send_waiter_probe_payload(waiters) do
     Enum.find_value(waiters, fn
-      {from, _ref, data, _timer_ref} when is_tuple(from) and byte_size(data) > 0 ->
+      {:wait, _from, data, _timer_ref, _monitor_ref} when byte_size(data) > 0 ->
         binary_part(data, 0, 1)
 
       _waiter ->
@@ -2528,13 +3083,15 @@ defmodule Tricep.Socket do
             Sequence.lte?(seq_end, ack)
           end)
 
-        base_state = %{
-          state
-          | tcb: Tcb.acknowledge(state.tcb, ack, window),
-            unacked_segments: new_unacked,
-            rto_ms: @initial_rto_ms,
-            soft_error: nil
-        }
+        base_state =
+          %{
+            state
+            | tcb: Tcb.acknowledge(state.tcb, ack, window),
+              unacked_segments: new_unacked,
+              rto_ms: @initial_rto_ms,
+              soft_error: nil
+          }
+          |> clear_acked_retransmit_retry(new_unacked)
 
         # Check if window opened and we have send_waiters
         {new_state, send_waiter_actions} = process_send_waiters(base_state)
@@ -2544,7 +3101,7 @@ defmodule Tricep.Socket do
         timer_actions =
           if new_unacked == [] do
             # All data acknowledged - cancel timer
-            [{{:timeout, :rto}, :cancel}]
+            [{{:timeout, :rto}, :cancel} | cancel_acked_retransmit_retry(state)]
           else
             # More unacked data - restart timer with fresh RTO
             [{{:timeout, :rto}, @initial_rto_ms, :retransmit}]
@@ -2562,6 +3119,20 @@ defmodule Tricep.Socket do
     end
   end
 
+  defp clear_acked_retransmit_retry(
+         %__MODULE__{link_retry_path: :retransmit} = state,
+         []
+       ) do
+    clear_link_stall(state)
+  end
+
+  defp clear_acked_retransmit_retry(%__MODULE__{} = state, _unacked_segments), do: state
+
+  defp cancel_acked_retransmit_retry(%__MODULE__{link_retry_path: :retransmit}),
+    do: [{{:timeout, :link_retry}, :cancel}]
+
+  defp cancel_acked_retransmit_retry(%__MODULE__{}), do: []
+
   defp schedule_flush_send_buffer(state, actions) do
     flush_action = {:next_event, :internal, :flush_send_buffer}
 
@@ -2573,40 +3144,51 @@ defmodule Tricep.Socket do
     end
   end
 
-  # Process send_waiters when window opens.
+  # Process waiting sends in FIFO order once both the peer window and the
+  # socket low-watermark permit another whole application write.  Selects do
+  # not reserve bytes; a notification remains advisory and the caller retries
+  # its complete write.
   defp process_send_waiters(state) do
-    capacity = send_waiter_capacity(state)
-    process_send_waiters(state.send_waiters, %{state | send_waiters: []}, capacity, [])
+    process_send_waiters(state.send_waiters, %{state | send_waiters: []}, [])
   end
 
-  defp process_send_waiters([], state, _capacity, actions) do
+  defp process_send_waiters([], state, actions) do
     {state, actions}
   end
 
-  defp process_send_waiters(remaining_waiters, state, capacity, actions) when capacity <= 0 do
-    {%{state | send_waiters: remaining_waiters}, actions}
+  defp process_send_waiters(
+         [{:select, caller_pid, ref, monitor_ref} | rest],
+         state,
+         actions
+       ) do
+    if send_ready?(state) do
+      demonitor_send_waiter(monitor_ref)
+      notify_select(caller_pid, ref)
+      process_send_waiters(rest, state, actions)
+    else
+      {%{state | send_waiters: [{:select, caller_pid, ref, monitor_ref} | rest]}, actions}
+    end
   end
 
-  defp process_send_waiters([{caller_pid, ref} | rest], state, capacity, actions)
-       when is_pid(caller_pid) do
-    # :nowait waiter - notify readiness; caller must retry send to enqueue data.
-    notify_select(caller_pid, ref)
-    process_send_waiters(rest, state, capacity, actions)
+  defp process_send_waiters(
+         [{:wait, from, data, timer_ref, monitor_ref} | rest],
+         state,
+         actions
+       ) do
+    if send_ready?(state) and send_owned_bytes(state) + byte_size(data) <= state.send_buffer_size do
+      demonitor_send_waiter(monitor_ref)
+      new_state = %{state | send_buffer: DataBuffer.append(state.send_buffer, data)}
+      cancel_actions = if timer_ref, do: [{{:timeout, timer_ref}, :cancel}], else: []
+      waiter_actions = cancel_actions ++ [{:reply, from, :ok}]
+      process_send_waiters(rest, new_state, actions ++ waiter_actions)
+    else
+      {%{state | send_waiters: [{:wait, from, data, timer_ref, monitor_ref} | rest]}, actions}
+    end
   end
 
-  defp process_send_waiters([{from, _ref, data, timer_ref} | rest], state, capacity, actions)
-       when is_tuple(from) do
-    # Blocking waiter - enqueue data and reply.
-    new_send_buffer = DataBuffer.append(state.send_buffer, data)
-    new_state = %{state | send_buffer: new_send_buffer}
-    cancel_actions = if timer_ref, do: [{{:timeout, timer_ref}, :cancel}], else: []
-    waiter_actions = cancel_actions ++ [{:reply, from, :ok}]
-
-    process_send_waiters(rest, new_state, capacity - byte_size(data), actions ++ waiter_actions)
-  end
-
-  defp send_waiter_capacity(state) do
-    max(0, Tcb.send_window_available(state.tcb) - DataBuffer.size(state.send_buffer))
+  defp send_ready?(%__MODULE__{} = state) do
+    Tcb.send_window_available(state.tcb) > 0 and
+      send_owned_bytes(state) <= state.send_buffer_low_watermark
   end
 
   def take_select_for_pid(selects, caller_pid) do

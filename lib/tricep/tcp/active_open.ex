@@ -22,7 +22,7 @@ defmodule Tricep.Tcp.ActiveOpen do
       )
 
     packet = Tricep.Ip.wrap(src_addr, dst_addr, :tcp, tcp_segment)
-    :ok = Tricep.Link.send(state.link, packet)
+    _ = Tricep.Link.send(state.link, packet)
 
     base_state = %{
       state
@@ -66,17 +66,20 @@ defmodule Tricep.Tcp.ActiveOpen do
         {:next_state, :closed, Socket.closed_data(state),
          [
            {{:timeout, :rto}, :cancel},
+           {{:timeout, :link_retry}, :cancel},
            {{:timeout, :connect_timeout}, :cancel},
            {:reply, from, {:error, :econnrefused}},
            {:change_callback_module, Socket}
          ]}
 
       {:established, new_state} ->
+        new_state = Socket.complete_link_retry(new_state)
         Socket.send_ack(new_state.tcb.rcv_nxt, new_state)
 
         {:next_state, :established, new_state,
          [
            {{:timeout, :rto}, :cancel},
+           {{:timeout, :link_retry}, :cancel},
            {{:timeout, :connect_timeout}, :cancel},
            {:reply, from, :ok},
            {:change_callback_module, Established}
@@ -98,14 +101,23 @@ defmodule Tricep.Tcp.ActiveOpen do
         {state_name, state_data} = Socket.nowait_connect_failure(state, :econnrefused)
 
         {:next_state, state_name, state_data,
-         [{{:timeout, :rto}, :cancel}, {:change_callback_module, Socket}]}
+         [
+           {{:timeout, :rto}, :cancel},
+           {{:timeout, :link_retry}, :cancel},
+           {:change_callback_module, Socket}
+         ]}
 
       {:established, new_state} ->
+        new_state = Socket.complete_link_retry(new_state)
         Socket.notify_selects(state.connect_selects)
         Socket.send_ack(new_state.tcb.rcv_nxt, new_state)
 
         {:next_state, :established, new_state,
-         [{{:timeout, :rto}, :cancel}, {:change_callback_module, Established}]}
+         [
+           {{:timeout, :rto}, :cancel},
+           {{:timeout, :link_retry}, :cancel},
+           {:change_callback_module, Established}
+         ]}
 
       {:bad_ack, acknowledgment} ->
         Socket.send_rst(acknowledgment, state)
@@ -138,11 +150,16 @@ defmodule Tricep.Tcp.ActiveOpen do
         Socket.reject_unacceptable_segment(state)
 
       {:established, next_state, new_state, receive_actions} ->
+        new_state = Socket.complete_link_retry(new_state)
         Socket.notify_passive_owner(state, :passive_established)
 
         {:next_state, next_state, new_state,
          receive_actions ++
-           [{{:timeout, :rto}, :cancel}, {:change_callback_module, callback_module(next_state)}]}
+           [
+             {{:timeout, :rto}, :cancel},
+             {{:timeout, :link_retry}, :cancel},
+             {:change_callback_module, callback_module(next_state)}
+           ]}
 
       {:bad_ack, acknowledgment} ->
         Socket.send_rst(acknowledgment, state)
@@ -164,7 +181,39 @@ defmodule Tricep.Tcp.ActiveOpen do
       Socket.notify_passive_owner(state, {:passive_failed, reason})
       {:stop, :normal}
     else
-      Socket.retransmit_syn_ack(state)
+      case Socket.retransmit_syn_ack(state) do
+        {:link_stall_exhausted, state, reason} ->
+          Socket.reset_state(state)
+          Socket.notify_passive_owner(state, {:passive_failed, reason})
+          {:stop, :normal}
+
+        result ->
+          result
+      end
+    end
+  end
+
+  def handle_event(
+        {:timeout, :link_retry},
+        {:retry, :syn_ack},
+        :syn_received,
+        %Socket{} = state
+      ) do
+    if state.syn_retransmit_count >= @max_retransmit_count do
+      reason = Socket.retry_exhaustion_error(state)
+      Socket.reset_state(state)
+      Socket.notify_passive_owner(state, {:passive_failed, reason})
+      {:stop, :normal}
+    else
+      case Socket.retry_link_syn_ack(state) do
+        {:link_stall_exhausted, state, reason} ->
+          Socket.reset_state(state)
+          Socket.notify_passive_owner(state, {:passive_failed, reason})
+          {:stop, :normal}
+
+        result ->
+          result
+      end
     end
   end
 
@@ -179,7 +228,53 @@ defmodule Tricep.Tcp.ActiveOpen do
          {:change_callback_module, Socket}
        ]}
     else
-      Socket.retransmit_syn(state, {:syn_timeout, from})
+      case Socket.retransmit_syn(state, {:syn_timeout, from}) do
+        {:link_stall_exhausted, state, reason} ->
+          Socket.reset_state(state)
+
+          {:next_state, :closed, Socket.closed_data(state),
+           [
+             {{:timeout, :connect_timeout}, :cancel},
+             {:reply, from, {:error, reason}},
+             {:change_callback_module, Socket}
+           ]}
+
+        result ->
+          result
+      end
+    end
+  end
+
+  def handle_event(
+        {:timeout, :link_retry},
+        {:retry, {:syn, {:syn_timeout, from}}},
+        {:syn_sent, from},
+        %Socket{} = state
+      ) do
+    if state.syn_retransmit_count >= @max_retransmit_count do
+      Socket.reset_state(state)
+
+      {:next_state, :closed, Socket.closed_data(state),
+       [
+         {{:timeout, :connect_timeout}, :cancel},
+         {:reply, from, {:error, Socket.retry_exhaustion_error(state)}},
+         {:change_callback_module, Socket}
+       ]}
+    else
+      case Socket.retry_link_syn(state, {:syn_timeout, from}) do
+        {:link_stall_exhausted, state, reason} ->
+          Socket.reset_state(state)
+
+          {:next_state, :closed, Socket.closed_data(state),
+           [
+             {{:timeout, :connect_timeout}, :cancel},
+             {:reply, from, {:error, reason}},
+             {:change_callback_module, Socket}
+           ]}
+
+        result ->
+          result
+      end
     end
   end
 
@@ -195,7 +290,37 @@ defmodule Tricep.Tcp.ActiveOpen do
 
       {:next_state, state_name, state_data, {:change_callback_module, Socket}}
     else
-      Socket.retransmit_syn(state, :syn_timeout_nowait)
+      case Socket.retransmit_syn(state, :syn_timeout_nowait) do
+        {:link_stall_exhausted, state, reason} ->
+          {state_name, state_data} = Socket.nowait_connect_failure(state, reason)
+          {:next_state, state_name, state_data, {:change_callback_module, Socket}}
+
+        result ->
+          result
+      end
+    end
+  end
+
+  def handle_event(
+        {:timeout, :link_retry},
+        {:retry, {:syn, :syn_timeout_nowait}},
+        {:syn_sent, :nowait},
+        %Socket{} = state
+      ) do
+    if state.syn_retransmit_count >= @max_retransmit_count do
+      {state_name, state_data} =
+        Socket.nowait_connect_failure(state, Socket.retry_exhaustion_error(state))
+
+      {:next_state, state_name, state_data, {:change_callback_module, Socket}}
+    else
+      case Socket.retry_link_syn(state, :syn_timeout_nowait) do
+        {:link_stall_exhausted, state, reason} ->
+          {state_name, state_data} = Socket.nowait_connect_failure(state, reason)
+          {:next_state, state_name, state_data, {:change_callback_module, Socket}}
+
+        result ->
+          result
+      end
     end
   end
 
@@ -210,6 +335,7 @@ defmodule Tricep.Tcp.ActiveOpen do
     {:next_state, :closed, Socket.closed_data(state),
      [
        {{:timeout, :rto}, :cancel},
+       {{:timeout, :link_retry}, :cancel},
        {:reply, from, {:error, :timeout}},
        {:change_callback_module, Socket}
      ]}
